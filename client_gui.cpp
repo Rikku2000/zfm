@@ -34,6 +34,7 @@ static bool saveClientConfigFile(const std::string& path, const ClientConfig& cf
     f << "  \"vox_threshold\": " << cfg.vox_threshold << ",\n";
     f << "  \"input_gain\": " << cfg.input_gain << ",\n";
     f << "  \"output_gain\": " << cfg.output_gain << ",\n";
+	f << "  \"roger_sound\": " << cfg.roger_sound << ",\n";
     f << "  \"ptt_cmd_on\": \""  << cfg.ptt_cmd_on  << "\",\n";
     f << "  \"ptt_cmd_off\": \"" << cfg.ptt_cmd_off << "\"\n";
     f << "}\n";

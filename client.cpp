@@ -1859,17 +1859,6 @@ int main(int argc, char** argv) {
         voxAutoLoop(sock);
         g_running = false;
     } else {
-		LOG_INFO("Server mode cmds:\n"
-         "  t or /talk        - talk (VOX gating if enabled)\n"
-         "  /kick <user>      - admin\n"
-         "  /mute <user>      - admin\n"
-         "  /unmute <user>    - admin\n"
-         "  /ban <user>       - admin\n"
-         "  /unban <user>     - admin\n"
-         "  /list_users       - admin\n"
-         "  /list_tgs         - admin\n"
-         "  q or /quit        - exit\n");
-
         while (g_running) {
             LOG_INFO("> ");
             std::string input;

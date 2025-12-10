@@ -114,6 +114,22 @@ announcements, weather, dashboard.
 
 ```
 
+## Server Commands (Admin)
+
+- /kick <user>
+- /mute <user>
+- /unmute <user>
+- /ban <user>
+- /unban <user>
+- /add_user <user> <pass>
+- /remove_user <user>
+- /set_admin <user> <0|1>
+- /set_pass <user> <newpass>
+- /add_tg <user> <tg>
+- /drop_tg <user> <tg>
+- /list_users
+- /list_tgs
+
 ### Client
 
 PortAudio capture/playback, networking, PTT, VOX, GPIO/CM108 support.

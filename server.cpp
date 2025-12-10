@@ -1215,6 +1215,81 @@ static std::string escapeJson(const std::string& s) {
     return out;
 }
 
+static bool saveConfig(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    std::ofstream f(path.c_str());
+    if (!f.is_open()) {
+        LOG_ERROR("Failed to open config file for writing: %s\n", path.c_str());
+        return false;
+    }
+
+    f << "{\n";
+    f << "  \"server_port\": " << g_server_port << ",\n";
+    f << "  \"max_talk_ms\": " << g_max_talk_ms << ",\n";
+    f << "  \"http_root\": \"" << escapeJson(g_http_root) << "\",\n";
+    f << "  \"http_port\": " << g_http_port << ",\n";
+
+    f << "  \"time_announcement\": {\n";
+    f << "    \"enabled\": " << (g_timeCfg.enabled ? "true" : "false") << ",\n";
+    f << "    \"folder\": \"" << escapeJson(g_timeCfg.folder) << "\",\n";
+    f << "    \"volume_factor\": " << g_timeCfg.volumeFactor << "\n";
+    f << "  },\n";
+
+    f << "  \"weather_enabled\": " << (g_weatherCfg.enabled ? "true" : "false") << ",\n";
+    f << "  \"weather_host_ip\": \"" << escapeJson(g_weatherCfg.weatherHostIp) << "\",\n";
+    f << "  \"weather_talkgroup\": \"" << escapeJson(g_weatherCfg.talkgroup) << "\",\n";
+    f << "  \"weather_interval_sec\": " << g_weatherCfg.intervalSec << ",\n";
+    f << "  \"weather_api_key\": \"" << escapeJson(g_weatherCfg.apiKey) << "\",\n";
+    f << "  \"weather_lat\": \"" << escapeJson(g_weatherCfg.lat) << "\",\n";
+    f << "  \"weather_lon\": \"" << escapeJson(g_weatherCfg.lon) << "\",\n";
+    f << "  \"weather_city_key\": \"" << escapeJson(g_weatherCfg.cityKey) << "\",\n";
+
+    f << "  \"users\": [\n";
+    {
+        bool firstUser = true;
+        for (const auto& kv : g_users) {
+            const User& u = kv.second;
+            if (!firstUser) f << ",\n";
+            firstUser = false;
+
+            f << "    {\n";
+            f << "      \"callsign\": \"" << escapeJson(u.callsign) << "\",\n";
+            f << "      \"password\": \"" << escapeJson(u.password) << "\",\n";
+            f << "      \"is_admin\": " << (u.isAdmin ? "true" : "false") << ",\n";
+            f << "      \"banned\": " << (u.banned ? "true" : "false") << ",\n";
+
+            f << "      \"talkgroups\": [";
+            bool firstTg = true;
+            for (const auto& tg : u.talkgroups) {
+                if (!firstTg) f << ", ";
+                firstTg = false;
+                f << "\"" << escapeJson(tg) << "\"";
+            }
+            f << "]\n";
+            f << "    }";
+        }
+        f << "\n  ],\n";
+    }
+
+    f << "  \"talkgroups\": [\n";
+    {
+        bool firstTg = true;
+        for (const auto& tgName : g_knownTalkgroups) {
+            if (!firstTg) f << ",\n";
+            firstTg = false;
+            f << "    { \"name\": \"" << escapeJson(tgName) << "\" }";
+        }
+        f << "\n  ]\n";
+    }
+
+    f << "}\n";
+
+    LOG_OK("Saved server config to %s\n", path.c_str());
+    return true;
+}
+
 static std::string getMimeType(const std::string& path) {
     size_t dot = path.find_last_of('.');
     if (dot == std::string::npos) return "text/plain";
@@ -1902,28 +1977,28 @@ void handleClient(SOCKET sock) {
 				}
 			}
         }
-        else if (cmd == "ADMIN") {
-            std::string sub;
-            iss >> sub;
+		else if (cmd == "ADMIN") {
+			std::string sub;
+			iss >> sub;
 
-            std::string myUser;
-            {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                std::unordered_map<SOCKET, ClientInfo>::iterator it = g_clients.find(sock);
-                if (it == g_clients.end() || !it->second.authenticated) {
-                    std::string resp = "ADMIN_FAIL not_authenticated\n";
-                    sendAll(sock, resp.c_str(), resp.size());
-                    continue;
-                }
-                myUser = it->second.callsign;
-            }
+			std::string myUser;
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+				std::unordered_map<SOCKET, ClientInfo>::iterator it = g_clients.find(sock);
+				if (it == g_clients.end() || !it->second.authenticated) {
+					std::string resp = "ADMIN_FAIL not_authenticated\n";
+					sendAll(sock, resp.c_str(), resp.size());
+					continue;
+				}
+				myUser = it->second.callsign;
+			}
 
-            std::unordered_map<std::string, User>::iterator uit = g_users.find(myUser);
-            if (uit == g_users.end() || !uit->second.isAdmin) {
-                std::string resp = "ADMIN_FAIL not_admin\n";
-                sendAll(sock, resp.c_str(), resp.size());
-                continue;
-            }
+			std::unordered_map<std::string, User>::iterator uit = g_users.find(myUser);
+			if (uit == g_users.end() || !uit->second.isAdmin) {
+				std::string resp = "ADMIN_FAIL not_admin\n";
+				sendAll(sock, resp.c_str(), resp.size());
+				continue;
+			}
 
             if (sub == "kick") {
                 std::string targetUser;
@@ -2003,7 +2078,208 @@ void handleClient(SOCKET sock) {
 					sendAll(sock, resp.c_str(), resp.size());
 				}
 			}
-            else if (sub == "list_users") {
+			else if (sub == "add_user") {
+				std::string newUser, newPass;
+				iss >> newUser >> newPass;
+
+				if (newUser.empty() || newPass.empty()) {
+					std::string resp = "ADMIN_FAIL add_user_missing_args\n";
+					sendAll(sock, resp.c_str(), resp.size());
+				} else {
+					bool ok = false;
+
+					{
+						std::lock_guard<std::mutex> lock(g_mutex);
+
+						if (g_users.find(newUser) != g_users.end()) {
+							std::string resp = "ADMIN_FAIL add_user_exists\n";
+							sendAll(sock, resp.c_str(), resp.size());
+						} else {
+							User u;
+							u.callsign = newUser;
+							u.password = newPass;
+							u.isAdmin  = false;
+							u.muted    = false;
+							u.banned   = false;
+
+							g_users[newUser] = u;
+
+							std::string resp = "ADMIN_OK add_user\n";
+							sendAll(sock, resp.c_str(), resp.size());
+							ok = true;
+						}
+					}
+
+					if (ok) {
+						saveConfig("server.json");
+					}
+				}
+			} else if (sub == "remove_user") {
+				std::string target;
+				iss >> target;
+
+				if (target.empty()) {
+					std::string resp = "ADMIN_FAIL remove_user_missing_args\n";
+					sendAll(sock, resp.c_str(), resp.size());
+				} else {
+					bool ok = false;
+
+					{
+						std::lock_guard<std::mutex> lock(g_mutex);
+
+						auto it = g_users.find(target);
+						if (it == g_users.end()) {
+							std::string resp = "ADMIN_FAIL remove_user_not_found\n";
+							sendAll(sock, resp.c_str(), resp.size());
+						} else {
+							SOCKET s = findClientByCallsign(target);
+							if (s != INVALID_SOCKET) {
+								std::string msg = "ADMIN_INFO removed_by_admin\n";
+								sendAll(s, msg.c_str(), msg.size());
+								closeSocket(s);
+								cleanupClient(s);
+							}
+
+							g_users.erase(it);
+
+							std::string resp = "ADMIN_OK remove_user\n";
+							sendAll(sock, resp.c_str(), resp.size());
+							ok = true;
+						}
+					}
+
+					if (ok) {
+						saveConfig("server.json");
+					}
+				}
+			} else if (sub == "set_admin") {
+				std::string targetUser;
+				int flag = 0;
+				iss >> targetUser >> flag;
+
+				if (targetUser.empty()) {
+					std::string resp = "ADMIN_FAIL set_admin_missing_args\n";
+					sendAll(sock, resp.c_str(), resp.size());
+				} else {
+					bool ok = false;
+
+					{
+						std::lock_guard<std::mutex> lock(g_mutex);
+						std::unordered_map<std::string, User>::iterator it2 = g_users.find(targetUser);
+						if (it2 == g_users.end()) {
+							std::string resp = "ADMIN_FAIL set_admin_user_not_found\n";
+							sendAll(sock, resp.c_str(), resp.size());
+						} else {
+							it2->second.isAdmin = (flag != 0);
+							std::string resp = "ADMIN_OK set_admin\n";
+							sendAll(sock, resp.c_str(), resp.size());
+							ok = true;
+						}
+					}
+
+					if (ok) {
+						saveConfig("server.json");
+					}
+				}
+			} else if (sub == "set_pass") {
+				std::string targetUser;
+				std::string newPass;
+				iss >> targetUser >> newPass;
+
+				if (targetUser.empty() || newPass.empty()) {
+					std::string resp = "ADMIN_FAIL set_pass_missing_args\n";
+					sendAll(sock, resp.c_str(), resp.size());
+				} else {
+					bool ok = false;
+
+					{
+						std::lock_guard<std::mutex> lock(g_mutex);
+						std::unordered_map<std::string, User>::iterator it2 = g_users.find(targetUser);
+						if (it2 == g_users.end()) {
+							std::string resp = "ADMIN_FAIL set_pass_user_not_found\n";
+							sendAll(sock, resp.c_str(), resp.size());
+						} else {
+							it2->second.password = newPass;
+							std::string resp = "ADMIN_OK set_pass\n";
+							sendAll(sock, resp.c_str(), resp.size());
+							ok = true;
+						}
+					}
+
+					if (ok) {
+						saveConfig("server.json");
+					}
+				}
+			} else if (sub == "add_tg") {
+				std::string targetUser;
+				std::string tg;
+				iss >> targetUser >> tg;
+
+				if (targetUser.empty() || tg.empty()) {
+					std::string resp = "ADMIN_FAIL add_tg_missing_args\n";
+					sendAll(sock, resp.c_str(), resp.size());
+				} else {
+					bool ok = false;
+
+					{
+						std::lock_guard<std::mutex> lock(g_mutex);
+						std::unordered_map<std::string, User>::iterator it2 = g_users.find(targetUser);
+						if (it2 == g_users.end()) {
+							std::string resp = "ADMIN_FAIL add_tg_user_not_found\n";
+							sendAll(sock, resp.c_str(), resp.size());
+						} else {
+							it2->second.talkgroups.insert(tg);
+
+							g_knownTalkgroups.insert(tg);
+							g_talkgroups[tg];
+
+							std::string resp = "ADMIN_OK add_talkgroup\n";
+							sendAll(sock, resp.c_str(), resp.size());
+							ok = true;
+						}
+					}
+
+					if (ok) {
+						saveConfig("server.json");
+					}
+				}
+			} else if (sub == "drop_tg") {
+				std::string targetUser;
+				std::string tg;
+				iss >> targetUser >> tg;
+
+				if (targetUser.empty() || tg.empty()) {
+					std::string resp = "ADMIN_FAIL drop_tg_missing_args\n";
+					sendAll(sock, resp.c_str(), resp.size());
+				} else {
+					bool ok = false;
+
+					{
+						std::lock_guard<std::mutex> lock(g_mutex);
+						std::unordered_map<std::string, User>::iterator it2 = g_users.find(targetUser);
+						if (it2 == g_users.end()) {
+							std::string resp = "ADMIN_FAIL drop_tg_user_not_found\n";
+							sendAll(sock, resp.c_str(), resp.size());
+						} else {
+							std::unordered_set<std::string>::iterator tgIt =
+								it2->second.talkgroups.find(tg);
+							if (tgIt == it2->second.talkgroups.end()) {
+								std::string resp = "ADMIN_FAIL drop_tg_not_in_user\n";
+								sendAll(sock, resp.c_str(), resp.size());
+							} else {
+								it2->second.talkgroups.erase(tgIt);
+								std::string resp = "ADMIN_OK drop_talkgroup\n";
+								sendAll(sock, resp.c_str(), resp.size());
+								ok = true;
+							}
+						}
+					}
+
+					if (ok) {
+						saveConfig("server.json");
+					}
+				}
+			} else if (sub == "list_users") {
                 std::ostringstream oss;
                 oss << "ADMIN_USERS ";
                 bool first = true;
