@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>zFM - Digital Voice Communication</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+  <header>
+    <h1>Dashboard</h1>
+
+    <div class="time-box">
+      <span>Server time:</span>
+      <span id="serverTime">--</span>
+    </div>
+
+    <div class="time-box">
+      <span>Forecast:</span>
+      <span id="weatherTg">--</span>
+    </div>
+
+    <div class="time-box">
+      <span>Clients:</span>
+      <span id="clientCount">0</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="table-wrapper">
+      <h2 style="text-align: center;">Now Speaking</h2>
+      <div id="activeSpeaker" class="now-speaking" style="text-align: center;">Nobody</div>
+    </section>
+
+    <section class="table-wrapper">
+      <h2>Talkgroups</h2>
+      <table id="tgTable">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Active speaker</th>
+            <th>Duration</th>
+            <th>Listeners</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div class="status-msg status-msg-small">
+        Click a talkgroup row to focus the waveform on that TG.
+      </div>
+    </section>
+
+    <section class="table-wrapper">
+      <h2 style="text-align: center;">Live Waveform</h2>
+      <canvas id="waveCanvas" width="800" height="120"></canvas>
+      <div class="status-msg status-msg-small" style="text-align: center;">
+        Showing audio from: <strong><span id="waveTgLabel">gateway</span></strong>
+      </div>
+    </section>
+
+    <section class="table-wrapper">
+      <h2>Connected Users</h2>
+      <table id="usersTable">
+        <thead>
+          <tr>
+            <th>Callsign</th>
+            <th>Talkgroup</th>
+            <th>Speaking</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+      <div id="statusMsg" class="status-msg">Connecting...</div>
+    </section>
+  </main>
+
+  <footer>
+    <span>
+      <strong>zFM - Digital Voice Communication</strong><br/>
+      programmed by 13MAD86 / Martin
+    </span>
+  </footer>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>
