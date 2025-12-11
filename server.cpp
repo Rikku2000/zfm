@@ -1701,7 +1701,6 @@ static std::string buildStatusJson() {
 		}
 	}
 	oss << "\n  ]\n";
-    oss << "\n  ]";
 
     {
         std::lock_guard<std::mutex> lhLock(g_lastHeardMutex);
