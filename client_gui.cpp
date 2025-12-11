@@ -65,12 +65,6 @@ static std::atomic<bool> g_isTalking(false);
 static std::atomic<bool> g_guiPttHeld(false);
 static std::atomic<bool> g_guiPttThreadRunning(false);
 
-static std::atomic<float> g_audioLevel(0.0f);
-static std::atomic<float> g_rxAudioLevel(0.0f);
-static std::atomic<bool>  g_talkerActive(false);
-
-static std::chrono::steady_clock::time_point g_talkerStart;
-
 static void GuiAppendLog(const std::string& text) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     std::string s = text;
@@ -100,21 +94,6 @@ static void GuiAppendLog(const std::string& text) {
 			g_currentSpeaker.clear();
 		g_talkerActive = false;
 		g_audioLevel = 0.0f;
-	}
-
-	std::size_t pos;
-	if ((pos = s.find("RX from ")) != std::string::npos) {
-		g_currentSpeaker = s.substr(pos + 8);
-		g_talkerStart = now;
-		g_talkerActive = true;
-	} else if ((pos = s.find("RX ")) != std::string::npos) {
-		g_currentSpeaker = s.substr(pos + 3);
-		g_talkerStart = now;
-		g_talkerActive = true;
-	} else if ((pos = s.find("Caller: ")) != std::string::npos) {
-		g_currentSpeaker = s.substr(pos + 8);
-		g_talkerStart = now;
-		g_talkerActive = true;
 	}
 }
 
@@ -417,15 +396,15 @@ static void GuiPushToTalkLoop() {
     }
 
     int waits = 0;
-    while (g_running && g_guiPttHeld && !g_canTalk && waits < 50) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        ++waits;
-    }
-    if (!g_canTalk || !g_guiPttHeld) {
-        GuiAppendLog("[INFO] PTT: not granted or cancelled");
-        g_guiPttThreadRunning = false;
-        return;
-    }
+	while (g_running && g_guiPttHeld && !g_canTalk && waits < 50) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		++waits;
+	}
+	if (!g_canTalk || !g_guiPttHeld) {
+		GuiAppendLog("[INFO] PTT: not granted or cancelled");
+		g_guiPttThreadRunning = false;
+		return;
+	}
 
     if (g_cfg.gpio_ptt_enabled) {
         setPtt(true);
@@ -758,6 +737,9 @@ static std::string ui_callsign;
 static std::string ui_password;
 static std::string ui_talkgroup;
 
+std::vector<std::string> g_tgComboItems;
+int ui_tg_index = 0;
+
 static std::string ui_sample_rate;
 static std::string ui_frames_per_buffer;
 static std::string ui_channels;
@@ -774,7 +756,9 @@ static bool ui_gpio_ah     = false;
 static bool ui_vox_en      = false;
 
 #ifdef OPUS
-static bool ui_use_opus    = false;
+static std::vector<std::string> g_codecItems;
+static int         ui_codec_index = 0;
+static std::string ui_codec_text;
 #endif
 
 static std::string ui_ptt_cmd_on;
@@ -809,6 +793,28 @@ static void CfgToUi() {
     ui_password    = g_cfg.password;
     ui_talkgroup   = g_cfg.talkgroup;
 
+    if (!ui_talkgroup.empty() && g_tgComboItems.empty()) {
+        g_tgComboItems.push_back(ui_talkgroup);
+        ui_tg_index = 0;
+    }
+
+    if (!g_tgComboItems.empty()) {
+        int foundIndex = -1;
+        for (size_t i = 0; i < g_tgComboItems.size(); ++i) {
+            if (g_tgComboItems[i] == ui_talkgroup) {
+                foundIndex = (int)i;
+                break;
+            }
+        }
+        if (foundIndex == -1) {
+            g_tgComboItems.push_back(ui_talkgroup);
+            ui_tg_index = (int)g_tgComboItems.size() - 1;
+        } else {
+            ui_tg_index = foundIndex;
+        }
+        ui_talkgroup = g_tgComboItems[ui_tg_index];
+    }
+
     ui_sample_rate       = std::to_string(g_cfg.sample_rate);
     ui_frames_per_buffer = std::to_string(g_cfg.frames_per_buffer);
     ui_channels          = std::to_string(g_cfg.channels);
@@ -825,7 +831,14 @@ static void CfgToUi() {
     ui_out_gain = g_cfg.output_gain;
 
 #ifdef OPUS
-	ui_use_opus = g_cfg.use_opus;
+    if (g_codecItems.empty()) {
+        g_codecItems.push_back("Default (PCM)");
+        g_codecItems.push_back("Opus");
+    }
+    ui_codec_index = g_cfg.use_opus ? 1 : 0;
+    if (ui_codec_index < 0 || ui_codec_index >= (int)g_codecItems.size())
+        ui_codec_index = 0;
+    ui_codec_text = g_codecItems[ui_codec_index];
 #endif
 
     ui_ptt_cmd_on  = g_cfg.ptt_cmd_on;
@@ -921,7 +934,7 @@ static void UiToCfg() {
     g_cfg.output_gain = ui_out_gain;
 
 #ifdef OPUS
-	g_cfg.use_opus    = ui_use_opus;
+	g_cfg.use_opus = (ui_codec_index == 1);
 #endif
 
     g_cfg.vox_enabled          = ui_vox_en;
@@ -1190,8 +1203,8 @@ int main(int argc, char** argv) {
         AddLabel(0, xLabel, y, "Password");
         AddEdit(0, xCtrl, y - 2, w - xCtrl - 20, &ui_password); y += 34;
 
-        AddLabel(0, xLabel, y, "Talkgroup");
-        AddEdit(0, xCtrl, y - 2, w - xCtrl - 20, &ui_talkgroup); y += 40;
+		AddLabel(0, xLabel, y, "Talkgroup");
+		AddCombo(0, xCtrl, y - 2, w - xCtrl - 20, &ui_talkgroup, &ui_tg_index, &g_tgComboItems); y += 40;
 
         AddLabel(0, xLabel, y, "Status:");
     }
@@ -1200,6 +1213,11 @@ int main(int argc, char** argv) {
 		int xLabel = 16;
 		int xCtrl  = 150;
 		int y = contentTop + 10;
+
+#ifdef OPUS
+        AddLabel(1, xLabel, y, "Audio Codec");
+        AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_codec_text, &ui_codec_index, &g_codecItems); y += 34;
+#endif
 
 		AddLabel(1, xLabel, y, "Sample Rate");
 		AddEdit(1, xCtrl, y - 2, w - xCtrl - 20, &ui_sample_rate); y += 34;
@@ -1211,7 +1229,7 @@ int main(int argc, char** argv) {
 		AddEdit(1, xCtrl, y - 2, w - xCtrl - 20, &ui_channels); y += 40;
 
 		AddLabel(1, xLabel, y, "Roger Sound");
-		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_roger_text, &ui_roger_index, &g_rogerItems); y += 40;
+		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_roger_text, &ui_roger_index, &g_rogerItems); y += 34;
 
 		AddCheck(1, xLabel, y, "VOX Enabled", &ui_vox_en); y += 34;
 
@@ -1219,22 +1237,16 @@ int main(int argc, char** argv) {
 		AddEdit(1, xCtrl, y - 2, w - xCtrl - 20, &ui_vox_thresh); y += 34;
 
 		AddLabel(1, xLabel, y, "Input Device");
-		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_in_dev_text,
-				 &ui_in_dev_index, &g_inputDeviceNames); y += 40;
+		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_in_dev_text, &ui_in_dev_index, &g_inputDeviceNames); y += 34;
 
 		AddLabel(1, xLabel, y, "Input Gain");
 		AddSlider(1, xCtrl, y, 290, &ui_in_gain, 0, 200, ""); y += 40;
 
 		AddLabel(1, xLabel, y, "Output Device");
-		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_out_dev_text,
-				 &ui_out_dev_index, &g_outputDeviceNames); y += 40;
+		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_out_dev_text, &ui_out_dev_index, &g_outputDeviceNames); y += 34;
 
 		AddLabel(1, xLabel, y, "Output Gain");
 		AddSlider(1, xCtrl, y, 290, &ui_out_gain, 0, 200, ""); y += 40;
-
-#ifdef OPUS
-		AddCheck(1, xLabel, y, "Use Opus codec", &ui_use_opus); y += 34;
-#endif
 
 		id_btnLoad1 = AddButton(1, w - 190, y + 8, 80, 30, "Load");
 		id_btnSave1 = AddButton(1, w - 100, y + 8, 80, 30, "Save");
@@ -1256,8 +1268,7 @@ int main(int argc, char** argv) {
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_gpio_hold_ms); y += 34;
 
 		AddLabel(2, xLabel, y, "PTT Method");
-		AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_method,
-				 &ui_ptt_method_index, &g_pttMethodItems); y += 40;
+		AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_method, &ui_ptt_method_index, &g_pttMethodItems); y += 34;
 
 		AddLabel(2, xLabel, y, "PTT cmd ON");
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_cmd_on); y += 34;
@@ -1643,6 +1654,13 @@ int main(int argc, char** argv) {
             ui_out_dev_text = g_outputDeviceNames[ui_out_dev_index];
         } else {
             ui_out_dev_text = "(none)";
+        }
+
+        if (!g_tgComboItems.empty()) {
+            if (ui_tg_index < 0) ui_tg_index = 0;
+            if (ui_tg_index >= (int)g_tgComboItems.size())
+                ui_tg_index = (int)g_tgComboItems.size() - 1;
+            ui_talkgroup = g_tgComboItems[ui_tg_index];
         }
 
         auto clampSlider = [](int v) {

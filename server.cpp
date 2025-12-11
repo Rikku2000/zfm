@@ -392,6 +392,7 @@ struct User {
     bool muted;
     bool banned;
     std::string remoteIp;
+    int priority;
 };
 
 struct ClientInfo {
@@ -409,7 +410,28 @@ struct TalkgroupState {
     std::string name;
     std::string activeSpeaker;
     std::chrono::steady_clock::time_point speakStart;
+    std::chrono::steady_clock::time_point lastAudio;
 };
+
+struct LastHeardInfo {
+    std::string talkgroup;
+    std::chrono::system_clock::time_point when;
+};
+
+std::mutex g_lastHeardMutex;
+std::map<std::string, LastHeardInfo> g_lastHeard;
+
+static bool clientIsSpeaking(const TalkgroupState& ts)
+{
+    if (ts.activeSpeaker.empty()) return false;
+    if (ts.lastAudio.time_since_epoch().count() == 0) return false;
+
+    auto now  = std::chrono::steady_clock::now();
+    long long idle =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.lastAudio).count();
+
+    return (idle < 1500);
+}
 
 struct TimeAnnounceConfig {
     bool enabled;
@@ -454,6 +476,7 @@ std::atomic<bool> g_announcePumpRunning(false);
 
 std::mutex g_audioBufMutex;
 std::map<std::string, std::vector<char> > g_tgAudioBuf;
+std::map<std::string, std::vector<int16_t> > g_tgWaveHistory;
 
 struct WeatherConfig {
     bool enabled;
@@ -477,6 +500,68 @@ std::atomic<bool> g_weatherThreadRunning(false);
 bool fetchWeatherFromOpenWeather(WeatherData& out);
 bool buildCompositeWav(const std::vector<std::string>& keys,const std::string& compositeKey,CachedWav& out);
 std::vector<std::string> buildWeatherSegmentKeys(const WeatherData& wd);
+
+static void sendTalkgroupListForUser(SOCKET sock, const std::string& callsign)
+{
+    std::ostringstream oss;
+    oss << "TGLIST ";
+    bool first = true;
+
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+
+        auto uit = g_users.find(callsign);
+        if (uit != g_users.end()) {
+            const User &u = uit->second;
+
+            if (!u.talkgroups.empty()) {
+                for (const auto &tgName : g_knownTalkgroups) {
+                    if (u.talkgroups.find(tgName) != u.talkgroups.end()) {
+                        if (!first) oss << ",";
+                        first = false;
+                        oss << tgName;
+                    }
+                }
+            } else {
+                for (const auto &tgName : g_knownTalkgroups) {
+                    if (!first) oss << ",";
+                    first = false;
+                    oss << tgName;
+                }
+            }
+        } else {
+            for (const auto &tgName : g_knownTalkgroups) {
+                if (!first) oss << ",";
+                first = false;
+                oss << tgName;
+            }
+        }
+    }
+
+    oss << "\n";
+    std::string msg = oss.str();
+    sendAll(sock, msg.c_str(), msg.size());
+}
+
+static std::unordered_map<std::string, std::vector<std::string>> g_linkedTalkgroups;
+
+static std::vector<std::string> getLinkedFanout(const std::string& tg) {
+    std::vector<std::string> result;
+    if (tg.empty()) return result;
+
+    result.push_back(tg);
+
+    auto it = g_linkedTalkgroups.find(tg);
+    if (it != g_linkedTalkgroups.end()) {
+        for (const auto& link : it->second) {
+            if (!link.empty() &&
+                std::find(result.begin(), result.end(), link) == result.end()) {
+                result.push_back(link);
+            }
+        }
+    }
+    return result;
+}
 
 #ifdef OPUS
 static bool decodeClientOpus(ClientInfo& ci,
@@ -702,6 +787,7 @@ bool loadConfig(const std::string& path) {
 				currentUser.isAdmin = false;
 				currentUser.muted   = false;
 				currentUser.banned  = false;
+				currentUser.priority = 0;
 				continue;
 			}
 			if (l.find('}') != std::string::npos) {
@@ -726,6 +812,10 @@ bool loadConfig(const std::string& path) {
 				}
 				if (parseBoolField(l, "banned", bval)) {
 					currentUser.banned = bval;
+					continue;
+				}
+				if (parseIntField(l, "priority", val)) {
+					currentUser.priority = val;
 					continue;
 				}
 				std::vector<std::string> tgs;
@@ -1404,6 +1494,7 @@ static bool saveConfig(const std::string& path)
             f << "      \"password\": \"" << escapeJson(u.password) << "\",\n";
             f << "      \"is_admin\": " << (u.isAdmin ? "true" : "false") << ",\n";
             f << "      \"banned\": " << (u.banned ? "true" : "false") << ",\n";
+			f << "      \"priority\": " << u.priority << ",\n";
 
             f << "      \"talkgroups\": [";
             bool firstTg = true;
@@ -1464,14 +1555,46 @@ static bool loadFileToString(const std::string& fullPath, std::string& outData) 
     return true;
 }
 
+static std::string formatTimeLocal(std::chrono::system_clock::time_point tp)
+{
+    std::time_t tt = std::chrono::system_clock::to_time_t(tp);
+    char buf[64];
+
+#ifdef _WIN32
+    tm tmb;
+    localtime_s(&tmb, &tt);
+    std::strftime(buf, sizeof(buf), "%d.%m.%Y / %H:%M:%S", &tmb);
+#else
+    tm tmb;
+    localtime_r(&tt, &tmb);
+    std::strftime(buf, sizeof(buf), "%d.%m.%Y / %H:%M:%S", &tmb);
+#endif
+
+    return std::string(buf);
+}
+
+static void updateLastHeard(const std::string& user, const std::string& tg)
+{
+    if (user.empty() || tg.empty())
+        return;
+
+    using namespace std::chrono;
+    auto now = system_clock::now();
+
+    std::lock_guard<std::mutex> lock(g_lastHeardMutex);
+    LastHeardInfo &info = g_lastHeard[user];
+    info.talkgroup = tg;
+    info.when      = now;
+}
+
 static std::string buildStatusJson() {
     using namespace std::chrono;
 
-    std::lock_guard<std::mutex> lock(g_mutex);
+    auto nowSys    = system_clock::now();
+    auto nowSteady = steady_clock::now();
 
-	auto now = system_clock::now();
-	std::time_t tt = system_clock::to_time_t(now);
-	char timebuf[64];
+    std::time_t tt = system_clock::to_time_t(nowSys);
+    char timebuf[64];
 #ifdef _WIN32
     tm tmb;
     localtime_s(&tmb, &tt);
@@ -1482,48 +1605,138 @@ static std::string buildStatusJson() {
     std::strftime(timebuf, sizeof(timebuf), "%d.%m.%Y / %H:%M:%S", &tmb);
 #endif
 
+    int clientCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        clientCount = (int)g_clients.size();
+    }
+
     std::ostringstream oss;
     oss << "{\n";
     oss << "  \"server_time_iso\": \"" << timebuf << "\",\n";
+
     if (g_weatherCfg.enabled && !g_weatherCfg.talkgroup.empty()) {
-		oss << "  \"weather_talkgroup\": \"" << g_weatherCfg.talkgroup << "\",\n";
-		oss << "  \"weather_rx_only\": true,\n";
+        oss << "  \"weather_talkgroup\": \"" << g_weatherCfg.talkgroup << "\",\n";
+        oss << "  \"weather_rx_only\": true,\n";
     }
-    oss << "  \"entries\": [\n";
 
-    bool first = true;
-    for (const auto& kv : g_clients) {
-        const ClientInfo& ci = kv.second;
-        if (!ci.authenticated) continue;
+    oss << "  \"connected_clients\": " << clientCount << ",\n";
 
-        bool speaking = false;
-        long long speakMs = 0;
-        if (!ci.talkgroup.empty()) {
-            auto tgIt = g_talkgroups.find(ci.talkgroup);
-            if (tgIt != g_talkgroups.end()) {
-                const TalkgroupState& ts = tgIt->second;
-                if (ts.activeSpeaker == ci.callsign) {
-                    speaking = true;
-                    auto dur = steady_clock::now() - ts.speakStart;
-                    speakMs = duration_cast<milliseconds>(dur).count();
-                }
+	oss << "  \"talkgroups\": [\n";
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		bool firstTg = true;
+		for (const auto& kv : g_talkgroups) {
+			const std::string& tgName = kv.first;
+			const TalkgroupState& ts  = kv.second;
+
+			std::string activeSpeaker = ts.activeSpeaker;
+			long long speakMs = 0;
+			if (!activeSpeaker.empty() && clientIsSpeaking(ts)) {
+				auto dur = nowSteady - ts.speakStart;
+				speakMs  = duration_cast<std::chrono::milliseconds>(dur).count();
+			} else {
+				activeSpeaker.clear();
+			}
+
+			int listeners = 0;
+			for (const auto& ck : g_clients) {
+				const ClientInfo& ci = ck.second;
+				if (!ci.authenticated) continue;
+				if (ci.talkgroup == tgName) {
+					++listeners;
+				}
+			}
+
+			if (!firstTg) oss << ",\n";
+			firstTg = false;
+
+			std::string outName = ts.name.empty() ? tgName : ts.name;
+
+			oss << "    {"
+				<< "\"name\":\""           << escapeJson(outName)       << "\","
+				<< "\"active_speaker\":\"" << escapeJson(activeSpeaker) << "\","
+				<< "\"speak_ms\":"         << speakMs                   << ","
+				<< "\"listeners\":"        << listeners
+				<< "}";
+		}
+	}
+    oss << "\n  ],\n";
+
+	oss << "  \"entries\": [\n";
+	{
+		std::lock_guard<std::mutex> lock(g_mutex);
+		bool first = true;
+		for (const auto& kv : g_clients) {
+			const ClientInfo& ci = kv.second;
+			if (!ci.authenticated) continue;
+
+			bool       speaking = false;
+			long long  speakMs  = 0;
+
+			if (!ci.talkgroup.empty()) {
+				auto tgIt = g_talkgroups.find(ci.talkgroup);
+				if (tgIt != g_talkgroups.end()) {
+					const TalkgroupState& ts = tgIt->second;
+
+					if (ts.activeSpeaker == ci.callsign && clientIsSpeaking(ts)) {
+						speaking = true;
+						speakMs =
+							std::chrono::duration_cast<std::chrono::milliseconds>(
+								std::chrono::steady_clock::now() - ts.speakStart).count();
+					}
+				}
+			}
+
+			if (!first) oss << ",\n";
+			first = false;
+
+			oss << "    {"
+				<< "\"callsign\":\""  << escapeJson(ci.callsign)    << "\","
+				<< "\"talkgroup\":\"" << escapeJson(ci.talkgroup)   << "\","
+				<< "\"ip\":\""        << escapeJson(ci.remoteAddr)  << "\","
+				<< "\"speaking\":"    << (speaking ? "true" : "false") << ","
+				<< "\"speak_ms\":"    << speakMs
+				<< "}";
+		}
+	}
+	oss << "\n  ]\n";
+    oss << "\n  ]";
+
+    {
+        std::lock_guard<std::mutex> lhLock(g_lastHeardMutex);
+        if (!g_lastHeard.empty()) {
+            oss << ",\n  \"last_heard\": [\n";
+            bool first = true;
+
+            auto nowSysLocal = std::chrono::system_clock::now();
+
+            for (const auto &kv : g_lastHeard) {
+                const std::string &cs       = kv.first;
+                const LastHeardInfo &info   = kv.second;
+
+                if (!first) oss << ",\n";
+                first = false;
+
+                std::string tstr = formatTimeLocal(info.when);
+
+                using namespace std::chrono;
+                long long ageSec =
+                    duration_cast<seconds>(nowSysLocal - info.when).count();
+                if (ageSec < 0) ageSec = 0;
+
+                oss << "    {"
+                    << "\"callsign\":\""   << escapeJson(cs)              << "\","
+                    << "\"talkgroup\":\""  << escapeJson(info.talkgroup)  << "\","
+                    << "\"last_heard\":\"" << escapeJson(tstr)            << "\","
+                    << "\"age_sec\":"      << ageSec
+                    << "}";
             }
+            oss << "\n  ]";
         }
-
-        if (!first) oss << ",\n";
-        first = false;
-
-        oss << "    {"
-            << "\"callsign\":\"" << escapeJson(ci.callsign) << "\","
-            << "\"talkgroup\":\"" << escapeJson(ci.talkgroup) << "\","
-            << "\"ip\":\"" << escapeJson(ci.remoteAddr) << "\","
-            << "\"speaking\":" << (speaking ? "true" : "false") << ","
-            << "\"speak_ms\":" << speakMs
-            << "}";
     }
 
-    oss << "\n  ]\n";
-    oss << "}\n";
+    oss << "\n}\n";
     return oss.str();
 }
 
@@ -1579,6 +1792,64 @@ static void handleHttpClient(SOCKET s) {
     }
 
     if (url.empty()) url = "/";
+
+    if (url.rfind("/api/waveform", 0) == 0) {
+        std::string tg;
+
+        size_t qpos = url.find('?');
+        if (qpos != std::string::npos) {
+            std::string qs = url.substr(qpos + 1);
+            const std::string key = "tg=";
+            size_t kpos = qs.find(key);
+            if (kpos != std::string::npos) {
+                tg = qs.substr(kpos + key.size());
+            }
+        }
+
+        if (tg.empty()) {
+            sendHttpResponse(s,
+                             "HTTP/1.1 400 Bad Request",
+                             "application/json",
+                             "{\"error\":\"missing tg param\"}");
+            closeSocket(s);
+            return;
+        }
+
+        std::vector<int16_t> samples;
+        {
+            std::lock_guard<std::mutex> lock(g_audioBufMutex);
+            std::map<std::string, std::vector<char> >::const_iterator it =
+                g_tgAudioBuf.find(tg);
+            if (it != g_tgAudioBuf.end()) {
+                const std::vector<char>& bufPcm = it->second;
+                size_t sampleCount = bufPcm.size() / sizeof(int16_t);
+                const int16_t* pcm =
+                    reinterpret_cast<const int16_t*>(bufPcm.data());
+
+                const size_t maxSamples = 256;
+                if (sampleCount > maxSamples) {
+                    pcm += (sampleCount - maxSamples);
+                    sampleCount = maxSamples;
+                }
+                samples.assign(pcm, pcm + sampleCount);
+            }
+        }
+
+        std::ostringstream body;
+        body << "{ \"talkgroup\": \"" << escapeJson(tg) << "\", \"samples\": [";
+        for (size_t i = 0; i < samples.size(); ++i) {
+            if (i) body << ",";
+            body << samples[i];
+        }
+        body << "] }";
+
+        sendHttpResponse(s,
+                         "HTTP/1.1 200 OK",
+                         "application/json",
+                         body.str());
+        closeSocket(s);
+        return;
+    }
 
     size_t qpos = url.find('?');
     if (qpos != std::string::npos) {
@@ -1708,15 +1979,30 @@ void broadcastAudioToTalkgroup(const std::string& tg, const std::string& fromUse
                 sendAll(it->first, audio.data(), audio.size());
             }
         }
-        return;
+
+		return;
     }
 
+	updateLastHeard(fromUser, tg);
     const size_t JITTER_TARGET_BYTES = 640;
 
     std::vector<char> toSend;
 
     {
         std::lock_guard<std::mutex> lock(g_audioBufMutex);
+
+        {
+            std::vector<int16_t>& wave = g_tgWaveHistory[tg];
+            const int16_t* pcm = reinterpret_cast<const int16_t*>(audio.data());
+            size_t sampleCount = audio.size() / sizeof(int16_t);
+            wave.insert(wave.end(), pcm, pcm + sampleCount);
+
+            const size_t maxWaveSamples = 256;
+            if (wave.size() > maxWaveSamples) {
+                wave.erase(wave.begin(), wave.end() - maxWaveSamples);
+            }
+        }
+
         std::vector<char>& buf = g_tgAudioBuf[tg];
 
         buf.insert(buf.end(), audio.begin(), audio.end());
@@ -1727,9 +2013,6 @@ void broadcastAudioToTalkgroup(const std::string& tg, const std::string& fromUse
 
         toSend.swap(buf);
     }
-
-    if (toSend.empty())
-        return;
 
     std::lock_guard<std::mutex> lock(g_mutex);
     std::ostringstream oss;
@@ -1743,6 +2026,20 @@ void broadcastAudioToTalkgroup(const std::string& tg, const std::string& fromUse
             if (!sendAll(it->first, header.data(), header.size())) continue;
             sendAll(it->first, toSend.data(), toSend.size());
         }
+    }
+}
+
+static void broadcastToLinkedTalkgroups(const std::string& tg,const std::string& message,SOCKET exceptSock = INVALID_SOCKET) {
+    auto tgs = getLinkedFanout(tg);
+    for (const auto& name : tgs) {
+        broadcastToTalkgroup(name, message, exceptSock);
+    }
+}
+
+static void broadcastAudioToLinkedTalkgroups(const std::string& tg,const std::string& fromUser,const std::vector<char>& buf,SOCKET exceptSock) {
+    auto tgs = getLinkedFanout(tg);
+    for (const auto& name : tgs) {
+        broadcastAudioToTalkgroup(name, fromUser, buf, exceptSock);
     }
 }
 
@@ -1924,7 +2221,7 @@ void handleClient(SOCKET sock) {
 				resp = "AUTH_FAIL " + reason + "\n";
 			}
 
-			sendAll(sock, resp.c_str(), resp.size());
+            sendAll(sock, resp.c_str(), resp.size());
 
 			if (ok) {
 				sockaddr_in addr;
@@ -1940,9 +2237,9 @@ void handleClient(SOCKET sock) {
 				LOG_INFO("[AUTH] user=%s from=%s\n", user.c_str(), ipbuf);
 			}
 
-			if (!ok) {
-				break;
-			}
+            if (!ok) {
+                break;
+            }
 		}
         else if (cmd == "JOIN") {
             std::string tg;
@@ -1988,6 +2285,8 @@ void handleClient(SOCKET sock) {
                 std::string resp = "JOIN_OK " + tg + "\n";
                 sendAll(sock, resp.c_str(), resp.size());
 
+				sendTalkgroupListForUser(sock, callsign);
+
                 if (!prevTg.empty() && prevTg != tg) {
                     triggerAnnouncementForTalkgroup(prevTg, "tg_leave");
                 }
@@ -1997,51 +2296,80 @@ void handleClient(SOCKET sock) {
                 sendAll(sock, resp.c_str(), resp.size());
             }
         }
-        else if (cmd == "REQ_SPEAK") {
-            std::string tg;
-            std::string user;
-            bool granted = false;
+		else if (cmd == "REQ_SPEAK") {
+			std::string tg;
+			std::string user;
+			bool        granted   = false;
+			bool        preempted = false;
+			std::string prevSpeaker;
 
 			{
 				std::lock_guard<std::mutex> lock(g_mutex);
 				ClientInfo &ci = g_clients[sock];
-				tg = ci.talkgroup;
+				tg   = ci.talkgroup;
 				user = ci.callsign;
-				if (!tg.empty()) {
-					if (isRxOnlyTalkgroup(tg)) {
-						granted = false;
-					} else {
-						TalkgroupState &ts = g_talkgroups[tg];
-						if (ts.activeSpeaker.empty()) {
-							ts.activeSpeaker = user;
-							ts.speakStart = std::chrono::steady_clock::now();
-							granted = true;
+
+				if (!tg.empty() && !isRxOnlyTalkgroup(tg)) {
+					TalkgroupState &ts = g_talkgroups[tg];
+
+					auto now = std::chrono::steady_clock::now();
+
+					if (!ts.activeSpeaker.empty()) {
+						if (ts.lastAudio.time_since_epoch().count() != 0) {
+							long long idleMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.lastAudio).count();
+							if (idleMs > 2000) {
+								ts.activeSpeaker.clear();
+							}
 						}
 					}
-				}
-			}
 
-            if (!granted) {
-                std::string resp = "SPEAK_DENIED busy_or_no_tg\n";
-                sendAll(sock, resp.c_str(), resp.size());
-            } else {
-				if (!granted) {
-					std::string resp = "SPEAK_DENIED busy_or_no_tg\n";
-					sendAll(sock, resp.c_str(), resp.size());
-				} else {
-					std::ostringstream oss;
-					oss << "SPEAK_GRANTED " << g_max_talk_ms << "\n";
-					std::string resp = oss.str();
-					sendAll(sock, resp.c_str(), resp.size());
-
-					if (!tg.empty()) {
-						std::string msg = "SPEAKER " + user + "\n";
-						broadcastToTalkgroup(tg, msg);
-						LOG_INFO("[TG %s] SPEAKER = %s\n", tg.c_str(), user.c_str());
+					if (ts.activeSpeaker.empty()) {
+						ts.activeSpeaker = user;
+						ts.speakStart    = now;
+						ts.lastAudio     = now;
+						granted = true;
 					}
 				}
 			}
-        }
+
+			if (!granted) {
+				std::string resp = "SPEAK_DENIED busy_or_no_tg\n";
+				sendAll(sock, resp.c_str(), resp.size());
+			} else {
+				std::ostringstream oss;
+				oss << "SPEAK_GRANTED " << g_max_talk_ms << "\n";
+				std::string resp = oss.str();
+				sendAll(sock, resp.c_str(), resp.size());
+
+				if (!tg.empty()) {
+					std::string sMsg = "SPEAKER " + user + "\n";
+					broadcastToTalkgroup(tg, sMsg);
+				}
+
+				if (preempted && !prevSpeaker.empty()) {
+					SOCKET prevSock = INVALID_SOCKET;
+					{
+						std::lock_guard<std::mutex> lock(g_mutex);
+						for (const auto& kv : g_clients) {
+							const ClientInfo& ci2 = kv.second;
+							if (!ci2.authenticated) continue;
+							if (ci2.callsign == prevSpeaker && ci2.talkgroup == tg) {
+								prevSock = kv.first;
+								break;
+							}
+						}
+					}
+					if (prevSock != INVALID_SOCKET) {
+						const char* msg = "SPEAK_REVOKED preempted\nMIC_FREE\n";
+						sendAll(prevSock, msg, std::strlen(msg));
+					}
+				}
+
+				LOG_INFO("SPEAK granted for %s on TG %s%s\n",
+						 user.c_str(), tg.c_str(),
+						 preempted ? " (preempted previous)" : "");
+			}
+		}
 		else if (cmd == "END_SPEAK") {
 			std::string tg;
 			std::string user;
@@ -2066,69 +2394,86 @@ void handleClient(SOCKET sock) {
 			if (freed) {
 				flushAudioJitterForTalkgroup(tg, user, sock);
 
-				std::string msg = "MIC_FREE\n";
-				broadcastToTalkgroup(tg, msg);
-
+				std::string msg  = "MIC_FREE\n";
 				std::string sMsg = "SPEAKER_NONE\n";
-				broadcastToTalkgroup(tg, sMsg);
+
+				broadcastToLinkedTalkgroups(tg, msg);
+				broadcastToLinkedTalkgroups(tg, sMsg);
 
 				std::cout << "[TG " << tg << "] Mic freed by " << user << "\n";
 			}
         }
 #ifdef OPUS
-		else if (cmd == "AUDIO" || cmd == "AUDIO_OPUS") {
-			size_t size;
-			iss >> size;
-			if (size == 0) continue;
+        else if (cmd == "AUDIO" || cmd == "AUDIO_OPUS") {
+            size_t size;
+            iss >> size;
+            if (size == 0) continue;
 
-			std::vector<char> buf(size);
-			if (!recvAll(sock, buf.data(), size)) {
-				break;
-			}
+            std::vector<char> buf(size);
+            if (!recvAll(sock, buf.data(), size)) {
+                break;
+            }
 
-			std::string tg;
-			std::string user;
-			bool allowed = false;
-			bool timeOut = false;
-			bool isOpus = (cmd == "AUDIO_OPUS");
-			std::vector<char> decodedPcm;
+            std::string tg;
+            std::string user;
+            bool allowed = false;
+            bool timeOut = false;
+            bool isOpus  = (cmd == "AUDIO_OPUS");
+            std::vector<char> decodedPcm;
 
-			{
-				std::lock_guard<std::mutex> lock(g_mutex);
-				auto it = g_clients.find(sock);
-				if (it == g_clients.end()) continue;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                auto it = g_clients.find(sock);
+                if (it == g_clients.end()) continue;
 
-				tg   = it->second.talkgroup;
-				user = it->second.callsign;
+                tg   = it->second.talkgroup;
+                user = it->second.callsign;
 
-				if (allowed && isOpus) {
-					if (!decodeClientOpus(it->second, buf, decodedPcm)) {
-						allowed = false;
-					}
-				}
-			}
+                if (!tg.empty()) {
+                    TalkgroupState &ts = g_talkgroups[tg];
+                    auto uit = g_users.find(user);
+                    if (uit != g_users.end() && !uit->second.muted && ts.activeSpeaker == user) {
+                        auto now = std::chrono::steady_clock::now();
+                        long long elapsed =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.speakStart).count();
+                        if (elapsed <= g_max_talk_ms) {
+                            allowed      = true;
+                            ts.lastAudio = now;
+                        } else {
+                            ts.activeSpeaker.clear();
+                            timeOut = true;
+                        }
+                    }
+                }
+
+                if (allowed && isOpus) {
+                    if (!decodeClientOpus(it->second, buf, decodedPcm)) {
+                        allowed = false;
+                    }
+                }
+            }
 
 			if (allowed) {
 				if (isOpus && !decodedPcm.empty()) {
-					broadcastAudioToTalkgroup(tg, user, decodedPcm, sock);
+					broadcastAudioToLinkedTalkgroups(tg, user, decodedPcm, sock);
 				} else {
-					broadcastAudioToTalkgroup(tg, user, buf, sock);
+					broadcastAudioToLinkedTalkgroups(tg, user, buf, sock);
 				}
-			} else if (timeOut) {
-				flushAudioJitterForTalkgroup(tg, user, sock);
+            } else if (timeOut) {
+                flushAudioJitterForTalkgroup(tg, user, sock);
 
-				std::string msg = "SPEAK_REVOKED TIME_LIMIT\nMIC_FREE\n";
-				sendAll(sock, msg.c_str(), msg.size());
-				if (!tg.empty()) {
-					std::string bmsg = "MIC_FREE\n";
-					broadcastToTalkgroup(tg, bmsg, sock);
+                std::string msg = "SPEAK_REVOKED TIME_LIMIT\nMIC_FREE\n";
+                sendAll(sock, msg.c_str(), msg.size());
+                if (!tg.empty()) {
+                    std::string bmsg = "MIC_FREE\n";
+                    broadcastToTalkgroup(tg, bmsg, sock);
 
-					std::string sMsg = "SPEAKER_NONE\n";
-					broadcastToTalkgroup(tg, sMsg, sock);
-				}
-				LOG_INFO("[TG %s] Time limit reached for %s\n", tg.c_str(), user.c_str());
-			}
-		}
+                    std::string sMsg = "SPEAKER_NONE\n";
+                    broadcastToTalkgroup(tg, sMsg, sock);
+                }
+                LOG_INFO("[TG %s] Time limit reached for %s\n", tg.c_str(), user.c_str());
+            }
+        }
 #else
         else if (cmd == "AUDIO") {
             size_t size;
@@ -2169,7 +2514,7 @@ void handleClient(SOCKET sock) {
             }
 
 			if (allowed) {
-				broadcastAudioToTalkgroup(tg, user, buf, sock);
+				broadcastAudioToLinkedTalkgroups(tg, user, buf, sock);
 			} else {
 				if (timeOut) {
 					flushAudioJitterForTalkgroup(tg, user, sock);
@@ -2312,6 +2657,7 @@ void handleClient(SOCKET sock) {
 							u.isAdmin  = false;
 							u.muted    = false;
 							u.banned   = false;
+							u.priority = 0;
 
 							g_users[newUser] = u;
 
@@ -2526,8 +2872,29 @@ void handleClient(SOCKET sock) {
                 oss << "\n";
                 std::string resp = oss.str();
                 sendAll(sock, resp.c_str(), resp.size());
-            }
-            else {
+            } else if (sub == "last_heard") {
+                std::ostringstream oss;
+                oss << "ADMIN_LASTHEARD ";
+
+                {
+                    std::lock_guard<std::mutex> lhLock(g_lastHeardMutex);
+                    bool first = true;
+                    for (const auto &kv : g_lastHeard) {
+                        const std::string &cs       = kv.first;
+                        const LastHeardInfo &info   = kv.second;
+                        std::string tstr = formatTimeLocal(info.when);
+
+                        if (!first) oss << ",";
+                        first = false;
+
+                        oss << cs << "@" << info.talkgroup << ":" << tstr;
+                    }
+                }
+
+                oss << "\n";
+                std::string resp = oss.str();
+                sendAll(sock, resp.c_str(), resp.size());
+            } else {
                 std::string resp = "ADMIN_FAIL unknown_subcommand\n";
                 sendAll(sock, resp.c_str(), resp.size());
             }

@@ -1,84 +1,121 @@
-# zFM - Digital Voice Communication System
+# zFM – Digital Voice Communication System
 
-A cross-platform digital communication framework consisting of a
-**server**, a **command-line client**, an **SDL2 GUI client**, and
-optional **GPIO/CM108 PTT support**.
+zFM is a cross-platform digital voice communication framework consisting of a:
 
-This project is **not strictly a ham-radio application**, but its architecture and operating style are very similar
-to modern amateur-radio digital voice systems. It is designed for experimentation, learning, and private communication
-networks, and **may be adapted for amateur-radio use** where permitted by local regulations.
+- **Server**
+- **Command-line client**
+- **SDL2 GUI client**
+- **Optional GPIO / CM108 / VOX support**
+- **HTTP Dashboard**
 
-## Project Structure
+zFM is not strictly a ham-radio system, but its architecture is similar to digital‑voice systems (DMR, YSF, etc.).  
+It is designed for experimentation, private networks, and learning.
 
-    /server.cpp
-    /client.cpp
-    /client_gui.cpp
-    /cm108.c
-    /Makefile
-    /client.vcxproj
-    /client_gui.vcxproj
-    /server.vcxproj
+---
 
-## Building
+## 🔗 Linked Talkgroups / Cross‑TG Bridging
+The server now supports routing audio across multiple linked talkgroups:
 
-### Linux
+```json
+"bridges": {
+    "weather": ["gateway", "hesse"],
+    "gateway": ["germany"]
+}
+```
 
-- sudo apt install build-essential libportaudio2 portaudio19-dev libsdl2-dev libsdl2-ttf-dev libudev-dev
-- sudo make
-- sudo chmod +x client client_gui server
+A transmission on `weather` also forwards to `gateway` and `hesse`.
 
-### Windows
+## 🔐 Per‑User Talkgroup Permissions
+Users may be restricted to specific talkgroups:
 
-- Use included Visual Studio `.vcxproj` files.
+```json
+{
+  "callsign": "DL0XLZ",
+  "password": "passw0rd",
+  "talkgroups": ["weather", "gateway", "germany"],
+  "is_admin": true
+}
+```
 
-## Features
+JOIN attempts to unauthorized talkgroups will fail.
 
-### Cross-platform Audio (PortAudio)
+## 📡 Server → Client Talkgroup Sync (TGLIST)
+After JOIN, the server now sends a list of allowed talkgroups:
 
-- The client uses PortAudio for audio capture & playback
+```
+TGLIST tg1,tg2,tg3
+```
 
-### TCP-based low-latency audio transport
+The client GUI automatically updates its talkgroup selector.
 
-Uses a simple line-based command protocol with binary audio frames.
-Protocol commands include:
-- AUTH <callsign> <password>
-- JOIN <talkgroup>
-- REQ_SPEAK
-- END_SPEAK
-- AUDIO <bytes>
+---
 
-### GUI Client (SDL2 + SDL_ttf)
+# 📁 Project Structure
 
-Includes:
-- Real-time audio meter
-- Talkgroup status
-- Log viewer
-- Connect/disconnect
-- PTT & VOX indicators
+```
+/server.cpp
+/client.cpp
+/client_gui.cpp
+/cm108.c
+/Makefile
+*.vcxproj (Windows builds)
+```
 
-### CM108/CM119 USB PTT GPIO Support
+---
 
-- Linux & Windows compatible
+# 🔧 Building
 
-### Server with talkgroups, announcements & weather
+## Linux
 
-The server maintains:
-- User accounts
-- Talkgroup permissions
-- Time announcements
-- Weather API integration
-- HTTP dashboard
+```
+sudo apt install build-essential
+sudo apt install libportaudio2 portaudio19-dev libopus-dev
+sudo apt install libsdl2-dev libsdl2-ttf-dev libudev-dev
+sudo make
+sudo chmod +x client client_gui server
+```
 
-## Components
+## Windows
+Use Visual Studio and the included `.vcxproj` files.
 
-### Server
+---
 
-Handles authentication, talkgroups, audio routing, admin commands,
-announcements, weather, dashboard.
+# 🚀 Features
 
-## Server Config (server.json)
+## ✔ Cross‑platform audio (PortAudio)
+Real‑time PCM capture & playback.
 
-``` json
+## ✔ Low‑latency TCP protocol
+Commands include:
+
+- `AUTH <callsign> <password>`
+- `JOIN <talkgroup>`
+- `TGLIST <tg1,tg2,...>`
+- `REQ_SPEAK`
+- `END_SPEAK`
+- `AUDIO <bytes>`
+- `AUDIO_OPUS <bytes>` (if OPUS enabled)
+
+## ✔ SDL2 GUI Client
+- Audio meter  
+- Device selection  
+- PTT / VOX indicators  
+- Log viewer  
+- Dynamic talkgroup dropdown  
+
+## ✔ Server Features
+- User accounts with permissions  
+- Talkgroups  
+- **Linked talkgroups**  
+- Weather announcements  
+- Time announcements  
+- HTTP dashboard  
+
+---
+
+# 🧩 Example server.json
+
+```json
 {
   "server_port": 26613,
   "max_talk_ms": 300000,
@@ -89,21 +126,26 @@ announcements, weather, dashboard.
       "callsign": "DL0XYZ",
       "password": "passw0rd",
       "is_admin": true,
-      "talkgroups": ["admin", "weather", "gateway"]
+      "talkgroups": ["weather","gateway","germany","hesse"]
     }
   ],
   "talkgroups": [
-	{ "name": "admin" },
-	{ "name": "weather" }
-	{ "name": "gateway" }
+    { "name": "weather" },
+    { "name": "gateway" },
+    { "name": "germany" },
+    { "name": "hesse" }
   ],
+  "bridges": {
+    "weather": ["gateway","hesse"],
+    "gateway": ["germany"]
+  },
   "time_announcement": {
     "enabled": true,
     "folder": "audio",
     "volume_factor": 0.4
   },
   "weather_enabled": true,
-  "weather_host_ip": "api.openweathermap.org"
+  "weather_host_ip": "api.openweathermap.org",
   "weather_talkgroup": "weather",
   "weather_interval_sec": 600,
   "weather_api_key": "API_KEY",
@@ -111,32 +153,31 @@ announcements, weather, dashboard.
   "weather_lon": "8.6821",
   "weather_city_key": "frankfurt"
 }
-
 ```
 
-## Server Commands (Admin)
+---
 
-- /kick user
-- /mute user
-- /unmute user
-- /ban user
-- /unban user
-- /add_user user pass
-- /remove_user user
-- /set_admin user
-- /set_pass user newpass
-- /add_tg user tg
-- /drop_tg user tg
-- /list_users
-- /list_tgs
+# 🛠 Admin Commands
 
-### Client
+- `/kick <user>`
+- `/mute <user>`
+- `/unmute <user>`
+- `/ban <user>`
+- `/unban <user>`
+- `/add_user <user> <pass>`
+- `/remove_user <user>`
+- `/set_admin <user> <0|1>`
+- `/set_pass <user> <newpass>`
+- `/add_tg <user> <tg>`
+- `/drop_tg <user> <tg>`
+- `/list_users`
+- `/list_tgs`
 
-PortAudio capture/playback, networking, PTT, VOX, GPIO/CM108 support.
+---
 
-## Client Config (client.json)
+# 📦 client.json Example
 
-``` json
+```
 {
   "mode": "server",
   "server_ip": "127.0.0.1",
@@ -146,45 +187,29 @@ PortAudio capture/playback, networking, PTT, VOX, GPIO/CM108 support.
   "talkgroup": "gateway",
   "sample_rate": 22050,
   "frames_per_buffer": 1440,
-  "channels": 1,
-  "input_device_index": 0,
-  "output_device_index": 2,
-  "ptt_enabled": true,
-  "ptt_pin": 3,
-  "active_high": true,
-  "ptt_hold_ms": 250,
-  "vox_enabled": false,
-  "vox_threshold": 5000,
-  "input_gain": 100,
-  "output_gain": 100,
-  "ptt_cmd_on": "",
-  "ptt_cmd_off": ""
+  "channels": 1
 }
-
 ```
 
-### GUI Client
+---
 
-SDL2 interface with meters, logs, PTT, device selection.
+# 🌐 Dashboard
 
-### CM108 GPIO Handler
+The built‑in HTTP server displays:
 
-Cross‑platform USB HID GPIO toggle for CM108/CM119 devices.
+- Current speaker  
+- Active talkgroups  
+- User list  
+- Weather  
+- Audio waveform  
 
-## Extra
+Served from `/dashboard/`.
 
-### Dashboard (HTTP)
+---
 
-Server runs a lightweight web server:
-- Serves static files from /dashboard
-- Shows current talkers
-- Group activity
-- Server stats
+# 📢 Weather Announcements
+The server periodically:
 
-### Weather Announcements
-
-If enabled, server periodically:
-- Queries weather API
-- Constructs a list of WAV segments
-- Concatenates them into a cached WAV
-- Broadcasts to talkgroup
+1. Fetches weather from OpenWeatherMap  
+2. Builds WAV segments  
+3. Broadcasts to the configured talkgroup  

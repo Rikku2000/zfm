@@ -38,9 +38,11 @@ extern "C" {
 }
 
 #ifdef GUI
-extern std::atomic<float> g_rxAudioLevel;
-extern std::atomic<bool>  g_talkerActive;
-extern std::chrono::steady_clock::time_point g_talkerStart;
+static std::atomic<float> g_audioLevel(0.0f);
+
+std::atomic<float> g_rxAudioLevel(0.0f);
+std::atomic<bool>  g_talkerActive(false);
+std::chrono::steady_clock::time_point g_talkerStart;
 #endif
 
 #define RESET       "\033[0m"
@@ -473,7 +475,7 @@ static bool saveClientConfigFile(const std::string& path, const ClientConfig& cf
     f << "  \"ptt_cmd_on\": \""  << cfg.ptt_cmd_on  << "\",\n";
     f << "  \"ptt_cmd_off\": \"" << cfg.ptt_cmd_off << "\"\n";
 #ifdef OPUS
-	f << "  \"use_opus\": " << (cfg.use_opus ? "true" : "false") << "\n";
+    f << "  \"use_opus\": " << (cfg.use_opus ? "true" : "false") << "\n";
 #endif
     f << "}\n";
 
@@ -1296,6 +1298,25 @@ void shutdownPortAudio() {
     Pa_Terminate();
 }
 
+static void applySoftLimiter(std::vector<int16_t>& samples, float threshold)
+{
+    if (threshold <= 0.0f || threshold > 1.0f) threshold = 0.9f;
+    const float t = threshold * 32767.0f;
+
+    for (size_t i = 0; i < samples.size(); ++i) {
+        float v = (float)samples[i];
+        float av = std::fabs(v);
+        if (av > t) {
+            float sign = (v >= 0.0f) ? 1.0f : -1.0f;
+            float over = av - t;
+            v = sign * (t + over * 0.25f);
+            if (v > 32767.0f)  v = 32767.0f;
+            if (v < -32768.0f) v = -32768.0f;
+            samples[i] = (int16_t)v;
+        }
+    }
+}
+
 std::vector<char> captureAudioFrame() {
     std::vector<int16_t> samples(g_framesPerBuffer * g_channels);
     PaError err = Pa_ReadStream(g_inputStream, samples.data(), g_framesPerBuffer);
@@ -1320,6 +1341,10 @@ std::vector<char> captureAudioFrame() {
             if (v < -32768.0f) v = -32768.0f;
             samples[i] = static_cast<int16_t>(v);
         }
+    }
+
+    if (!samples.empty()) {
+        applySoftLimiter(samples, 0.9f);
     }
 
     std::vector<char> bytes(samples.size() * sizeof(int16_t));
@@ -1347,6 +1372,10 @@ void playAudioFrame(const std::vector<char>& frame) {
             if (v < -32768.0f) v = -32768.0f;
             outSamples[i] = static_cast<int16_t>(v);
         }
+    }
+
+    if (!outSamples.empty()) {
+        applySoftLimiter(outSamples, 0.95f);
     }
 
     PaError err = Pa_WriteStream(g_outputStream, outSamples.data(), frames);
@@ -1391,6 +1420,15 @@ std::atomic<float> g_outputGain(1.0f);
 
 std::mutex g_speakerMutex;
 std::string g_currentSpeaker;
+
+std::mutex g_tgListMutex;
+std::vector<std::string> g_serverTalkgroups;
+
+#ifdef GUI
+extern std::vector<std::string> g_tgComboItems;
+extern int ui_tg_index;
+extern std::string ui_talkgroup;
+#endif
 
 static const int VOX_TRIGGER_FRAMES_NEEDED  = 6;
 static const int VOX_SILENCE_FRAMES_NEEDED  = 100;
@@ -1594,6 +1632,10 @@ void receiverLoop(SOCKET sock) {
             g_canTalk = true;
             LOG_INFO("[SERVER] You can talk now (max %d ms).\n", ms);
         }
+		else if (cmd == "SPEAK_OK") {
+			g_canTalk = true;
+			LOG_INFO("[SERVER] You can talk now.\n");
+		}
         else if (cmd == "SPEAK_DENIED") {
             std::string reason;
             iss >> reason;
@@ -1649,6 +1691,48 @@ void receiverLoop(SOCKET sock) {
 				std::cout << "[INFO] Mic is now free.\n";
 			}
 		}
+        else if (cmd == "TGLIST") {
+            std::string rest;
+            std::getline(iss, rest);
+            if (!rest.empty() && rest[0] == ' ')
+                rest.erase(0, 1);
+
+            std::vector<std::string> items;
+            std::stringstream ss(rest);
+            std::string tg;
+            while (std::getline(ss, tg, ',')) {
+                tg = trim(tg);
+                if (!tg.empty()) items.push_back(tg);
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_tgListMutex);
+                g_serverTalkgroups = items;
+            }
+
+#ifndef GUI
+            std::cout << "[SERVER] Talkgroups: ";
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (i) std::cout << ", ";
+                std::cout << items[i];
+            }
+            std::cout << "\n";
+#else
+            if (!items.empty()) {
+                g_tgComboItems = items;
+
+                int newIndex = 0;
+                for (size_t i = 0; i < g_tgComboItems.size(); ++i) {
+                    if (g_tgComboItems[i] == ui_talkgroup) {
+                        newIndex = (int)i;
+                        break;
+                    }
+                }
+                ui_tg_index   = newIndex;
+                ui_talkgroup  = g_tgComboItems[ui_tg_index];
+            }
+#endif
+        }
 #ifdef OPUS
 		else if (cmd == "AUDIO_FROM" || cmd == "AUDIO_FROM_OPUS") {
 			std::string user;
@@ -1729,6 +1813,11 @@ void receiverLoop(SOCKET sock) {
             std::string rest;
             std::getline(iss, rest);
             std::cout << "[ADMIN_TGS]" << rest << "\n";
+        }
+        else if (cmd == "ADMIN_LASTHEARD") {
+            std::string rest;
+            std::getline(iss, rest);
+            std::cout << "[LAST_HEARD]" << rest << "\n";
         }
         else if (cmd == "ADMIN_OK") {
             std::string sub;
