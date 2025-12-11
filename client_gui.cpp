@@ -7,41 +7,6 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
 
-static bool saveClientConfigFile(const std::string& path, const ClientConfig& cfg) {
-    std::ofstream f(path.c_str());
-    if (!f.is_open()) {
-        std::cerr << "Failed to open client config for writing: " << path << "\n";
-        return false;
-    }
-
-    f << "{\n";
-    f << "  \"mode\": \"" << cfg.mode << "\",\n";
-    f << "  \"server_ip\": \"" << cfg.server_ip << "\",\n";
-    f << "  \"server_port\": " << cfg.server_port << ",\n";
-    f << "  \"callsign\": \"" << cfg.callsign << "\",\n";
-    f << "  \"password\": \"" << cfg.password << "\",\n";
-    f << "  \"talkgroup\": \"" << cfg.talkgroup << "\",\n";
-    f << "  \"sample_rate\": " << cfg.sample_rate << ",\n";
-    f << "  \"frames_per_buffer\": " << cfg.frames_per_buffer << ",\n";
-    f << "  \"channels\": " << cfg.channels << ",\n";
-    f << "  \"input_device_index\": " << cfg.input_device_index << ",\n";
-    f << "  \"output_device_index\": " << cfg.output_device_index << ",\n";
-    f << "  \"ptt_enabled\": " << (cfg.gpio_ptt_enabled ? "true" : "false") << ",\n";
-    f << "  \"ptt_pin\": " << cfg.gpio_ptt_pin << ",\n";
-    f << "  \"active_high\": " << (cfg.gpio_ptt_active_high ? "true" : "false") << ",\n";
-    f << "  \"ptt_hold_ms\": " << cfg.gpio_ptt_hold_ms << ",\n";
-    f << "  \"vox_enabled\": " << (cfg.vox_enabled ? "true" : "false") << ",\n";
-    f << "  \"vox_threshold\": " << cfg.vox_threshold << ",\n";
-    f << "  \"input_gain\": " << cfg.input_gain << ",\n";
-    f << "  \"output_gain\": " << cfg.output_gain << ",\n";
-	f << "  \"roger_sound\": " << cfg.roger_sound << ",\n";
-    f << "  \"ptt_cmd_on\": \""  << cfg.ptt_cmd_on  << "\",\n";
-    f << "  \"ptt_cmd_off\": \"" << cfg.ptt_cmd_off << "\"\n";
-    f << "}\n";
-
-    return true;
-}
-
 static std::vector<int> g_inputDevices;
 static std::vector<int> g_outputDevices;
 static std::vector<std::string> g_inputDeviceNames;
@@ -511,6 +476,36 @@ static void GuiPushToTalkLoop() {
 			}
 		}
 
+#ifdef OPUS
+		std::vector<char> payload;
+		std::string audioCmd;
+
+		if (g_cfg.use_opus) {
+			payload = encodeOpusFrame(frame);
+			if (payload.empty()) {
+				continue;
+			}
+			audioCmd = "AUDIO_OPUS";
+		} else {
+			payload = std::move(frame);
+			audioCmd = "AUDIO";
+		}
+
+		std::ostringstream oss;
+		oss << audioCmd << " " << payload.size() << "\n";
+		std::string header = oss.str();
+
+		if (!sendAll(g_guiSock, header.data(), header.size())) {
+			GuiAppendLog("[ERROR] Failed to send AUDIO header");
+			g_running = false;
+			break;
+		}
+		if (!sendAll(g_guiSock, payload.data(), payload.size())) {
+			GuiAppendLog("[ERROR] Failed to send AUDIO data");
+			g_running = false;
+			break;
+		}
+#else
         std::ostringstream oss;
         oss << "AUDIO " << frame.size() << "\n";
         std::string header = oss.str();
@@ -525,6 +520,7 @@ static void GuiPushToTalkLoop() {
             g_running = false;
             break;
         }
+#endif
     }
 
     if (g_canTalk) {
@@ -777,6 +773,10 @@ static bool ui_gpio_ptt_en = false;
 static bool ui_gpio_ah     = false;
 static bool ui_vox_en      = false;
 
+#ifdef OPUS
+static bool ui_use_opus    = false;
+#endif
+
 static std::string ui_ptt_cmd_on;
 static std::string ui_ptt_cmd_off;
 
@@ -823,6 +823,10 @@ static void CfgToUi() {
 
     ui_in_gain  = g_cfg.input_gain;
     ui_out_gain = g_cfg.output_gain;
+
+#ifdef OPUS
+	ui_use_opus = g_cfg.use_opus;
+#endif
 
     ui_ptt_cmd_on  = g_cfg.ptt_cmd_on;
     ui_ptt_cmd_off = g_cfg.ptt_cmd_off;
@@ -915,6 +919,10 @@ static void UiToCfg() {
 
     g_cfg.input_gain  = ui_in_gain;
     g_cfg.output_gain = ui_out_gain;
+
+#ifdef OPUS
+	g_cfg.use_opus    = ui_use_opus;
+#endif
 
     g_cfg.vox_enabled          = ui_vox_en;
     g_cfg.vox_threshold        = std::atoi(ui_vox_thresh.c_str());
@@ -1223,6 +1231,10 @@ int main(int argc, char** argv) {
 
 		AddLabel(1, xLabel, y, "Output Gain");
 		AddSlider(1, xCtrl, y, 290, &ui_out_gain, 0, 200, ""); y += 40;
+
+#ifdef OPUS
+		AddCheck(1, xLabel, y, "Use Opus codec", &ui_use_opus); y += 34;
+#endif
 
 		id_btnLoad1 = AddButton(1, w - 190, y + 8, 80, 30, "Load");
 		id_btnSave1 = AddButton(1, w - 100, y + 8, 80, 30, "Save");

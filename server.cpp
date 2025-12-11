@@ -263,7 +263,7 @@ static bool httpGet(const std::string& host, const std::string& path, std::strin
 #endif
 
         if (connect(sock, rp->ai_addr, static_cast<int>(rp->ai_addrlen)) == 0) {
-            break; // success
+            break;
         }
 
 #ifdef _WIN32
@@ -313,6 +313,77 @@ static bool httpGet(const std::string& host, const std::string& path, std::strin
     return !outResponse.empty();
 }
 
+#ifdef OPUS
+#ifdef _WIN32
+#include <opus.h>
+
+static HMODULE g_opusModule = NULL;
+
+typedef OpusDecoder* (*opus_decoder_create_t)(opus_int32 Fs, int channels, int *error);
+typedef void (*opus_decoder_destroy_t)(OpusDecoder *st);
+typedef int (*opus_decode_t)(OpusDecoder *st,
+                             const unsigned char *data,
+                             opus_int32 len,
+                             opus_int16 *pcm,
+                             int frame_size,
+                             int decode_fec);
+typedef const char* (*opus_strerror_t)(int error);
+
+static opus_decoder_create_t  p_opus_decoder_create  = nullptr;
+static opus_decoder_destroy_t p_opus_decoder_destroy = nullptr;
+static opus_decode_t          p_opus_decode          = nullptr;
+static opus_strerror_t        p_opus_strerror        = nullptr;
+
+static const int g_opusSampleRate = 48000;
+static const int g_opusChannels   = 1;
+static const int g_opusFrameSize  = 480;
+
+static bool loadOpusDllServer()
+{
+    if (g_opusModule)
+        return true;
+
+    g_opusModule = LoadLibraryA("opus.dll");
+    if (!g_opusModule) {
+        LOG_WARN("Failed to load opus.dll on server\n");
+        return false;
+    }
+
+    auto loadSym = [](HMODULE mod, const char* name) -> FARPROC {
+        FARPROC p = GetProcAddress(mod, name);
+        if (!p) {
+            LOG_WARN("opus.dll missing symbol: %s\n", name);
+        }
+        return p;
+    };
+
+    p_opus_decoder_create  = (opus_decoder_create_t)  loadSym(g_opusModule, "opus_decoder_create");
+    p_opus_decoder_destroy = (opus_decoder_destroy_t) loadSym(g_opusModule, "opus_decoder_destroy");
+    p_opus_decode          = (opus_decode_t)         loadSym(g_opusModule, "opus_decode");
+    p_opus_strerror        = (opus_strerror_t)       loadSym(g_opusModule, "opus_strerror");
+
+    if (!p_opus_decoder_create || !p_opus_decoder_destroy || !p_opus_decode || !p_opus_strerror) {
+        LOG_WARN("opus.dll missing required decoder functions\n");
+        FreeLibrary(g_opusModule);
+        g_opusModule = NULL;
+        return false;
+    }
+
+    return true;
+}
+
+static void unloadOpusDllServer()
+{
+    if (g_opusModule) {
+        FreeLibrary(g_opusModule);
+        g_opusModule = NULL;
+    }
+}
+#else
+#include <opus/opus.h>
+#endif
+#endif
+
 struct User {
     std::string callsign;
     std::string password;
@@ -329,6 +400,9 @@ struct ClientInfo {
     std::string talkgroup;
     bool authenticated;
     std::string remoteAddr;
+#ifdef OPUS
+	OpusDecoder* opusDec;
+#endif
 };
 
 struct TalkgroupState {
@@ -403,6 +477,63 @@ std::atomic<bool> g_weatherThreadRunning(false);
 bool fetchWeatherFromOpenWeather(WeatherData& out);
 bool buildCompositeWav(const std::vector<std::string>& keys,const std::string& compositeKey,CachedWav& out);
 std::vector<std::string> buildWeatherSegmentKeys(const WeatherData& wd);
+
+#ifdef OPUS
+static bool decodeClientOpus(ClientInfo& ci,
+                             const std::vector<char>& inPkt,
+                             std::vector<char>& outPcm)
+{
+    outPcm.clear();
+    if (inPkt.empty()) return false;
+    if (!loadOpusDllServer()) return false;
+
+    if (!p_opus_decoder_create || !p_opus_decode) {
+        return false;
+    }
+
+    if (!ci.opusDec) {
+        int err = 0;
+        ci.opusDec = p_opus_decoder_create(g_opusSampleRate,
+                                           g_opusChannels,
+                                           &err);
+        if (!ci.opusDec || err != OPUS_OK) {
+            LOG_WARN("Opus decoder create failed for client %s (err=%d)\n",
+                     ci.callsign.c_str(), err);
+            ci.opusDec = nullptr;
+            return false;
+        }
+    }
+
+    std::vector<opus_int16> pcm((size_t)g_opusFrameSize * g_opusChannels * 2);
+    int nsamples = p_opus_decode(ci.opusDec,
+                                 (const unsigned char*)inPkt.data(),
+                                 (opus_int32)inPkt.size(),
+                                 pcm.data(),
+                                 g_opusFrameSize,
+                                 0);
+
+    if (nsamples < 0) {
+        LOG_WARN("Opus decode failed for client %s: %s\n",
+                 ci.callsign.c_str(),
+                 p_opus_strerror ? p_opus_strerror(nsamples) : "error");
+        return false;
+    }
+
+    if (nsamples == 0) {
+        return false;
+    }
+
+    size_t totalSamples = (size_t)nsamples * g_opusChannels;
+    outPcm.resize(totalSamples * sizeof(opus_int16));
+    std::memcpy(outPcm.data(), pcm.data(), outPcm.size());
+    return true;
+}
+#else
+static bool decodeClientOpus(ClientInfo&, const std::vector<char>&, std::vector<char>&)
+{
+    return false;
+}
+#endif
 
 static inline std::string trim(const std::string& s) {
     size_t a = 0;
@@ -1689,6 +1820,13 @@ void cleanupClient(SOCKET sock) {
 		triggerAnnouncementForTalkgroup(tg, "tg_leave");
 	}
 
+#ifdef OPUS
+    if (it->second.opusDec && p_opus_decoder_destroy) {
+        p_opus_decoder_destroy(it->second.opusDec);
+        it->second.opusDec = nullptr;
+    }
+#endif
+
     g_clients.erase(it);
 }
 
@@ -1701,6 +1839,9 @@ void handleClient(SOCKET sock) {
         ci.talkgroup.clear();
         ci.authenticated = false;
         ci.remoteAddr = "unknown";
+#ifdef OPUS
+		ci.opusDec = nullptr;
+#endif
 
         sockaddr_in addr;
         socklen_t len = sizeof(addr);
@@ -1920,6 +2061,81 @@ void handleClient(SOCKET sock) {
 				std::cout << "[TG " << tg << "] Mic freed by " << user << "\n";
 			}
         }
+#ifdef OPUS
+		else if (cmd == "AUDIO" || cmd == "AUDIO_OPUS") {
+			size_t size;
+			iss >> size;
+			if (size == 0) continue;
+
+			std::vector<char> buf(size);
+			if (!recvAll(sock, buf.data(), size)) {
+				break;
+			}
+
+			std::string tg;
+			std::string user;
+			bool allowed = false;
+			bool timeOut = false;
+			bool isOpus = (cmd == "AUDIO_OPUS");
+
+			std::vector<char> decodedPcm;
+
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+				std::unordered_map<SOCKET, ClientInfo>::iterator it = g_clients.find(sock);
+				if (it == g_clients.end()) {
+					continue;
+				}
+
+				tg   = it->second.talkgroup;
+				user = it->second.callsign;
+
+				if (!tg.empty()) {
+					TalkgroupState& ts = g_talkgroups[tg];
+					std::unordered_map<std::string, User>::iterator uit = g_users.find(user);
+					if (uit != g_users.end() && !uit->second.muted && ts.activeSpeaker == user) {
+						std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+						long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.speakStart).count();
+						if (elapsed <= g_max_talk_ms) {
+							allowed = true;
+						} else {
+							ts.activeSpeaker.clear();
+							timeOut = true;
+						}
+					}
+				}
+
+				if (allowed && isOpus) {
+					if (!decodeClientOpus(it->second, buf, decodedPcm)) {
+						allowed = false;
+					}
+				}
+			}
+
+			if (allowed) {
+				if (isOpus) {
+					if (!decodedPcm.empty()) {
+						broadcastAudioToTalkgroup(tg, user, decodedPcm, sock);
+					}
+				} else {
+					broadcastAudioToTalkgroup(tg, user, buf, sock);
+				}
+			} else if (timeOut) {
+				flushAudioJitterForTalkgroup(tg, user, sock);
+
+				std::string msg = "SPEAK_REVOKED TIME_LIMIT\nMIC_FREE\n";
+				sendAll(sock, msg.c_str(), msg.size());
+				if (!tg.empty()) {
+					std::string bmsg = "MIC_FREE\n";
+					broadcastToTalkgroup(tg, bmsg, sock);
+
+					std::string sMsg = "SPEAKER_NONE\n";
+					broadcastToTalkgroup(tg, sMsg, sock);
+				}
+				LOG_INFO("[TG %s] Time limit reached for %s\n", tg.c_str(), user.c_str());
+			}
+		}
+#else
         else if (cmd == "AUDIO") {
             size_t size;
             iss >> size;
@@ -1977,6 +2193,7 @@ void handleClient(SOCKET sock) {
 				}
 			}
         }
+#endif
 		else if (cmd == "ADMIN") {
 			std::string sub;
 			iss >> sub;

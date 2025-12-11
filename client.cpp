@@ -353,6 +353,10 @@ struct ClientConfig {
     std::string ptt_cmd_off;
 
 	int roger_sound;
+
+#ifdef OPUS
+	bool use_opus;
+#endif
 };
 
 bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
@@ -384,6 +388,10 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
     cfg.ptt_cmd_off.clear();
 
 	cfg.roger_sound = 1;
+
+#ifdef OPUS
+	cfg.use_opus = false;
+#endif
 
     std::ifstream f(path.c_str());
     if (!f.is_open()) {
@@ -426,7 +434,48 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
         else if (parseIntField(l, "input_gain", ival))    cfg.input_gain  = ival;
         else if (parseIntField(l, "output_gain", ival))   cfg.output_gain = ival;
 		else if (parseIntField(l, "roger_sound", ival)) cfg.roger_sound = ival;
+#ifdef OPUS
+		else if (parseBoolField(l, "use_opus", bval)) cfg.use_opus = bval;
+#endif
     }
+
+    return true;
+}
+
+static bool saveClientConfigFile(const std::string& path, const ClientConfig& cfg) {
+    std::ofstream f(path.c_str());
+    if (!f.is_open()) {
+        std::cerr << "Failed to open client config for writing: " << path << "\n";
+        return false;
+    }
+
+    f << "{\n";
+    f << "  \"mode\": \"" << cfg.mode << "\",\n";
+    f << "  \"server_ip\": \"" << cfg.server_ip << "\",\n";
+    f << "  \"server_port\": " << cfg.server_port << ",\n";
+    f << "  \"callsign\": \"" << cfg.callsign << "\",\n";
+    f << "  \"password\": \"" << cfg.password << "\",\n";
+    f << "  \"talkgroup\": \"" << cfg.talkgroup << "\",\n";
+    f << "  \"sample_rate\": " << cfg.sample_rate << ",\n";
+    f << "  \"frames_per_buffer\": " << cfg.frames_per_buffer << ",\n";
+    f << "  \"channels\": " << cfg.channels << ",\n";
+    f << "  \"input_device_index\": " << cfg.input_device_index << ",\n";
+    f << "  \"output_device_index\": " << cfg.output_device_index << ",\n";
+    f << "  \"ptt_enabled\": " << (cfg.gpio_ptt_enabled ? "true" : "false") << ",\n";
+    f << "  \"ptt_pin\": " << cfg.gpio_ptt_pin << ",\n";
+    f << "  \"active_high\": " << (cfg.gpio_ptt_active_high ? "true" : "false") << ",\n";
+    f << "  \"ptt_hold_ms\": " << cfg.gpio_ptt_hold_ms << ",\n";
+    f << "  \"vox_enabled\": " << (cfg.vox_enabled ? "true" : "false") << ",\n";
+    f << "  \"vox_threshold\": " << cfg.vox_threshold << ",\n";
+    f << "  \"input_gain\": " << cfg.input_gain << ",\n";
+    f << "  \"output_gain\": " << cfg.output_gain << ",\n";
+	f << "  \"roger_sound\": " << cfg.roger_sound << ",\n";
+    f << "  \"ptt_cmd_on\": \""  << cfg.ptt_cmd_on  << "\",\n";
+    f << "  \"ptt_cmd_off\": \"" << cfg.ptt_cmd_off << "\"\n";
+#ifdef OPUS
+	f << "  \"use_opus\": " << (cfg.use_opus ? "true" : "false") << "\n";
+#endif
+    f << "}\n";
 
     return true;
 }
@@ -449,6 +498,224 @@ extern ClientConfig g_cfg;
 
 extern std::atomic<float> g_inputGain;
 extern std::atomic<float> g_outputGain;
+
+#ifdef OPUS
+#ifdef _WIN32
+#include <opus.h>
+#else
+#include <opus/opus.h>
+#endif
+
+static OpusEncoder* g_opusEnc = nullptr;
+static OpusDecoder* g_opusDec = nullptr;
+static int          g_opusFrameSize = 0;
+static const int    OPUS_MAX_PACKET_BYTES = 1500;
+
+#ifdef _WIN32
+static HMODULE g_opusModule = NULL;
+
+typedef OpusEncoder* (*opus_encoder_create_t)(opus_int32 Fs, int channels,
+                                              int application, int *error);
+typedef void (*opus_encoder_destroy_t)(OpusEncoder *st);
+typedef OpusDecoder* (*opus_decoder_create_t)(opus_int32 Fs, int channels,
+                                              int *error);
+typedef void (*opus_decoder_destroy_t)(OpusDecoder *st);
+typedef int (*opus_encode_t)(OpusEncoder *st, const opus_int16 *pcm,
+                             int frame_size, unsigned char *data,
+                             opus_int32 max_data_bytes);
+typedef int (*opus_decode_t)(OpusDecoder *st, const unsigned char *data,
+                             opus_int32 len, opus_int16 *pcm,
+                             int frame_size, int decode_fec);
+typedef const char* (*opus_strerror_t)(int error);
+
+static opus_encoder_create_t  p_opus_encoder_create  = nullptr;
+static opus_encoder_destroy_t p_opus_encoder_destroy = nullptr;
+static opus_decoder_create_t  p_opus_decoder_create  = nullptr;
+static opus_decoder_destroy_t p_opus_decoder_destroy = nullptr;
+static opus_encode_t          p_opus_encode          = nullptr;
+static opus_decode_t          p_opus_decode          = nullptr;
+static opus_strerror_t        p_opus_strerror        = nullptr;
+
+static bool loadOpusDll()
+{
+    if (g_opusModule)
+        return true;
+
+    g_opusModule = LoadLibraryA("opus.dll");
+    if (!g_opusModule) {
+        std::cerr << "Failed to load opus.dll\n";
+        return false;
+    }
+
+    auto loadSym = [](HMODULE mod, const char* name) -> FARPROC {
+        FARPROC p = GetProcAddress(mod, name);
+        if (!p)
+            std::cerr << "Missing symbol in opus.dll: " << name << "\n";
+        return p;
+    };
+
+    p_opus_encoder_create  = (opus_encoder_create_t)  loadSym(g_opusModule, "opus_encoder_create");
+    p_opus_encoder_destroy = (opus_encoder_destroy_t) loadSym(g_opusModule, "opus_encoder_destroy");
+    p_opus_decoder_create  = (opus_decoder_create_t)  loadSym(g_opusModule, "opus_decoder_create");
+    p_opus_decoder_destroy = (opus_decoder_destroy_t) loadSym(g_opusModule, "opus_decoder_destroy");
+    p_opus_encode          = (opus_encode_t)          loadSym(g_opusModule, "opus_encode");
+    p_opus_decode          = (opus_decode_t)          loadSym(g_opusModule, "opus_decode");
+    p_opus_strerror        = (opus_strerror_t)        loadSym(g_opusModule, "opus_strerror");
+
+    if (!p_opus_encoder_create || !p_opus_encoder_destroy ||
+        !p_opus_decoder_create || !p_opus_decoder_destroy ||
+        !p_opus_encode || !p_opus_decode || !p_opus_strerror)
+    {
+        std::cerr << "opus.dll missing required functions\n";
+        FreeLibrary(g_opusModule);
+        g_opusModule = NULL;
+        return false;
+    }
+
+    return true;
+}
+
+static void unloadOpusDll()
+{
+    if (g_opusModule) {
+        FreeLibrary(g_opusModule);
+        g_opusModule = NULL;
+    }
+}
+#else
+static bool loadOpusDll()     { return true; }
+static void unloadOpusDll()   {}
+#endif
+
+static bool initOpus(const ClientConfig& cfg)
+{
+    if (!cfg.use_opus)
+        return true;
+
+    if (!loadOpusDll()) {
+        std::cerr << "Opus DLL load failed\n";
+        return false;
+    }
+
+    int err = 0;
+    int sampleRate = cfg.sample_rate;
+    int channels   = cfg.channels;
+
+    g_opusFrameSize = (int)cfg.frames_per_buffer;
+
+    g_opusEnc = p_opus_encoder_create(sampleRate, channels,
+                                      OPUS_APPLICATION_VOIP, &err);
+    if (err != OPUS_OK || !g_opusEnc) {
+        std::cerr << "Opus encoder create failed: "
+                  << (p_opus_strerror ? p_opus_strerror(err) : "unknown") << "\n";
+        g_opusEnc = nullptr;
+        return false;
+    }
+
+    g_opusDec = p_opus_decoder_create(sampleRate, channels, &err);
+    if (err != OPUS_OK || !g_opusDec) {
+        std::cerr << "Opus decoder create failed: "
+                  << (p_opus_strerror ? p_opus_strerror(err) : "unknown") << "\n";
+        if (g_opusEnc) {
+            p_opus_encoder_destroy(g_opusEnc);
+            g_opusEnc = nullptr;
+        }
+        g_opusDec = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+static void shutdownOpus()
+{
+    if (g_opusEnc) {
+        if (p_opus_encoder_destroy)
+            p_opus_encoder_destroy(g_opusEnc);
+        g_opusEnc = nullptr;
+    }
+    if (g_opusDec) {
+        if (p_opus_decoder_destroy)
+            p_opus_decoder_destroy(g_opusDec);
+        g_opusDec = nullptr;
+    }
+    unloadOpusDll();
+}
+
+static std::vector<char> encodeOpusFrame(const std::vector<char>& pcmBytes)
+{
+    if (!g_cfg.use_opus || !g_opusEnc || !p_opus_encode) {
+        return pcmBytes;
+    }
+
+    if (pcmBytes.empty()) {
+        return std::vector<char>();
+    }
+
+    size_t samplesTotal    = pcmBytes.size() / sizeof(opus_int16);
+    size_t samplesPerFrame = (size_t)g_opusFrameSize * g_channels;
+
+    if (samplesTotal != samplesPerFrame) {
+        std::cerr << "encodeOpusFrame: unexpected frame size: "
+                  << samplesTotal << " samples, expected "
+                  << samplesPerFrame << "\n";
+        return std::vector<char>();
+    }
+
+    const opus_int16* pcm = reinterpret_cast<const opus_int16*>(pcmBytes.data());
+    std::vector<unsigned char> pkt(OPUS_MAX_PACKET_BYTES);
+
+    int nbytes = p_opus_encode(g_opusEnc,
+                               pcm,
+                               g_opusFrameSize,
+                               pkt.data(),
+                               (opus_int32)pkt.size());
+
+    if (nbytes < 0) {
+        std::cerr << "Opus encode failed: "
+                  << (p_opus_strerror ? p_opus_strerror(nbytes) : "error") << "\n";
+        return std::vector<char>();
+    }
+
+    return std::vector<char>((char*)pkt.data(), (char*)pkt.data() + nbytes);
+}
+
+static std::vector<char> decodeOpusFrame(const std::vector<char>& pktBytes)
+{
+    if (!g_cfg.use_opus || !g_opusDec || !p_opus_decode) {
+        return pktBytes;
+    }
+
+    if (pktBytes.empty()) {
+        return std::vector<char>();
+    }
+
+    std::vector<opus_int16> pcm((size_t)g_opusFrameSize * g_channels);
+
+    int nsamples = p_opus_decode(g_opusDec,
+                                 (const unsigned char*)pktBytes.data(),
+                                 (opus_int32)pktBytes.size(),
+                                 pcm.data(),
+                                 g_opusFrameSize,
+                                 0 /* no FEC */);
+
+    if (nsamples < 0) {
+        std::cerr << "Opus decode failed: "
+                  << (p_opus_strerror ? p_opus_strerror(nsamples) : "error") << "\n";
+        return std::vector<char>();
+    }
+
+    if (nsamples == 0) {
+        return std::vector<char>();
+    }
+
+    size_t totalSamples = (size_t)nsamples * g_channels;
+    std::vector<char> out(totalSamples * sizeof(opus_int16));
+    std::memcpy(out.data(), pcm.data(), out.size());
+
+    return out;
+}
+#endif
 
 static void ParseCm108Command(const std::string& cmd, std::string& hiddev, int& pinOut)
 {
@@ -1246,6 +1513,34 @@ void voxAutoLoop(SOCKET sock) {
         }
 
         if (above) {
+#ifdef OPUS
+			std::vector<char> payload;
+			std::string audioCmd;
+
+			if (g_cfg.use_opus) {
+				payload = encodeOpusFrame(frame);
+				if (payload.empty()) {
+					continue;
+				}
+				audioCmd = "AUDIO_OPUS";
+			} else {
+				payload = std::move(frame);
+				audioCmd = "AUDIO";
+			}
+
+			std::ostringstream oss;
+			oss << audioCmd << " " << payload.size() << "\n";
+			std::string header = oss.str();
+
+			if (!sendAll(sock, header.data(), header.size())) {
+				std::cout << "Failed to send AUDIO header (ending talk session).\n";
+				break;
+			}
+			if (!sendAll(sock, payload.data(), payload.size())) {
+				std::cout << "Failed to send AUDIO data (ending talk session).\n";
+				break;
+			}
+#else
             std::ostringstream oss;
             oss << "AUDIO " << frame.size() << "\n";
             std::string header = oss.str();
@@ -1260,6 +1555,7 @@ void voxAutoLoop(SOCKET sock) {
                 g_running = false;
                 break;
             }
+#endif
         }
     }
 
@@ -1352,6 +1648,42 @@ void receiverLoop(SOCKET sock) {
 				std::cout << "[INFO] Mic is now free.\n";
 			}
 		}
+#ifdef OPUS
+		else if (cmd == "AUDIO_FROM" || cmd == "AUDIO_FROM_OPUS") {
+			std::string user;
+			size_t size;
+			iss >> user >> size;
+			std::vector<char> buf(size);
+			if (!recvAll(sock, buf.data(), size)) {
+				LOG_ERROR("Failed to receive audio frame\n");
+				g_running = false;
+				break;
+			}
+
+			{
+				std::lock_guard<std::mutex> lock(g_speakerMutex);
+				if (g_currentSpeaker != user) {
+					g_currentSpeaker = user;
+#ifdef GUI
+					g_talkerStart  = std::chrono::steady_clock::now();
+					g_talkerActive = true;
+#endif
+					std::cout << "[TG] Now talking: " << user << "\n";
+				}
+			}
+			g_lastRxAudioTime = std::chrono::steady_clock::now();
+
+			std::vector<char> pcm;
+			if (cmd == "AUDIO_FROM_OPUS" && g_cfg.use_opus) {
+				pcm = decodeOpusFrame(buf);
+			} else {
+				pcm = std::move(buf);
+			}
+
+			if (!pcm.empty()) {
+				playAudioFrame(pcm);
+			}
+#else
 		else if (cmd == "AUDIO_FROM") {
 			std::string user;
 			size_t size;
@@ -1375,6 +1707,7 @@ void receiverLoop(SOCKET sock) {
 			}
 			g_lastRxAudioTime = std::chrono::steady_clock::now();
 			playAudioFrame(buf);
+#endif
 		}
         else if (cmd == "ADMIN_INFO") {
             std::string info;
@@ -1677,6 +2010,14 @@ int main(int argc, char** argv) {
         std::cerr << "PortAudio init failed.\n";
         return 1;
     }
+#ifdef OPUS
+	if (g_cfg.use_opus) {
+		if (!initOpus(g_cfg)) {
+			std::cerr << "Opus init failed, falling back to PCM.\n";
+			g_cfg.use_opus = false;
+		}
+	}
+#endif
 	loadRogerFromConfig();
     if (!initGpioPtt(g_cfg)) {
         std::cerr << "GPIO PTT init failed.\n";
@@ -1689,6 +2030,9 @@ int main(int argc, char** argv) {
     if (g_cfg.mode == "parrot") {
         parrotLoop(g_cfg);
         shutdownPortAudio();
+#ifdef OPUS
+		shutdownOpus();
+#endif
         shutdownGpioPtt();
         return 0;
     }
@@ -1699,6 +2043,9 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to create socket\n";
         cleanupSockets();
         shutdownPortAudio();
+#ifdef OPUS
+		shutdownOpus();
+#endif
         shutdownGpioPtt();
         return 1;
     }
@@ -1722,6 +2069,9 @@ int main(int argc, char** argv) {
 		closeSocket(sock);
 		cleanupSockets();
 		shutdownPortAudio();
+#ifdef OPUS
+		shutdownOpus();
+#endif
 		shutdownGpioPtt();
 		return 1;
 	}
@@ -1741,6 +2091,9 @@ int main(int argc, char** argv) {
 		closeSocket(sock);
 		cleanupSockets();
 		shutdownPortAudio();
+#ifdef OPUS
+		shutdownOpus();
+#endif
 		shutdownGpioPtt();
 		return 1;
 	}
@@ -1754,6 +2107,9 @@ int main(int argc, char** argv) {
         closeSocket(sock);
         cleanupSockets();
         shutdownPortAudio();
+#ifdef OPUS
+		shutdownOpus();
+#endif
         shutdownGpioPtt();
         return 1;
     }
@@ -1767,6 +2123,9 @@ int main(int argc, char** argv) {
 			closeSocket(sock);
 			cleanupSockets();
 			shutdownPortAudio();
+#ifdef OPUS
+			shutdownOpus();
+#endif
 			shutdownGpioPtt();
 			return 1;
 		}
@@ -1775,6 +2134,9 @@ int main(int argc, char** argv) {
 		closeSocket(sock);
 		cleanupSockets();
 		shutdownPortAudio();
+#ifdef OPUS
+		shutdownOpus();
+#endif
 		shutdownGpioPtt();
 		return 1;
 #endif
@@ -1796,6 +2158,9 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
+#ifdef OPUS
+			shutdownOpus();
+#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -1805,6 +2170,9 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
+#ifdef OPUS
+			shutdownOpus();
+#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -1813,6 +2181,9 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
+#ifdef OPUS
+			shutdownOpus();
+#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -1828,6 +2199,9 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
+#ifdef OPUS
+			shutdownOpus();
+#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -1837,6 +2211,9 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
+#ifdef OPUS
+			shutdownOpus();
+#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -1846,6 +2223,9 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
+#ifdef OPUS
+			shutdownOpus();
+#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -1892,6 +2272,9 @@ int main(int argc, char** argv) {
     if (recvThread.joinable()) recvThread.join();
 
     shutdownPortAudio();
+#ifdef OPUS
+	shutdownOpus();
+#endif
     shutdownGpioPtt();
     cleanupSockets();
     return 0;
