@@ -484,9 +484,17 @@ static bool decodeClientOpus(ClientInfo& ci,
                              std::vector<char>& outPcm)
 {
     outPcm.clear();
-    if (inPkt.empty()) return false;
-    if (!loadOpusDllServer()) return false;
 
+    if (inPkt.empty()) {
+        return false;
+    }
+    if (inPkt.size() < 3) {
+        return false;
+    }
+
+    if (!loadOpusDllServer()) {
+        return false;
+    }
     if (!p_opus_decoder_create || !p_opus_decode) {
         return false;
     }
@@ -505,6 +513,7 @@ static bool decodeClientOpus(ClientInfo& ci,
     }
 
     std::vector<opus_int16> pcm((size_t)g_opusFrameSize * g_opusChannels * 2);
+
     int nsamples = p_opus_decode(ci.opusDec,
                                  (const unsigned char*)inPkt.data(),
                                  (opus_int32)inPkt.size(),
@@ -513,9 +522,14 @@ static bool decodeClientOpus(ClientInfo& ci,
                                  0);
 
     if (nsamples < 0) {
-        LOG_WARN("Opus decode failed for client %s: %s\n",
-                 ci.callsign.c_str(),
-                 p_opus_strerror ? p_opus_strerror(nsamples) : "error");
+        static int badCount = 0;
+        if (badCount < 10) {
+            ++badCount;
+            LOG_WARN("Opus decode failed for client %s: %s (len=%d)\n",
+                     ci.callsign.c_str(),
+                     p_opus_strerror ? p_opus_strerror(nsamples) : "error",
+                     (int)inPkt.size());
+        }
         return false;
     }
 
@@ -2077,33 +2091,15 @@ void handleClient(SOCKET sock) {
 			bool allowed = false;
 			bool timeOut = false;
 			bool isOpus = (cmd == "AUDIO_OPUS");
-
 			std::vector<char> decodedPcm;
 
 			{
 				std::lock_guard<std::mutex> lock(g_mutex);
-				std::unordered_map<SOCKET, ClientInfo>::iterator it = g_clients.find(sock);
-				if (it == g_clients.end()) {
-					continue;
-				}
+				auto it = g_clients.find(sock);
+				if (it == g_clients.end()) continue;
 
 				tg   = it->second.talkgroup;
 				user = it->second.callsign;
-
-				if (!tg.empty()) {
-					TalkgroupState& ts = g_talkgroups[tg];
-					std::unordered_map<std::string, User>::iterator uit = g_users.find(user);
-					if (uit != g_users.end() && !uit->second.muted && ts.activeSpeaker == user) {
-						std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-						long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.speakStart).count();
-						if (elapsed <= g_max_talk_ms) {
-							allowed = true;
-						} else {
-							ts.activeSpeaker.clear();
-							timeOut = true;
-						}
-					}
-				}
 
 				if (allowed && isOpus) {
 					if (!decodeClientOpus(it->second, buf, decodedPcm)) {
@@ -2113,10 +2109,8 @@ void handleClient(SOCKET sock) {
 			}
 
 			if (allowed) {
-				if (isOpus) {
-					if (!decodedPcm.empty()) {
-						broadcastAudioToTalkgroup(tg, user, decodedPcm, sock);
-					}
+				if (isOpus && !decodedPcm.empty()) {
+					broadcastAudioToTalkgroup(tg, user, decodedPcm, sock);
 				} else {
 					broadcastAudioToTalkgroup(tg, user, buf, sock);
 				}

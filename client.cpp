@@ -1514,6 +1514,8 @@ void voxAutoLoop(SOCKET sock) {
 
         if (above) {
 #ifdef OPUS
+            std::ostringstream oss;
+			std::vector<char> frame = captureAudioFrame();
 			std::vector<char> payload;
 			std::string audioCmd;
 
@@ -1528,7 +1530,6 @@ void voxAutoLoop(SOCKET sock) {
 				audioCmd = "AUDIO";
 			}
 
-			std::ostringstream oss;
 			oss << audioCmd << " " << payload.size() << "\n";
 			std::string header = oss.str();
 
