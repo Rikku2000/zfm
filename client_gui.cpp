@@ -1386,8 +1386,30 @@ int main(int argc, char** argv) {
 							int relY = my - g_comboPopupRect.y;
 							int idx  = relY / itemHeight;
 							if (idx >= 0 && idx < (int)cw.comboItems->size()) {
+								std::string oldTg = ui_talkgroup;
+
 								if (cw.boundIndex) *cw.boundIndex = idx;
 								if (cw.boundText)  *cw.boundText  = (*cw.comboItems)[idx];
+
+								if (cw.boundIndex == &ui_tg_index && cw.boundText == &ui_talkgroup) {
+									std::string newTg = ui_talkgroup;
+
+									if (!newTg.empty() && newTg != oldTg &&
+										g_connected && g_guiSock != INVALID_SOCKET) {
+
+										g_cfg.talkgroup = newTg;
+
+										std::ostringstream oss;
+										oss << "JOIN " << newTg << "\n";
+										std::string joinCmd = oss.str();
+
+										if (!sendAll(g_guiSock, joinCmd.data(), joinCmd.size())) {
+											GuiAppendLog("[ERROR] Failed to send JOIN for talkgroup " + newTg);
+										} else {
+											GuiAppendLog("Requesting switch to talkgroup: " + newTg);
+										}
+									}
+								}
 							}
 						}
 						g_comboOpen = false;
@@ -1816,32 +1838,77 @@ int main(int argc, char** argv) {
 					int durY = centerY + th + 6;
 					DrawText(renderer, font, dur, durX, durY, COL_TEXT_MUT);
 
-					float levelLocal  = g_audioLevel.load();
-					float levelRemote = g_rxAudioLevel.load();
-					float level = (g_currentSpeaker == g_cfg.callsign) ? levelLocal : levelRemote;
-					if (level < 0.0f) level = 0.0f;
-					if (level > 1.0f) level = 1.0f;
+					float levelMic = g_audioLevel.load();
+					float levelRx  = g_rxAudioLevel.load();
 
-					int barWidth  = rcTalkerInner.w - 40;
-					if (barWidth < 40) barWidth = 40;
+					auto clamp01 = [](float v) {
+						if (v < 0.0f) return 0.0f;
+						if (v > 1.0f) return 1.0f;
+						return v;
+					};
+
+					levelMic = clamp01(levelMic);
+					levelRx  = clamp01(levelRx);
+
+					int totalBarWidth = rcTalkerInner.w - 40;
+					if (totalBarWidth < 80) totalBarWidth = 80;
+
 					int barHeight = 10;
-					int barX      = rcTalkerInner.x + (rcTalkerInner.w - barWidth) / 2;
-					int barY      = durY + dH + 8;
+					int barX      = rcTalkerInner.x + (rcTalkerInner.w - totalBarWidth) / 2;
+					int barY      = durY + dH + 10;
 
-					SDL_Rect barBg = { barX, barY, barWidth, barHeight };
-					DrawRect(renderer, barBg, COL_INPUT_BG);
-					DrawRectBorder(renderer, barBg, COL_PANEL_BD, 1);
+					int gap = 20;
+					int singleWidth = (totalBarWidth - gap) / 2;
+					if (singleWidth < 40) singleWidth = 40;
 
-					int fillWidth = (int)(barWidth * level);
-					if (fillWidth > 0) {
-						SDL_Rect barFill = {
-							barX + 1,
-							barY + 1,
-							fillWidth - 2,
+					{
+						const char* label = "MIC";
+						int lw = 0, lh = 0;
+						TTF_SizeUTF8(font, label, &lw, &lh);
+						int lx = barX + (singleWidth - lw) / 2;
+						int ly = barY - lh - 2;
+						DrawText(renderer, font, label, lx, ly, COL_TEXT_MUT);
+					}
+
+					{
+						const char* label = "RX";
+						int lw = 0, lh = 0;
+						TTF_SizeUTF8(font, label, &lw, &lh);
+						int lx = barX + singleWidth + gap + (singleWidth - lw) / 2;
+						int ly = barY - lh - 2;
+						DrawText(renderer, font, label, lx, ly, COL_TEXT_MUT);
+					}
+
+					SDL_Rect micBg = { barX, barY, singleWidth, barHeight };
+					DrawRect(renderer, micBg, COL_INPUT_BG);
+					DrawRectBorder(renderer, micBg, COL_PANEL_BD, 1);
+
+					SDL_Rect rxBg = { barX + singleWidth + gap, barY, singleWidth, barHeight };
+					DrawRect(renderer, rxBg, COL_INPUT_BG);
+					DrawRectBorder(renderer, rxBg, COL_PANEL_BD, 1);
+
+					int micFillWidth = (int)(singleWidth * levelMic);
+					if (micFillWidth > 0) {
+						SDL_Rect micFill = {
+							micBg.x + 1,
+							micBg.y + 1,
+							micFillWidth - 2,
 							barHeight - 2
 						};
-						if (barFill.w < 0) barFill.w = 0;
-						DrawRect(renderer, barFill, COL_TAB_ACTIVE);
+						if (micFill.w < 0) micFill.w = 0;
+						DrawRect(renderer, micFill, COL_TAB_ACTIVE);
+					}
+
+					int rxFillWidth = (int)(singleWidth * levelRx);
+					if (rxFillWidth > 0) {
+						SDL_Rect rxFill = {
+							rxBg.x + 1,
+							rxBg.y + 1,
+							rxFillWidth - 2,
+							barHeight - 2
+						};
+						if (rxFill.w < 0) rxFill.w = 0;
+						DrawRect(renderer, rxFill, COL_TAB_ACTIVE);
 					}
 				}
 			}

@@ -1,11 +1,12 @@
-const tableBody     = document.querySelector("#usersTable tbody");
-const tgTableBody   = document.querySelector("#tgTable tbody");
-const serverTimeEl  = document.getElementById("serverTime");
-const statusMsgEl   = document.getElementById("statusMsg");
-const weatherTgEl   = document.getElementById("weatherTg");
-const clientCountEl = document.getElementById("clientCount");
+const tableBody       = document.querySelector("#usersTable tbody");
+const tgTableBody     = document.querySelector("#tgTable tbody");
+const serverTimeEl    = document.getElementById("serverTime");
+const statusMsgEl     = document.getElementById("statusMsg");
+const weatherTgEl     = document.getElementById("weatherTg");
+const clientCountEl   = document.getElementById("clientCount");
 const activeSpeakerEl = document.getElementById("activeSpeaker");
-const waveTgLabelEl = document.getElementById("waveTgLabel");
+const waveTgLabelEl   = document.getElementById("waveTgLabel");
+const tgLinksEl       = document.getElementById("tgLinks");
 
 const waveCanvas = document.getElementById("waveCanvas");
 const waveCtx    = waveCanvas.getContext("2d");
@@ -52,6 +53,8 @@ function renderStatus(data) {
   const talkgroups = data.talkgroups || [];
   renderTalkgroups(talkgroups);
 
+  renderTalkgroupLinks(talkgroups);
+
   const entries = data.entries || [];
   renderUsers(entries);
 
@@ -66,7 +69,7 @@ function renderTalkgroups(tgs) {
   if (!tgs || tgs.length === 0) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 4;
+    td.colSpan = 6;
     td.textContent = "No talkgroups.";
     td.style.textAlign = "center";
     td.style.color = "#777";
@@ -80,6 +83,12 @@ function renderTalkgroups(tgs) {
     tr.dataset.tgName = tg.name;
 
     if (tg.active_speaker) tr.classList.add("speaking");
+
+    const activity = typeof tg.activity_score === "number" ? tg.activity_score : 0;
+
+    if (activity > 0.66) tr.classList.add("heat-high");
+    else if (activity > 0.33) tr.classList.add("heat-mid");
+    else if (activity > 0.10) tr.classList.add("heat-low");
 
     const tdName = document.createElement("td");
     tdName.textContent = tg.name || "-";
@@ -101,9 +110,28 @@ function renderTalkgroups(tgs) {
     }
 
     const tdListeners = document.createElement("td");
-    tdListeners.textContent = typeof tg.listeners === "number" ? tg.listeners : "-";
+    tdListeners.textContent =
+      typeof tg.listeners === "number" ? tg.listeners : "-";
 
-    tr.append(tdName, tdSpeaker, tdDur, tdListeners);
+    const tdLevel = document.createElement("td");
+    const levelVal =
+      typeof tg.audio_level === "number" ? tg.audio_level : 0;
+    const levelOuter = document.createElement("div");
+    levelOuter.className = "level-bar";
+    const levelInner = document.createElement("div");
+    levelInner.className = "level-bar-fill";
+    levelInner.style.width = Math.round(levelVal * 100) + "%";
+    levelOuter.appendChild(levelInner);
+    tdLevel.appendChild(levelOuter);
+
+    const tdActivity = document.createElement("td");
+    if (activity > 0) {
+      tdActivity.textContent = Math.round(activity * 100) + "%";
+    } else {
+      tdActivity.textContent = "-";
+    }
+
+    tr.append(tdName, tdSpeaker, tdDur, tdListeners, tdLevel, tdActivity);
 
     tr.addEventListener("click", () => {
       currentWaveTg = tg.name;
@@ -114,13 +142,51 @@ function renderTalkgroups(tgs) {
   }
 }
 
+function renderTalkgroupLinks(tgs) {
+  if (!tgLinksEl) return;
+  tgLinksEl.innerHTML = "";
+
+  if (!tgs || tgs.length === 0) {
+    tgLinksEl.textContent = "No talkgroups.";
+    tgLinksEl.style.color = "#777";
+    return;
+  }
+
+  let any = false;
+  for (const tg of tgs) {
+    const linked = tg.linked || [];
+    if (!linked.length) continue;
+    any = true;
+
+    const row = document.createElement("div");
+    row.className = "tg-link-row";
+
+    const strong = document.createElement("strong");
+    strong.textContent = tg.name;
+    row.appendChild(strong);
+
+    const span = document.createElement("span");
+    span.textContent = " <> " + linked.join(", ");
+    row.appendChild(span);
+
+    tgLinksEl.appendChild(row);
+  }
+
+  if (!any) {
+    tgLinksEl.textContent = "No active talkgroup links (bridges).";
+    tgLinksEl.style.color = "#777";
+  } else {
+    tgLinksEl.style.color = "";
+  }
+}
+
 function renderUsers(entries) {
   tableBody.innerHTML = "";
 
   if (!entries || entries.length === 0) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 4;
+    td.colSpan = 5;
     td.textContent = "No users connected.";
     td.style.textAlign = "center";
     td.style.color = "#777";
@@ -165,10 +231,25 @@ function renderUsers(entries) {
       tdDur.textContent = "-";
     }
 
+    const tdLevel = document.createElement("td");
+    const levelVal =
+      typeof e.audio_level === "number" ? e.audio_level : 0;
+    const levelOuter = document.createElement("div");
+    levelOuter.className = "level-bar";
+    const levelInner = document.createElement("div");
+    levelInner.className = "level-bar-fill";
+    levelInner.style.width = Math.round(levelVal * 100) + "%";
+    if (!e.speaking || levelVal <= 0) {
+      levelInner.classList.add("level-bar-muted");
+    }
+    levelOuter.appendChild(levelInner);
+    tdLevel.appendChild(levelOuter);
+
     tr.appendChild(tdUser);
     tr.appendChild(tdTg);
     tr.appendChild(tdSpeaking);
     tr.appendChild(tdDur);
+    tr.appendChild(tdLevel);
     tableBody.appendChild(tr);
   }
 }

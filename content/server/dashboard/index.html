@@ -8,8 +8,6 @@
 </head>
 <body>
   <header>
-    <h1>Dashboard</h1>
-
     <div class="time-box">
       <span>Server time:</span>
       <span id="serverTime">--</span>
@@ -34,15 +32,17 @@
 
     <section class="table-wrapper">
       <h2>Talkgroups</h2>
-      <table id="tgTable">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Active speaker</th>
-            <th>Duration</th>
-            <th>Listeners</th>
-          </tr>
-        </thead>
+	  <table id="tgTable">
+	    <thead>
+		  <tr>
+		    <th>Name</th>
+		    <th>Active speaker</th>
+		    <th>Duration</th>
+		    <th>Listeners</th>
+		    <th>Level</th>
+		    <th>Activity</th>
+		  </tr>
+	    </thead>
         <tbody></tbody>
       </table>
       <div class="status-msg status-msg-small">
@@ -59,6 +59,15 @@
     </section>
 
     <section class="table-wrapper">
+      <h2 style="text-align: center;">Talkgroup Links</h2>
+      <div id="tgLinks" class="tg-links">
+      </div>
+      <div class="status-msg status-msg-small" style="text-align: center;">
+        Showing which talkgroups are bridged together.
+      </div>
+    </section>
+
+    <section class="table-wrapper">
       <h2>Connected Users</h2>
       <table id="usersTable">
         <thead>
@@ -67,6 +76,7 @@
             <th>Talkgroup</th>
             <th>Speaking</th>
             <th>Duration</th>
+            <th>Level</th>
           </tr>
         </thead>
         <tbody></tbody>

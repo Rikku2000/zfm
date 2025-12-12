@@ -177,6 +177,68 @@ footer {
   border-top: 1px solid var(--border);
 }
 
+.level-bar {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: #202020;
+  overflow: hidden;
+}
+
+.level-bar-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--accent);
+  transition: width 0.15s linear;
+}
+
+.level-bar-muted {
+  opacity: 0.25;
+}
+
+tr.heat-low {
+  box-shadow: inset 0 0 0 1px rgba(255, 193, 7, 0.4);
+}
+
+tr.heat-mid {
+  box-shadow: inset 0 0 0 1px rgba(255, 152, 0, 0.5);
+  background-image: linear-gradient(
+    to right,
+    rgba(255, 152, 0, 0.18),
+    transparent
+  );
+}
+
+tr.heat-high {
+  box-shadow: inset 0 0 0 1px rgba(255, 82, 82, 0.7);
+  background-image: linear-gradient(
+    to right,
+    rgba(255, 82, 82, 0.22),
+    transparent
+  );
+}
+
+.tg-links {
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 0.8rem;
+}
+
+.tg-link-row {
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #181818;
+  white-space: nowrap;
+}
+
+.tg-link-row strong {
+  color: var(--accent);
+}
+
 @media (max-width: 600px) {
   h1 {
     font-size: 1rem;

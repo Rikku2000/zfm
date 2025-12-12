@@ -16,9 +16,11 @@
 #include <cctype>
 #include <cmath>
 #include <cstdarg>
+#include <algorithm>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
+  #define NOMINMAX
   #include <winsock2.h>
   #include <ws2tcpip.h>
   typedef int socklen_t;
@@ -336,7 +338,7 @@ static opus_strerror_t        p_opus_strerror        = nullptr;
 
 static const int g_opusSampleRate = 48000;
 static const int g_opusChannels   = 1;
-static const int g_opusFrameSize  = 480;
+static const int g_opusFrameSize  = 960;
 
 static bool loadOpusDllServer()
 {
@@ -725,10 +727,12 @@ bool loadConfig(const std::string& path) {
     g_users.clear();
     g_knownTalkgroups.clear();
     g_talkgroups.clear();
+    g_linkedTalkgroups.clear();
 
-    bool inUsers = false;
+    bool inUsers      = false;
     bool inUserObject = false;
     bool inTalkgroups = false;
+    bool inBridges    = false;
 
     User currentUser;
 
@@ -846,6 +850,30 @@ bool loadConfig(const std::string& path) {
 				continue;
 			}
 		}
+
+        if (l.find("\"bridges\"") != std::string::npos && l.find('{') != std::string::npos) {
+            inBridges = true;
+            continue;
+        }
+        if (inBridges) {
+            if (l.find('}') != std::string::npos) {
+                inBridges = false;
+                continue;
+            }
+
+            size_t q1 = l.find('"');
+            if (q1 == std::string::npos) continue;
+            size_t q2 = l.find('"', q1 + 1);
+            if (q2 == std::string::npos) continue;
+
+            std::string tgKey = l.substr(q1 + 1, q2 - q1 - 1);
+
+            std::vector<std::string> linked;
+            if (parseStringArray(l, tgKey, linked)) {
+                g_linkedTalkgroups[tgKey] = linked;
+            }
+            continue;
+        }
 
         if (parseBoolField(l, "weather_enabled", bval)) {
             g_weatherCfg.enabled = bval;
@@ -1611,6 +1639,31 @@ static std::string buildStatusJson() {
         clientCount = (int)g_clients.size();
     }
 
+    std::map<std::string, float> tgLevels;
+    {
+        std::lock_guard<std::mutex> lock(g_audioBufMutex);
+        for (const auto &kv : g_tgWaveHistory) {
+            const std::string &tgName = kv.first;
+            const std::vector<int16_t> &wave = kv.second;
+            if (wave.empty()) {
+                tgLevels[tgName] = 0.0f;
+                continue;
+            }
+            double sumSq = 0.0;
+            for (size_t i = 0; i < wave.size(); ++i) {
+                double v = wave[i] / 32768.0;
+                sumSq += v * v;
+            }
+            double rms = 0.0;
+            if (!wave.empty()) {
+                rms = std::sqrt(sumSq / wave.size());
+            }
+            if (rms < 0.0) rms = 0.0;
+            if (rms > 1.0) rms = 1.0;
+            tgLevels[tgName] = static_cast<float>(rms);
+        }
+    }
+
     std::ostringstream oss;
     oss << "{\n";
     oss << "  \"server_time_iso\": \"" << timebuf << "\",\n";
@@ -1651,14 +1704,48 @@ static std::string buildStatusJson() {
 			if (!firstTg) oss << ",\n";
 			firstTg = false;
 
-			std::string outName = ts.name.empty() ? tgName : ts.name;
+            std::string outName = ts.name.empty() ? tgName : ts.name;
 
-			oss << "    {"
-				<< "\"name\":\""           << escapeJson(outName)       << "\","
-				<< "\"active_speaker\":\"" << escapeJson(activeSpeaker) << "\","
-				<< "\"speak_ms\":"         << speakMs                   << ","
-				<< "\"listeners\":"        << listeners
-				<< "}";
+            float audioLevel = 0.0f;
+            {
+                auto itLvl = tgLevels.find(tgName);
+                if (itLvl != tgLevels.end())
+                    audioLevel = itLvl->second;
+            }
+
+            std::vector<std::string> fanout = getLinkedFanout(tgName);
+            fanout.erase(std::remove(fanout.begin(), fanout.end(), tgName), fanout.end());
+
+            float activity = 0.0f;
+            if (ts.lastAudio.time_since_epoch().count() != 0) {
+                long long msSince =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        nowSteady - ts.lastAudio).count();
+                const float windowMs = 30000.0f;
+                if (msSince < windowMs) {
+                    activity = 1.0f - static_cast<float>(msSince) / windowMs;
+                    if (activity < 0.0f) activity = 0.0f;
+                }
+            }
+			float speakActivity = 0.0f;
+			if (speakMs > 0) {
+				speakActivity = (float)speakMs / 30000.0f;
+				if (speakActivity > 1.0f) speakActivity = 1.0f;
+			}
+
+            oss << "    {"
+                << "\"name\":\""           << escapeJson(outName)       << "\","
+                << "\"active_speaker\":\"" << escapeJson(activeSpeaker) << "\","
+                << "\"speak_ms\":"         << speakMs                   << ","
+                << "\"listeners\":"        << listeners                 << ","
+                << "\"audio_level\":"      << audioLevel                << ","
+                << "\"activity_score\":"   << activity                  << ","
+                << "\"linked\":[";
+            for (size_t i = 0; i < fanout.size(); ++i) {
+                if (i) oss << ",";
+                oss << "\"" << escapeJson(fanout[i]) << "\"";
+            }
+            oss << "]}";
 		}
 	}
     oss << "\n  ],\n";
@@ -1688,16 +1775,24 @@ static std::string buildStatusJson() {
 				}
 			}
 
-			if (!first) oss << ",\n";
-			first = false;
+            float entryLevel = 0.0f;
+            if (speaking && !ci.talkgroup.empty()) {
+                auto itLvl = tgLevels.find(ci.talkgroup);
+                if (itLvl != tgLevels.end())
+                    entryLevel = itLvl->second;
+            }
 
-			oss << "    {"
-				<< "\"callsign\":\""  << escapeJson(ci.callsign)    << "\","
-				<< "\"talkgroup\":\"" << escapeJson(ci.talkgroup)   << "\","
-				<< "\"ip\":\""        << escapeJson(ci.remoteAddr)  << "\","
-				<< "\"speaking\":"    << (speaking ? "true" : "false") << ","
-				<< "\"speak_ms\":"    << speakMs
-				<< "}";
+            if (!first) oss << ",\n";
+            first = false;
+
+            oss << "    {"
+                << "\"callsign\":\""  << escapeJson(ci.callsign)    << "\","
+                << "\"talkgroup\":\"" << escapeJson(ci.talkgroup)   << "\","
+                << "\"ip\":\""        << escapeJson(ci.remoteAddr)  << "\","
+                << "\"speaking\":"    << (speaking ? "true" : "false") << ","
+                << "\"speak_ms\":"    << speakMs                    << ","
+                << "\"audio_level\":" << entryLevel
+                << "}";
 		}
 	}
 	oss << "\n  ]\n";

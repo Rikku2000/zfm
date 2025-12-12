@@ -370,7 +370,7 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
     cfg.talkgroup = "gateway";
 
     cfg.sample_rate = 48000;
-    cfg.frames_per_buffer = 480;
+    cfg.frames_per_buffer = 960;
     cfg.channels = 1;
     cfg.input_device_index = 0;
     cfg.output_device_index = 0;
@@ -440,6 +440,14 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
 		else if (parseBoolField(l, "use_opus", bval)) cfg.use_opus = bval;
 #endif
     }
+
+#ifdef OPUS
+	if (cfg.use_opus) {
+		cfg.sample_rate       = 48000;
+		cfg.frames_per_buffer = 480;
+		cfg.channels          = 1;
+	}
+#endif
 
     return true;
 }
@@ -646,9 +654,10 @@ static void shutdownOpus()
 
 static std::vector<char> encodeOpusFrame(const std::vector<char>& pcmBytes)
 {
-    if (!g_cfg.use_opus || !g_opusEnc || !p_opus_encode) {
-        return pcmBytes;
-    }
+	if (!g_cfg.use_opus || !g_opusEnc || !p_opus_encode) {
+		std::cerr << "encodeOpusFrame: Opus not initialized, cannot encode.\n";
+		return std::vector<char>();
+	}
 
     if (pcmBytes.empty()) {
         return std::vector<char>();
@@ -1434,8 +1443,13 @@ static const int VOX_TRIGGER_FRAMES_NEEDED  = 6;
 static const int VOX_SILENCE_FRAMES_NEEDED  = 100;
 static const int VOX_SPEAK_GRANT_TIMEOUT_MS = 50;
 
-bool frameAboveVoxThreshold(const std::vector<char>& frame, int threshold) {
-    if (frame.empty()) return false;
+static const int VOX_CALIB_FRAMES        = 40;
+static const int VOX_MIN_THRESHOLD_PEAK  = 1000;
+static const int VOX_MAX_THRESHOLD_PEAK  = 25000;
+
+static int frameMaxAbsSample(const std::vector<char>& frame)
+{
+    if (frame.empty()) return 0;
     size_t n = frame.size() / sizeof(int16_t);
     const int16_t* samples = (const int16_t*)frame.data();
     int maxAbs = 0;
@@ -1444,6 +1458,13 @@ bool frameAboveVoxThreshold(const std::vector<char>& frame, int threshold) {
         if (v < 0) v = -v;
         if (v > maxAbs) maxAbs = v;
     }
+    return maxAbs;
+}
+
+bool frameAboveVoxThreshold(const std::vector<char>& frame, int threshold)
+{
+    if (threshold <= 0) return false;
+    int maxAbs = frameMaxAbsSample(frame);
     return maxAbs >= threshold;
 }
 
@@ -1454,6 +1475,11 @@ void voxAutoLoop(SOCKET sock) {
     int triggerFrames = 0;
 
     std::chrono::steady_clock::time_point talkStart;
+
+    int adaptiveThreshold = (g_cfg.vox_threshold > 0) ? g_cfg.vox_threshold : 5000;
+    int calibFrames       = 0;
+    int calibNoisePeak    = 0;
+    bool haveCalibrated   = false;
 
     LOG_INFO("[VOX] Hands-free VOX mode enabled (no 't' needed).\n");
     LOG_INFO("[VOX] Just speak into the mic. Use Ctrl+C to exit client.\n");
@@ -1466,7 +1492,41 @@ void voxAutoLoop(SOCKET sock) {
             continue;
         }
 
-        bool above = frameAboveVoxThreshold(frame, g_cfg.vox_threshold);
+        int peak = frameMaxAbsSample(frame);
+
+        if (!isTalking && !haveCalibrated) {
+            if (peak > calibNoisePeak)
+                calibNoisePeak = peak;
+
+            ++calibFrames;
+            if (calibFrames >= VOX_CALIB_FRAMES) {
+                int thr = calibNoisePeak * 4;
+                if (thr < VOX_MIN_THRESHOLD_PEAK) thr = VOX_MIN_THRESHOLD_PEAK;
+                if (thr > VOX_MAX_THRESHOLD_PEAK) thr = VOX_MAX_THRESHOLD_PEAK;
+
+                adaptiveThreshold = thr;
+                haveCalibrated    = true;
+
+                LOG_INFO("[VOX] Auto-calibrated threshold: %d (noise peak=%d, cfg=%d)\n",
+                         adaptiveThreshold, calibNoisePeak, g_cfg.vox_threshold);
+            }
+        }
+
+        if (!isTalking && haveCalibrated) {
+            if (peak < adaptiveThreshold / 3) {
+                int target = peak * 4;
+                if (target < VOX_MIN_THRESHOLD_PEAK) target = VOX_MIN_THRESHOLD_PEAK;
+                if (target > VOX_MAX_THRESHOLD_PEAK) target = VOX_MAX_THRESHOLD_PEAK;
+                adaptiveThreshold = (adaptiveThreshold * 9 + target) / 10;
+            }
+        }
+
+        int effectiveThreshold = haveCalibrated ? adaptiveThreshold : g_cfg.vox_threshold;
+        if (effectiveThreshold <= 0) {
+            effectiveThreshold = adaptiveThreshold;
+        }
+
+        bool above = (peak >= effectiveThreshold);
 
         if (!isTalking) {
             if (!above) {
@@ -1559,10 +1619,13 @@ void voxAutoLoop(SOCKET sock) {
 
 			if (g_cfg.use_opus) {
 				payload = encodeOpusFrame(frame);
+
 				if (payload.empty()) {
-					continue;
+					payload  = std::move(frame);
+					audioCmd = "AUDIO";
+				} else {
+					audioCmd = "AUDIO_OPUS";
 				}
-				audioCmd = "AUDIO_OPUS";
 			} else {
 				payload = std::move(frame);
 				audioCmd = "AUDIO";
