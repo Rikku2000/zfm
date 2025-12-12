@@ -865,6 +865,8 @@ static void CfgToUi() {
         g_rogerItems.push_back("None");
         g_rogerItems.push_back("Roger 1");
         g_rogerItems.push_back("Roger 2");
+        g_rogerItems.push_back("Roger 3");
+        g_rogerItems.push_back("Roger 4");
     }
 
     ui_roger_index = g_cfg.roger_sound;

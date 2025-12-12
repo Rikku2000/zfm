@@ -81,6 +81,9 @@ function renderTalkgroups(tgs) {
   }
 
   for (const tg of tgs) {
+    if (typeof tg.listeners === "number" && tg.listeners === 0)
+      continue;
+
     if (!tg.name || tg.name === "-")
       continue;
 
@@ -302,17 +305,35 @@ function renderUsers(entries) {
 }
 
 function updateNowSpeaking(talkgroups) {
-  if (!talkgroups || talkgroups.length === 0) {
+  if (!Array.isArray(talkgroups) || talkgroups.length === 0) {
     activeSpeakerEl.textContent = "";
+    activeSpeakerEl.classList.remove("active");
     return;
   }
 
-  const active = talkgroups.find(t => t.active_speaker);
-  if (active) {
-    activeSpeakerEl.textContent = `${active.active_speaker} on ${active.name}`;
-  } else {
+  const actives = talkgroups
+    .filter(t => t && t.active_speaker && t.name && t.name !== "-")
+    .map(t => ({ speaker: t.active_speaker, tg: t.name }));
+
+  if (actives.length === 0) {
     activeSpeakerEl.textContent = "";
+    activeSpeakerEl.classList.remove("active");
+    return;
   }
+
+  const wrap = document.createElement("div");
+  wrap.className = "speaker-badges";
+
+  for (const a of actives) {
+    const badge = document.createElement("span");
+    badge.className = "speaker-badge";
+    badge.textContent = `${a.speaker} on ${a.tg}`;
+    wrap.appendChild(badge);
+  }
+
+  activeSpeakerEl.innerHTML = "";
+  activeSpeakerEl.appendChild(wrap);
+  activeSpeakerEl.classList.add("active");
 }
 
 function autoSelectWaveformTg(talkgroups) {

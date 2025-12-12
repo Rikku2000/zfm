@@ -1084,6 +1084,12 @@ void loadRogerFromConfig()
         case 2:
             wav = "roger2.wav";
             break;
+        case 3:
+            wav = "roger3.wav";
+            break;
+        case 4:
+            wav = "roger4.wav";
+            break;
         default:
             wav = "roger.wav";
             break;

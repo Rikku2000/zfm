@@ -25,10 +25,20 @@
   </header>
 
   <main>
-    <section class="table-wrapper">
-      <h2 style="text-align: center;">Now Speaking</h2>
-      <div id="activeSpeaker" class="now-speaking" style="text-align: center;">Nobody</div>
-    </section>
+	<div class="top-row">
+	  <section class="table-wrapper now-speaking-card">
+		<h2 style="text-align: center;">Now Speaking</h2>
+		<div id="activeSpeaker" class="now-speaking" style="text-align: center;"></div>
+	  </section>
+
+	  <section class="table-wrapper waveform-card">
+		<h2 style="text-align: center;">Live Waveform</h2>
+		<canvas id="waveCanvas" width="800" height="120"></canvas>
+		<div class="status-msg status-msg-small" style="text-align: center;">
+		  Showing audio from: <strong><span id="waveTgLabel">gateway</span></strong>
+		</div>
+	  </section>
+	</div>
 
     <section class="table-wrapper">
       <h2>Talkgroups</h2>
@@ -47,14 +57,6 @@
       </table>
       <div class="status-msg status-msg-small">
         Click a talkgroup row to focus the waveform on that TG.
-      </div>
-    </section>
-
-    <section class="table-wrapper">
-      <h2 style="text-align: center;">Live Waveform</h2>
-      <canvas id="waveCanvas" width="800" height="120"></canvas>
-      <div class="status-msg status-msg-small" style="text-align: center;">
-        Showing audio from: <strong><span id="waveTgLabel">gateway</span></strong>
       </div>
     </section>
 

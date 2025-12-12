@@ -254,6 +254,77 @@ tr.heat-high {
   color: var(--accent);
 }
 
+.now-speaking {
+  margin: 0 auto;
+  text-align: center;
+  flex-wrap: wrap;
+}
+
+.speaker-badges {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.speaker-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+
+  padding: 6px 14px;
+  border-radius: 999px;
+
+  font-size: 0.85rem;
+  font-weight: 500;
+
+  background: rgba(255, 82, 82, 0.15);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+}
+
+.speaker-badge::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.top-row {
+  max-width: 90vw;
+  margin: 10px auto 0;
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+}
+
+.top-row .table-wrapper {
+  margin: 0;
+  flex: 1 1 0;
+}
+
+.now-speaking-card {
+  flex: 0 0 32%;
+  min-width: 260px;
+}
+
+.waveform-card {
+  flex: 1 1 auto;
+  min-width: 420px;
+}
+
+@media (max-width: 900px) {
+  .top-row {
+    flex-direction: column;
+    max-width: 100vw;
+  }
+  .now-speaking-card,
+  .waveform-card {
+    min-width: 0;
+  }
+}
+
 @media (max-width: 600px) {
   h1 {
     font-size: 1rem;

@@ -127,6 +127,7 @@ Commands include:
     {
       "callsign": "DL0XYZ",
       "password": "passw0rd",
+      "role": "admin",
       "is_admin": true,
       "talkgroups": ["weather","gateway","germany","hesse"]
     }

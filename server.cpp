@@ -387,11 +387,33 @@ static void unloadOpusDllServer()
 #endif
 #endif
 
+enum class Role {
+    USER = 0,
+    OPERATOR = 1,
+    ADMIN = 2
+};
+
+static inline const char* roleToStr(Role r) {
+    switch (r) {
+        case Role::ADMIN:    return "admin";
+        case Role::OPERATOR: return "operator";
+        default:             return "user";
+    }
+}
+
+static inline Role roleFromStr(const std::string& s) {
+    std::string x = s;
+    for (auto& c : x) c = (char)std::tolower((unsigned char)c);
+    if (x == "admin")    return Role::ADMIN;
+    if (x == "operator") return Role::OPERATOR;
+    return Role::USER;
+}
+
 struct User {
     std::string callsign;
     std::string password;
     std::unordered_set<std::string> talkgroups;
-    bool isAdmin;
+    Role role;
     bool muted;
     bool banned;
     std::string remoteIp;
@@ -515,20 +537,18 @@ bool fetchWeatherFromOpenWeather(WeatherData& out);
 bool buildCompositeWav(const std::vector<std::string>& keys,const std::string& compositeKey,CachedWav& out);
 std::vector<std::string> buildWeatherSegmentKeys(const WeatherData& wd);
 
+static bool canSeeTalkgroup(Role role, const TalkgroupInfo& tg)
+{
+    if (tg.mode == TalkgroupMode::PUBLIC) return true;
+    if (tg.mode == TalkgroupMode::HIDE)   return (role >= Role::OPERATOR);
+    if (tg.mode == TalkgroupMode::ADMIN)  return (role >= Role::ADMIN);
+    return true;
+}
+
 static bool showInClientList(const TalkgroupInfo& tg, const User* user)
 {
-    if (user && user->isAdmin)
-        return true;
-
-    if (tg.mode == TalkgroupMode::HIDE) {
-        if (!user) return false;
-        return (user->talkgroups.find(tg.name) != user->talkgroups.end());
-    }
-
-    if (tg.mode == TalkgroupMode::ADMIN)
-        return false;
-
-    return true;
+    Role r = user ? user->role : Role::USER;
+    return canSeeTalkgroup(r, tg);
 }
 
 static void sendTalkgroupListForUser(SOCKET sock, const std::string& callsign)
@@ -540,39 +560,18 @@ static void sendTalkgroupListForUser(SOCKET sock, const std::string& callsign)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
 
-		auto uit = g_users.find(callsign);
-		const User* user = (uit != g_users.end()) ? &uit->second : nullptr;
+        Role role = Role::USER;
+        auto uit = g_users.find(callsign);
+        if (uit != g_users.end()) role = uit->second.role;
 
-		if (user && user->isAdmin) {
-			for (const auto& kv : g_knownTalkgroups) {
-				const TalkgroupInfo& tg = kv.second;
-				if (!first) oss << ",";
-				first = false;
-				oss << tg.name;
-			}
-		}
-		else if (user && !user->talkgroups.empty()) {
-			for (const auto& kv : g_knownTalkgroups) {
-				const TalkgroupInfo& tg = kv.second;
-				if (!showInClientList(tg, user)) continue;
+        for (const auto& kv : g_knownTalkgroups) {
+            const TalkgroupInfo& tg = kv.second;
+            if (!canSeeTalkgroup(role, tg)) continue;
 
-				if (user->talkgroups.find(tg.name) != user->talkgroups.end()) {
-					if (!first) oss << ",";
-					first = false;
-					oss << tg.name;
-				}
-			}
-		}
-		else {
-			for (const auto& kv : g_knownTalkgroups) {
-				const TalkgroupInfo& tg = kv.second;
-				if (!showInClientList(tg, user)) continue;
-
-				if (!first) oss << ",";
-				first = false;
-				oss << tg.name;
-			}
-		}
+            if (!first) oss << ",";
+            first = false;
+            oss << tg.name;
+        }
     }
 
     oss << "\n";
@@ -885,7 +884,7 @@ bool loadConfig(const std::string& path) {
 			if (l.find('{') != std::string::npos) {
 				inUserObject = true;
 				currentUser = User();
-				currentUser.isAdmin = false;
+				currentUser.role = Role::USER;
 				currentUser.muted   = false;
 				currentUser.banned  = false;
 				currentUser.priority = 0;
@@ -907,8 +906,12 @@ bool loadConfig(const std::string& path) {
 					currentUser.password = sval;
 					continue;
 				}
+				if (parseStringField(l, "role", sval)) {
+					currentUser.role = roleFromStr(sval);
+					continue;
+				}
 				if (parseBoolField(l, "is_admin", bval)) {
-					currentUser.isAdmin = bval;
+					if (bval) currentUser.role = Role::ADMIN;
 					continue;
 				}
 				if (parseBoolField(l, "banned", bval)) {
@@ -2041,7 +2044,7 @@ static bool saveConfig(const std::string& path)
             f << "    {\n";
             f << "      \"callsign\": \"" << escapeJson(u.callsign) << "\",\n";
             f << "      \"password\": \"" << escapeJson(u.password) << "\",\n";
-            f << "      \"is_admin\": " << (u.isAdmin ? "true" : "false") << ",\n";
+			f << "      \"role\": \"" << roleToStr(u.role) << "\",\n";
             f << "      \"banned\": " << (u.banned ? "true" : "false") << ",\n";
 			f << "      \"priority\": " << u.priority << ",\n";
 
@@ -2901,6 +2904,23 @@ static void handlePeerSession(SOCKET sock, const std::string& firstLine)
     delete pc;
 }
 
+static bool hasAtLeast(Role a, Role need) { return (int)a >= (int)need; }
+
+static bool canOperatorActOn(Role actor, Role target)
+{
+    if (actor == Role::ADMIN) return true;
+    if (actor == Role::OPERATOR) {
+        return (target == Role::USER);
+    }
+    return false;
+}
+
+static Role getUserRoleUnsafeNoLock(const std::string& cs) {
+	auto it = g_users.find(cs);
+	if (it == g_users.end()) return Role::USER;
+	return it->second.role;
+}
+
 void handleClient(SOCKET sock) {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -3352,16 +3372,44 @@ void handleClient(SOCKET sock) {
 				myUser = it->second.callsign;
 			}
 
-			std::unordered_map<std::string, User>::iterator uit = g_users.find(myUser);
-			if (uit == g_users.end() || !uit->second.isAdmin) {
-				std::string resp = "ADMIN_FAIL not_admin\n";
+			auto uit = g_users.find(myUser);
+			if (uit == g_users.end()) {
+				std::string resp = "ADMIN_FAIL no_user\n";
 				sendAll(sock, resp.c_str(), resp.size());
 				continue;
 			}
 
-            if (sub == "kick") {
-                std::string targetUser;
-                iss >> targetUser;
+			Role myRole = uit->second.role;
+			if (!hasAtLeast(myRole, Role::OPERATOR)) {
+				std::string resp = "ADMIN_FAIL not_operator\n";
+				sendAll(sock, resp.c_str(), resp.size());
+				continue;
+			}
+
+			if (sub == "set_admin" || sub == "set_pass" || sub == "add_tg" || sub == "drop_tg" || sub == "list_tgs" /* etc */) {
+				if (myRole != Role::ADMIN) {
+					std::string resp = "ADMIN_FAIL admin_only\n";
+					sendAll(sock, resp.c_str(), resp.size());
+					continue;
+				}
+			}
+
+			if (sub == "kick") {
+				std::string targetUser;
+				iss >> targetUser;
+
+				Role targetRole;
+				{
+					std::lock_guard<std::mutex> lock(g_mutex);
+					targetRole = getUserRoleUnsafeNoLock(targetUser);
+				}
+
+				if (!canOperatorActOn(myRole, targetRole)) {
+					std::string resp = "ADMIN_FAIL insufficient_privilege\n";
+					sendAll(sock, resp.c_str(), resp.size());
+					continue;
+				}
+
                 SOCKET targetSock = findClientByCallsign(targetUser);
                 if (targetSock == INVALID_SOCKET) {
                     std::string resp = "ADMIN_FAIL kick_user_not_found\n";
@@ -3377,8 +3425,21 @@ void handleClient(SOCKET sock) {
                 }
             }
             else if (sub == "mute") {
-                std::string targetUser;
-                iss >> targetUser;
+				std::string targetUser;
+				iss >> targetUser;
+
+				Role targetRole;
+				{
+					std::lock_guard<std::mutex> lock(g_mutex);
+					targetRole = getUserRoleUnsafeNoLock(targetUser);
+				}
+
+				if (!canOperatorActOn(myRole, targetRole)) {
+					std::string resp = "ADMIN_FAIL insufficient_privilege\n";
+					sendAll(sock, resp.c_str(), resp.size());
+					continue;
+				}
+
                 std::unordered_map<std::string, User>::iterator it2 = g_users.find(targetUser);
                 if (it2 == g_users.end()) {
                     std::string resp = "ADMIN_FAIL mute_user_not_found\n";
@@ -3390,8 +3451,21 @@ void handleClient(SOCKET sock) {
                 }
             }
             else if (sub == "unmute") {
-                std::string targetUser;
-                iss >> targetUser;
+				std::string targetUser;
+				iss >> targetUser;
+
+				Role targetRole;
+				{
+					std::lock_guard<std::mutex> lock(g_mutex);
+					targetRole = getUserRoleUnsafeNoLock(targetUser);
+				}
+
+				if (!canOperatorActOn(myRole, targetRole)) {
+					std::string resp = "ADMIN_FAIL insufficient_privilege\n";
+					sendAll(sock, resp.c_str(), resp.size());
+					continue;
+				}
+
                 std::unordered_map<std::string, User>::iterator it2 = g_users.find(targetUser);
                 if (it2 == g_users.end()) {
                     std::string resp = "ADMIN_FAIL unmute_user_not_found\n";
@@ -3405,6 +3479,19 @@ void handleClient(SOCKET sock) {
 			else if (sub == "ban") {
 				std::string targetUser;
 				iss >> targetUser;
+
+				Role targetRole;
+				{
+					std::lock_guard<std::mutex> lock(g_mutex);
+					targetRole = getUserRoleUnsafeNoLock(targetUser);
+				}
+
+				if (!canOperatorActOn(myRole, targetRole)) {
+					std::string resp = "ADMIN_FAIL insufficient_privilege\n";
+					sendAll(sock, resp.c_str(), resp.size());
+					continue;
+				}
+
 				std::unordered_map<std::string, User>::iterator it2 = g_users.find(targetUser);
 				if (it2 == g_users.end()) {
 					std::string resp = "ADMIN_FAIL ban_user_not_found\n";
@@ -3427,6 +3514,19 @@ void handleClient(SOCKET sock) {
 			else if (sub == "unban") {
 				std::string targetUser;
 				iss >> targetUser;
+
+				Role targetRole;
+				{
+					std::lock_guard<std::mutex> lock(g_mutex);
+					targetRole = getUserRoleUnsafeNoLock(targetUser);
+				}
+
+				if (!canOperatorActOn(myRole, targetRole)) {
+					std::string resp = "ADMIN_FAIL insufficient_privilege\n";
+					sendAll(sock, resp.c_str(), resp.size());
+					continue;
+				}
+
 				std::unordered_map<std::string, User>::iterator it2 = g_users.find(targetUser);
 				if (it2 == g_users.end()) {
 					std::string resp = "ADMIN_FAIL unban_user_not_found\n";
@@ -3457,7 +3557,6 @@ void handleClient(SOCKET sock) {
 							User u;
 							u.callsign = newUser;
 							u.password = newPass;
-							u.isAdmin  = false;
 							u.muted    = false;
 							u.banned   = false;
 							u.priority = 0;
@@ -3530,7 +3629,6 @@ void handleClient(SOCKET sock) {
 							std::string resp = "ADMIN_FAIL set_admin_user_not_found\n";
 							sendAll(sock, resp.c_str(), resp.size());
 						} else {
-							it2->second.isAdmin = (flag != 0);
 							std::string resp = "ADMIN_OK set_admin\n";
 							sendAll(sock, resp.c_str(), resp.size());
 							ok = true;
@@ -3654,7 +3752,6 @@ void handleClient(SOCKET sock) {
                         if (!first) oss << ",";
                         first = false;
 						oss << it->first;
-						if (it->second.isAdmin) oss << "(admin)";
 						if (it->second.muted)   oss << "(muted)";
 						if (it->second.banned)  oss << "(banned)";
                     }
