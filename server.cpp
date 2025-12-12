@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <algorithm>
+#include <cstdio>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -519,8 +520,10 @@ static bool showInClientList(const TalkgroupInfo& tg, const User* user)
     if (user && user->isAdmin)
         return true;
 
-    if (tg.mode == TalkgroupMode::HIDE)
-        return false;
+    if (tg.mode == TalkgroupMode::HIDE) {
+        if (!user) return false;
+        return (user->talkgroups.find(tg.name) != user->talkgroups.end());
+    }
 
     if (tg.mode == TalkgroupMode::ADMIN)
         return false;
@@ -596,6 +599,47 @@ static std::vector<std::string> getLinkedFanout(const std::string& tg) {
     }
     return result;
 }
+
+struct PeerRule {
+    std::string localTg;
+    std::string remoteTg;
+    enum Dir { TX, RX, BOTH } dir;
+};
+
+struct PeerConfig {
+    std::string name;
+    std::string host;
+    int         port;
+    std::string secret;
+    std::vector<std::string> ruleStr;
+    std::vector<PeerRule> rules;
+
+    PeerConfig() : port(0) {}
+};
+
+struct PeerConn {
+    std::string peerName;
+    SOCKET sock;
+    std::mutex sendMutex;
+    std::atomic<bool> running;
+    std::thread th;
+
+    PeerConn() : sock(INVALID_SOCKET), running(false) {}
+};
+
+static std::string g_serverName = "server";
+static std::string g_peerSecret;
+static std::vector<PeerConfig> g_peerCfg;
+static std::mutex g_peerMutex;
+static std::unordered_map<std::string, PeerConn*> g_peerConns;
+
+static std::mutex g_bridgeSeenMutex;
+static std::unordered_map<std::string, std::chrono::steady_clock::time_point> g_bridgeSeen;
+static const int PEER_HOP_MAX = 1;
+
+static std::mutex g_bridgeIdMutex;
+static std::unordered_map<std::string, std::string> g_activeBridgeIdByTg;
+static std::atomic<uint64_t> g_bridgeSeq(0);
 
 #ifdef OPUS
 static bool decodeClientOpus(ClientInfo& ci,
@@ -765,7 +809,9 @@ bool loadConfig(const std::string& path) {
     bool inUserObject = false;
     bool inTalkgroups = false;
     bool inBridges    = false;
+	bool inPeers 	  = false;
 
+	PeerConfig currentPeer;
     User currentUser;
 	TalkgroupInfo currentTg;
 
@@ -785,6 +831,15 @@ bool loadConfig(const std::string& path) {
         bool bval;
         float fval;
         std::string sval;
+
+        if (parseStringField(l, "server_name", sval)) {
+            g_serverName = sval;
+            continue;
+        }
+        if (parseStringField(l, "peer_secret", sval)) {
+            g_peerSecret = sval;
+            continue;
+        }
 
         if (parseStringField(l, "http_root", sval)) {
             g_http_root = sval;
@@ -807,6 +862,15 @@ bool loadConfig(const std::string& path) {
             g_timeCfg.volumeFactor = fval;
             continue;
         }
+
+		if (parseStringField(l, "server_name", sval)) {
+			g_serverName = sval;
+			continue;
+		}
+		if (parseStringField(l, "peer_secret", sval)) {
+			g_peerSecret = sval;
+			continue;
+		}
 
 		if (l.find("\"users\"") != std::string::npos && l.find('[') != std::string::npos) {
 			inUsers = true;
@@ -918,6 +982,55 @@ bool loadConfig(const std::string& path) {
             continue;
         }
 
+		if (l.find("\"peers\"") != std::string::npos && l.find('[') != std::string::npos) {
+			inPeers = true;
+			continue;
+		}
+
+		if (inPeers) {
+			if (l.find("{") != std::string::npos) {
+				currentPeer = PeerConfig();
+				continue;
+			}
+
+			if (parseStringField(l, "name", sval)) {
+				currentPeer.name = sval;
+				continue;
+			}
+			if (parseStringField(l, "host", sval)) {
+				currentPeer.host = sval;
+				continue;
+			}
+			if (parseStringField(l, "secret", sval)) {
+				currentPeer.secret = sval;
+				continue;
+			}
+			if (parseIntField(l, "port", val)) {
+				currentPeer.port = val;
+				continue;
+			}
+
+			std::vector<std::string> rules;
+			if (parseStringArray(l, "rules", rules)) {
+				currentPeer.ruleStr = rules;
+				continue;
+			}
+
+			if (l.find("}") != std::string::npos) {
+				if (!currentPeer.name.empty() &&
+					!currentPeer.host.empty() &&
+					currentPeer.port > 0) {
+					g_peerCfg.push_back(currentPeer);
+				}
+				continue;
+			}
+
+			if (l.find("]") != std::string::npos) {
+				inPeers = false;
+				continue;
+			}
+		}
+
         if (parseBoolField(l, "weather_enabled", bval)) {
             g_weatherCfg.enabled = bval;
             continue;
@@ -955,6 +1068,371 @@ bool loadConfig(const std::string& path) {
     LOG_OK("Loaded config: %zu users, %zu talkgroups\n",g_users.size(),g_knownTalkgroups.size());
 
     return true;
+}
+
+static bool parsePeerRule(const std::string& s, PeerRule& out) {
+    size_t eq = s.find('=');
+    size_t col = s.find(':');
+    if (eq == std::string::npos || col == std::string::npos || eq > col) return false;
+
+    out.localTg  = s.substr(0, eq);
+    out.remoteTg = s.substr(eq + 1, col - (eq + 1));
+    std::string dir = s.substr(col + 1);
+
+    if (dir == "tx") out.dir = PeerRule::TX;
+    else if (dir == "rx") out.dir = PeerRule::RX;
+    else out.dir = PeerRule::BOTH;
+
+    return !out.localTg.empty() && !out.remoteTg.empty();
+}
+
+static void compilePeerRules() {
+    for (auto& pc : g_peerCfg) {
+        pc.rules.clear();
+        for (const auto& rs : pc.ruleStr) {
+            PeerRule r;
+            if (parsePeerRule(rs, r)) pc.rules.push_back(r);
+        }
+    }
+}
+
+static std::string makeBridgeId() {
+    uint64_t n = ++g_bridgeSeq;
+    std::ostringstream oss;
+    oss << g_serverName << "-" << (uint64_t)std::time(nullptr) << "-" << n;
+    return oss.str();
+}
+
+static bool seenBridgeRecently(const std::string& id) {
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(g_bridgeSeenMutex);
+
+    for (auto it = g_bridgeSeen.begin(); it != g_bridgeSeen.end(); ) {
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second).count();
+        if (age > 15) it = g_bridgeSeen.erase(it);
+        else ++it;
+    }
+
+    auto it = g_bridgeSeen.find(id);
+    if (it != g_bridgeSeen.end()) return true;
+    g_bridgeSeen[id] = now;
+    return false;
+}
+
+static bool peerSendLine(PeerConn* pc, const std::string& line) {
+    std::lock_guard<std::mutex> lock(pc->sendMutex);
+    return sendAll(pc->sock, line.data(), line.size());
+}
+
+static bool peerSendAud(PeerConn* pc,
+                        const std::string& bridgeId,
+                        int hop,
+                        const std::string& remoteTg,
+                        const std::vector<char>& pcm)
+{
+    std::ostringstream oss;
+    oss << "PEER_AUD " << bridgeId << " " << hop << " " << remoteTg << " " << pcm.size() << "\n";
+    std::string hdr = oss.str();
+
+    std::lock_guard<std::mutex> lock(pc->sendMutex);
+    if (!sendAll(pc->sock, hdr.data(), hdr.size())) return false;
+    if (!pcm.empty() && !sendAll(pc->sock, pcm.data(), pcm.size())) return false;
+    return true;
+}
+
+
+static const PeerConfig* getPeerCfgByName(const std::string& name)
+{
+    for (const auto& pc : g_peerCfg) {
+        if (pc.name == name) return &pc;
+    }
+    return nullptr;
+}
+
+static void peerForwardSpeakerStart(const std::string& localTg,
+                                    const std::string& fromUser,
+                                    const std::string& bridgeId,
+                                    int hop)
+{
+    std::lock_guard<std::mutex> lock(g_peerMutex);
+    for (auto& kv : g_peerConns) {
+        PeerConn* pc = kv.second;
+        const PeerConfig* cfg = getPeerCfgByName(kv.first);
+        if (!pc || !cfg || !pc->running) continue;
+
+        for (const auto& r : cfg->rules) {
+            if (r.localTg != localTg) continue;
+            if (r.dir == PeerRule::RX) continue;
+            std::ostringstream oss;
+            oss << "PEER_SPK " << bridgeId << " " << hop << " " << r.remoteTg << " " << fromUser << "\n";
+            peerSendLine(pc, oss.str());
+        }
+    }
+}
+
+static void peerForwardSpeakerEnd(const std::string& localTg,
+                                  const std::string& bridgeId,
+                                  int hop)
+{
+    std::lock_guard<std::mutex> lock(g_peerMutex);
+    for (auto& kv : g_peerConns) {
+        PeerConn* pc = kv.second;
+        const PeerConfig* cfg = getPeerCfgByName(kv.first);
+        if (!pc || !cfg || !pc->running) continue;
+
+        for (const auto& r : cfg->rules) {
+            if (r.localTg != localTg) continue;
+            if (r.dir == PeerRule::RX) continue;
+            std::ostringstream oss;
+            oss << "PEER_END " << bridgeId << " " << hop << " " << r.remoteTg << "\n";
+            peerSendLine(pc, oss.str());
+        }
+    }
+}
+
+static void peerForwardAudio(const std::string& localTg,
+                             const std::vector<char>& pcm,
+                             const std::string& bridgeId,
+                             int hop)
+{
+    std::lock_guard<std::mutex> lock(g_peerMutex);
+    for (auto& kv : g_peerConns) {
+        PeerConn* pc = kv.second;
+        const PeerConfig* cfg = getPeerCfgByName(kv.first);
+        if (!pc || !cfg || !pc->running) continue;
+
+        for (const auto& r : cfg->rules) {
+            if (r.localTg != localTg) continue;
+            if (r.dir == PeerRule::RX) continue;
+            peerSendAud(pc, bridgeId, hop, r.remoteTg, pcm);
+        }
+    }
+}
+
+static std::string ensureBridgeIdForLocalTx(const std::string& tg)
+{
+    std::lock_guard<std::mutex> lock(g_bridgeIdMutex);
+    auto it = g_activeBridgeIdByTg.find(tg);
+    if (it != g_activeBridgeIdByTg.end() && !it->second.empty())
+        return it->second;
+
+    std::string id = makeBridgeId();
+    g_activeBridgeIdByTg[tg] = id;
+    return id;
+}
+
+static void clearBridgeIdForLocalTx(const std::string& tg)
+{
+    std::lock_guard<std::mutex> lock(g_bridgeIdMutex);
+    g_activeBridgeIdByTg.erase(tg);
+}
+
+
+static void handlePeerLine(PeerConn* pc, const std::string& line);
+static void broadcastToLinkedTalkgroups(const std::string& tg,const std::string& message,SOCKET exceptSock);
+static void broadcastAudioToLinkedTalkgroups(const std::string& tg,const std::string& fromUser,const std::vector<char>& buf,SOCKET exceptSock);
+
+static SOCKET connectTcp(const std::string& host, int port)
+{
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char portStr[16];
+#ifdef _WIN32
+    _snprintf_s(portStr, sizeof(portStr), _TRUNCATE, "%d", port);
+#else
+    std::snprintf(portStr, sizeof(portStr), "%d", port);
+#endif
+
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), portStr, &hints, &res) != 0 || !res) {
+        return INVALID_SOCKET;
+    }
+
+    SOCKET s = INVALID_SOCKET;
+    for (struct addrinfo* rp = res; rp != nullptr; rp = rp->ai_next) {
+#ifdef _WIN32
+        SOCKET cs = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (cs == INVALID_SOCKET) continue;
+#else
+        int cs = (int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (cs < 0) continue;
+#endif
+
+        if (connect(cs, rp->ai_addr, (int)rp->ai_addrlen) == 0) {
+            s = cs;
+            break;
+        }
+        closeSocket(cs);
+    }
+
+    freeaddrinfo(res);
+
+    if (s != INVALID_SOCKET) {
+        int flag = 1;
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+    }
+    return s;
+}
+
+
+static void peerOutboundThread(PeerConfig cfg)
+{
+    while (g_running) {
+        SOCKET s = connectTcp(cfg.host, cfg.port);
+        if (s == INVALID_SOCKET) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
+
+        std::string sec = cfg.secret.empty() ? g_peerSecret : cfg.secret;
+        std::ostringstream auth;
+        auth << "PEER_AUTH " << g_serverName << " " << sec << "\n";
+        if (!sendAll(s, auth.str().c_str(), auth.str().size())) { closeSocket(s); continue; }
+
+        std::string line;
+        if (!recvLine(s, line) || line != "PEER_OK") {
+            closeSocket(s);
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            continue;
+        }
+
+        PeerConn* pc = new PeerConn();
+        pc->peerName = cfg.name;
+        pc->sock = s;
+        pc->running = true;
+
+        {
+            std::lock_guard<std::mutex> lock(g_peerMutex);
+            auto it = g_peerConns.find(cfg.name);
+            if (it != g_peerConns.end()) {
+                closeSocket(s);
+                delete pc;
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                continue;
+            }
+            g_peerConns[cfg.name] = pc;
+        }
+
+        LOG_OK("PEER connected outbound to %s (%s:%d)\n", cfg.name.c_str(), cfg.host.c_str(), cfg.port);
+
+        while (g_running && pc->running) {
+            std::string ln;
+            if (!recvLine(s, ln)) break;
+            handlePeerLine(pc, ln);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_peerMutex);
+            auto it = g_peerConns.find(cfg.name);
+            if (it != g_peerConns.end() && it->second == pc) g_peerConns.erase(it);
+        }
+        closeSocket(s);
+        delete pc;
+
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+    }
+}
+
+static void setTalkgroupSpeakerRemote(const std::string& tg, const std::string& fromUser)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    TalkgroupState& ts = g_talkgroups[tg];
+    auto now = std::chrono::steady_clock::now();
+    ts.activeSpeaker = fromUser;
+    ts.speakStart = now;
+    ts.lastAudio  = now;
+}
+
+static void clearTalkgroupSpeakerIfMatches(const std::string& tg, const std::string& fromUser)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    TalkgroupState& ts = g_talkgroups[tg];
+    if (ts.activeSpeaker == fromUser) ts.activeSpeaker.clear();
+}
+
+static bool startsWith(const std::string& s, const std::string& p);
+
+static void handlePeerLine(PeerConn* pc, const std::string& line)
+{
+    std::istringstream iss(line);
+    std::string cmd;
+    iss >> cmd;
+
+    if (cmd == "PEER_SPK") {
+        std::string bridgeId, tg, from;
+        int hop = 0;
+        iss >> bridgeId >> hop >> tg >> from;
+
+        if (bridgeId.empty() || tg.empty() || from.empty()) return;
+        if (seenBridgeRecently(bridgeId) && hop >= 1) return;
+
+        std::string who = pc->peerName + ":" + from;
+        setTalkgroupSpeakerRemote(tg, who);
+
+        std::string sMsg = "SPEAKER " + who + "\n";
+        broadcastToLinkedTalkgroups(tg, sMsg, INVALID_SOCKET);
+
+        if (hop < PEER_HOP_MAX) {
+            peerForwardSpeakerStart(tg, from, bridgeId, hop + 1);
+        }
+        return;
+    }
+
+    if (cmd == "PEER_AUD") {
+        std::string bridgeId, tg;
+        int hop = 0;
+        size_t bytes = 0;
+        iss >> bridgeId >> hop >> tg >> bytes;
+        if (bridgeId.empty() || tg.empty() || bytes == 0) return;
+        if (seenBridgeRecently(bridgeId) && hop > 0) return;
+
+        std::vector<char> pcm(bytes);
+        if (!recvAll(pc->sock, pcm.data(), bytes)) { pc->running = false; return; }
+
+        int newHop = hop + 1;
+        if (newHop > PEER_HOP_MAX) newHop = PEER_HOP_MAX;
+
+        std::string who;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            who = g_talkgroups[tg].activeSpeaker;
+            if (who.empty()) who = pc->peerName + ":remote";
+            g_talkgroups[tg].lastAudio = std::chrono::steady_clock::now();
+        }
+
+        broadcastAudioToLinkedTalkgroups(tg, who, pcm, INVALID_SOCKET);
+        if (hop < PEER_HOP_MAX) {
+            peerForwardAudio(tg, pcm, bridgeId, hop + 1);
+        }
+        return;
+    }
+
+    if (cmd == "PEER_END") {
+        std::string bridgeId, tg;
+        int hop = 0;
+        iss >> bridgeId >> hop >> tg;
+        if (bridgeId.empty() || tg.empty()) return;
+        if (seenBridgeRecently(bridgeId) && hop > 0) return;
+
+        std::string curSpeaker;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            curSpeaker = g_talkgroups[tg].activeSpeaker;
+        }
+
+        const std::string peerPrefix = pc->peerName + ":";
+        if (!curSpeaker.empty() && startsWith(curSpeaker, peerPrefix)) {
+            clearTalkgroupSpeakerIfMatches(tg, curSpeaker);
+        }
+
+        broadcastToLinkedTalkgroups(tg, "MIC_FREE\\n", INVALID_SOCKET);
+        broadcastToLinkedTalkgroups(tg, "SPEAKER_NONE\\n", INVALID_SOCKET);
+
+        if (hop < PEER_HOP_MAX) {
+            peerForwardSpeakerEnd(tg, bridgeId, hop + 1);
+        }
+        return;
+    }
 }
 
 #pragma pack(push, 1)
@@ -1739,6 +2217,42 @@ static std::string buildStatusJson() {
 
     oss << "  \"connected_clients\": " << clientCount << ",\n";
 
+    oss << "  \"peers\": [\n";
+    {
+        std::lock_guard<std::mutex> lock(g_peerMutex);
+        bool firstP = true;
+
+        for (size_t i = 0; i < g_peerCfg.size(); ++i) {
+            const PeerConfig& pc = g_peerCfg[i];
+
+            bool connected = false;
+            auto it = g_peerConns.find(pc.name);
+            if (it != g_peerConns.end() && it->second) {
+                PeerConn* c = it->second;
+                connected = (c->sock != INVALID_SOCKET) && c->running.load();
+            }
+
+            if (!firstP) oss << ",\n";
+            firstP = false;
+
+            oss << "    {"
+                << "\"name\":\"" << escapeJson(pc.name) << "\","
+                << "\"host\":\"" << escapeJson(pc.host) << "\","
+                << "\"port\":" << pc.port << ","
+                << "\"connected\":" << (connected ? "true" : "false") << ","
+                << "\"rules\":[";
+
+            for (size_t r = 0; r < pc.ruleStr.size(); ++r) {
+                if (r) oss << ",";
+                oss << "\"" << escapeJson(pc.ruleStr[r]) << "\"";
+            }
+
+            oss << "]"
+                << "}";
+        }
+    }
+    oss << "\n  ],\n";
+
 	oss << "  \"talkgroups\": [\n";
 	{
 		std::lock_guard<std::mutex> lock(g_mutex);
@@ -2314,6 +2828,79 @@ void cleanupClient(SOCKET sock) {
     g_clients.erase(it);
 }
 
+
+static bool startsWith(const std::string& s, const std::string& p)
+{
+    return s.size() >= p.size() && std::equal(p.begin(), p.end(), s.begin());
+}
+
+static bool checkPeerAuth(const std::string& peerName, const std::string& secret)
+{
+    for (const auto& pc : g_peerCfg) {
+        if (pc.name != peerName) continue;
+        std::string expected = pc.secret.empty() ? g_peerSecret : pc.secret;
+        return !expected.empty() && secret == expected;
+    }
+    return false;
+}
+
+static void handlePeerSession(SOCKET sock, const std::string& firstLine)
+{
+    std::istringstream iss(firstLine);
+    std::string cmd, remoteName, secret;
+    iss >> cmd >> remoteName >> secret;
+
+    if (cmd != "PEER_AUTH" || remoteName.empty() || secret.empty() || !checkPeerAuth(remoteName, secret)) {
+        const char* fail = "PEER_FAIL\n";
+        sendAll(sock, fail, std::strlen(fail));
+        closeSocket(sock);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_peerMutex);
+        if (g_peerConns.find(remoteName) != g_peerConns.end()) {
+            const char* busy = "PEER_BUSY\n";
+            sendAll(sock, busy, std::strlen(busy));
+            closeSocket(sock);
+            return;
+        }
+    }
+
+    const char* ok = "PEER_OK\n";
+    if (!sendAll(sock, ok, std::strlen(ok))) {
+        closeSocket(sock);
+        return;
+    }
+
+    PeerConn* pc = new PeerConn();
+    pc->peerName = remoteName;
+    pc->sock = sock;
+    pc->running = true;
+
+    {
+        std::lock_guard<std::mutex> lock(g_peerMutex);
+        g_peerConns[remoteName] = pc;
+    }
+
+    LOG_OK("PEER connected inbound from %s\n", remoteName.c_str());
+
+    while (g_running && pc->running) {
+        std::string ln;
+        if (!recvLine(sock, ln)) break;
+        handlePeerLine(pc, ln);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_peerMutex);
+        auto it = g_peerConns.find(remoteName);
+        if (it != g_peerConns.end() && it->second == pc) g_peerConns.erase(it);
+    }
+
+    closeSocket(sock);
+    delete pc;
+}
+
 void handleClient(SOCKET sock) {
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -2341,10 +2928,29 @@ void handleClient(SOCKET sock) {
 
     std::string line;
 
+    if (!recvLine(sock, line)) {
+        cleanupClient(sock);
+        closeSocket(sock);
+        return;
+    }
+
+    if (startsWith(line, "PEER_AUTH")) {
+        cleanupClient(sock);
+        handlePeerSession(sock, line);
+        return;
+    }
+
+    bool haveBufferedLine = true;
+
     while (g_running) {
-        if (!recvLine(sock, line)) {
-            break;
+        if (!haveBufferedLine) {
+            if (!recvLine(sock, line)) {
+                break;
+            }
+        } else {
+            haveBufferedLine = false;
         }
+
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
@@ -2519,6 +3125,11 @@ void handleClient(SOCKET sock) {
 					broadcastToTalkgroup(tg, sMsg);
 				}
 
+				if (!tg.empty()) {
+					std::string bridgeId = ensureBridgeIdForLocalTx(tg);
+					peerForwardSpeakerStart(tg, user, bridgeId, 0);
+				}
+
 				if (preempted && !prevSpeaker.empty()) {
 					SOCKET prevSock = INVALID_SOCKET;
 					{
@@ -2571,7 +3182,18 @@ void handleClient(SOCKET sock) {
 				std::string sMsg = "SPEAKER_NONE\n";
 
 				broadcastToLinkedTalkgroups(tg, msg);
-				broadcastToLinkedTalkgroups(tg, sMsg);
+				broadcastToLinkedTalkgroups(tg, sMsg, INVALID_SOCKET);
+
+				std::string bridgeId;
+				{
+					std::lock_guard<std::mutex> lock(g_bridgeIdMutex);
+					auto it = g_activeBridgeIdByTg.find(tg);
+					if (it != g_activeBridgeIdByTg.end()) bridgeId = it->second;
+				}
+				if (!bridgeId.empty()) {
+					peerForwardSpeakerEnd(tg, bridgeId, 0);
+				}
+				clearBridgeIdForLocalTx(tg);
 
 				std::cout << "[TG " << tg << "] Mic freed by " << user << "\n";
 			}
@@ -2629,8 +3251,16 @@ void handleClient(SOCKET sock) {
 			if (allowed) {
 				if (isOpus && !decodedPcm.empty()) {
 					broadcastAudioToLinkedTalkgroups(tg, user, decodedPcm, sock);
+					{
+						std::string bridgeId = ensureBridgeIdForLocalTx(tg);
+						peerForwardAudio(tg, decodedPcm, bridgeId, 0);
+					}
 				} else {
 					broadcastAudioToLinkedTalkgroups(tg, user, buf, sock);
+					{
+						std::string bridgeId = ensureBridgeIdForLocalTx(tg);
+						peerForwardAudio(tg, buf, bridgeId, 0);
+					}
 				}
             } else if (timeOut) {
                 flushAudioJitterForTalkgroup(tg, user, sock);
@@ -3092,6 +3722,11 @@ int main() {
         LOG_ERROR("Config load failed, exiting.\n");
         return 1;
     }
+
+	compilePeerRules();
+	for (const auto& pcfg : g_peerCfg) {
+		std::thread(peerOutboundThread, pcfg).detach();
+	}
 
     initSockets();
 

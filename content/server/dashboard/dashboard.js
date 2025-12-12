@@ -7,6 +7,7 @@ const clientCountEl   = document.getElementById("clientCount");
 const activeSpeakerEl = document.getElementById("activeSpeaker");
 const waveTgLabelEl   = document.getElementById("waveTgLabel");
 const tgLinksEl       = document.getElementById("tgLinks");
+const peersTableBody  = document.querySelector("#peersTable tbody");
 
 const waveCanvas = document.getElementById("waveCanvas");
 const waveCtx    = waveCanvas.getContext("2d");
@@ -54,6 +55,7 @@ function renderStatus(data) {
   renderTalkgroups(talkgroups);
 
   renderTalkgroupLinks(talkgroups);
+  renderPeers(data.peers || []);
 
   const entries = data.entries || [];
   renderUsers(entries);
@@ -142,6 +144,48 @@ function renderTalkgroups(tgs) {
     });
 
     tgTableBody.appendChild(tr);
+  }
+}
+
+function renderPeers(peers) {
+  if (!peersTableBody) return;
+
+  peersTableBody.innerHTML = "";
+
+  if (!peers || peers.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 4;
+    td.textContent = "No peers configured.";
+    td.style.textAlign = "center";
+    td.style.color = "#777";
+    tr.appendChild(td);
+    peersTableBody.appendChild(tr);
+    return;
+  }
+
+  for (const p of peers) {
+    const tr = document.createElement("tr");
+
+    const tdName = document.createElement("td");
+    tdName.textContent = p.name || "-";
+
+    const tdEndpoint = document.createElement("td");
+    tdEndpoint.textContent = (p.host && p.port) ? `${p.host}:${p.port}` : "-";
+
+    const tdStatus = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = "badge dot " + (p.connected ? "ok" : "down");
+    badge.textContent = p.connected ? "Online" : "Offline";
+    tdStatus.appendChild(badge);
+
+    const tdRules = document.createElement("td");
+    tdRules.className = "peer-rules";
+    if (Array.isArray(p.rules) && p.rules.length) tdRules.textContent = p.rules.join(", ");
+    else tdRules.textContent = "-";
+
+    tr.append(tdName, tdEndpoint, tdStatus, tdRules);
+    peersTableBody.appendChild(tr);
   }
 }
 

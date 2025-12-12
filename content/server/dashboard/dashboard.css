@@ -144,6 +144,21 @@ td .badge {
   background: currentColor;
 }
 
+.badge.ok {
+  background: rgba(76, 175, 80, 0.12);
+  color: var(--ok);
+}
+
+.badge.down {
+  background: rgba(255, 82, 82, 0.12);
+  color: var(--accent);
+}
+
+.peer-rules {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
 .status-msg {
   padding: 6px 10px 10px;
   font-size: 0.75rem;

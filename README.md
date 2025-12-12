@@ -118,6 +118,8 @@ Commands include:
 ```json
 {
   "server_port": 26613,
+  "server_name": "local-server",
+  "peer_secret": "peer_secret",
   "max_talk_ms": 300000,
   "http_root": "dashboard",
   "http_port": 8080,
@@ -141,6 +143,14 @@ Commands include:
     "weather": ["gateway","hesse"],
     "gateway": ["germany"]
   },
+  "peers": [
+    {
+      "name": "remote-server",
+      "host": "127.0.0.1",
+      "port": 26613,
+      "rules": ["gateway=gateway:both", "germany=germany:tx"]
+    }
+  ],
   "time_announcement": {
     "enabled": true,
     "folder": "audio",
@@ -227,3 +237,20 @@ The server periodically:
 1. Fetches weather from OpenWeatherMap  
 2. Builds WAV segments  
 3. Broadcasts to the configured talkgroup  
+
+---
+
+## 📊 Dashboard – Bridge Peers Panel
+
+The dashboard now includes a **Bridge Peers** panel showing:
+- Peer name
+- Host / port
+- Online / Offline state
+- Active rules
+
+---
+
+## 🛠 Notes
+- Cross‑server audio is forwarded as PCM
+- Loop prevention uses bridge IDs + hop limits
+- Peer connections auto‑reconnect
