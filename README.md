@@ -133,7 +133,9 @@ Commands include:
     { "name": "weather" },
     { "name": "gateway" },
     { "name": "germany" },
-    { "name": "hesse" }
+    { "name": "hesse" },
+    { "name": "admin", "mode": "admin" },
+    { "name": "demo", "mode": "hide" }
   ],
   "bridges": {
     "weather": ["gateway","hesse"],
@@ -154,6 +156,15 @@ Commands include:
   "weather_city_key": "frankfurt"
 }
 ```
+
+# 🔐 Talkgroup Visibility Modes
+Talkgroups now support **visibility modes** defined in the server configuration:
+
+| Mode | Description |
+|----|----|
+| `public` (default) | Visible to everyone |
+| `admin` | Visible only to admin users |
+| `hide` | Completely hidden from non-admin users |
 
 ---
 
@@ -195,13 +206,16 @@ Commands include:
 
 # 🌐 Dashboard
 
-The built‑in HTTP server displays:
+The HTTP dashboard shows:
+- Server time
+- Connected clients
+- Active speakers
+- Public talkgroups only
+- Audio levels & activity
+- Linked talkgroup visualization
+- Live waveform
 
-- Current speaker  
-- Active talkgroups  
-- User list  
-- Weather  
-- Audio waveform  
+📌 Hidden/admin talkgroups are never shown, even if active.
 
 Served from `/dashboard/`.
 

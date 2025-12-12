@@ -454,7 +454,18 @@ struct CachedWav {
 
 std::mutex g_mutex;
 std::unordered_map<std::string, User> g_users;
-std::unordered_set<std::string> g_knownTalkgroups;
+
+enum class TalkgroupMode {
+    PUBLIC, HIDE, ADMIN
+};
+
+struct TalkgroupInfo {
+    std::string name;
+    TalkgroupMode mode;
+};
+
+std::unordered_map<std::string, TalkgroupInfo> g_knownTalkgroups;
+
 std::unordered_map<SOCKET, ClientInfo> g_clients;
 std::unordered_map<std::string, TalkgroupState> g_talkgroups;
 
@@ -503,6 +514,20 @@ bool fetchWeatherFromOpenWeather(WeatherData& out);
 bool buildCompositeWav(const std::vector<std::string>& keys,const std::string& compositeKey,CachedWav& out);
 std::vector<std::string> buildWeatherSegmentKeys(const WeatherData& wd);
 
+static bool showInClientList(const TalkgroupInfo& tg, const User* user)
+{
+    if (user && user->isAdmin)
+        return true;
+
+    if (tg.mode == TalkgroupMode::HIDE)
+        return false;
+
+    if (tg.mode == TalkgroupMode::ADMIN)
+        return false;
+
+    return true;
+}
+
 static void sendTalkgroupListForUser(SOCKET sock, const std::string& callsign)
 {
     std::ostringstream oss;
@@ -512,32 +537,39 @@ static void sendTalkgroupListForUser(SOCKET sock, const std::string& callsign)
     {
         std::lock_guard<std::mutex> lock(g_mutex);
 
-        auto uit = g_users.find(callsign);
-        if (uit != g_users.end()) {
-            const User &u = uit->second;
+		auto uit = g_users.find(callsign);
+		const User* user = (uit != g_users.end()) ? &uit->second : nullptr;
 
-            if (!u.talkgroups.empty()) {
-                for (const auto &tgName : g_knownTalkgroups) {
-                    if (u.talkgroups.find(tgName) != u.talkgroups.end()) {
-                        if (!first) oss << ",";
-                        first = false;
-                        oss << tgName;
-                    }
-                }
-            } else {
-                for (const auto &tgName : g_knownTalkgroups) {
-                    if (!first) oss << ",";
-                    first = false;
-                    oss << tgName;
-                }
-            }
-        } else {
-            for (const auto &tgName : g_knownTalkgroups) {
-                if (!first) oss << ",";
-                first = false;
-                oss << tgName;
-            }
-        }
+		if (user && user->isAdmin) {
+			for (const auto& kv : g_knownTalkgroups) {
+				const TalkgroupInfo& tg = kv.second;
+				if (!first) oss << ",";
+				first = false;
+				oss << tg.name;
+			}
+		}
+		else if (user && !user->talkgroups.empty()) {
+			for (const auto& kv : g_knownTalkgroups) {
+				const TalkgroupInfo& tg = kv.second;
+				if (!showInClientList(tg, user)) continue;
+
+				if (user->talkgroups.find(tg.name) != user->talkgroups.end()) {
+					if (!first) oss << ",";
+					first = false;
+					oss << tg.name;
+				}
+			}
+		}
+		else {
+			for (const auto& kv : g_knownTalkgroups) {
+				const TalkgroupInfo& tg = kv.second;
+				if (!showInClientList(tg, user)) continue;
+
+				if (!first) oss << ",";
+				first = false;
+				oss << tg.name;
+			}
+		}
     }
 
     oss << "\n";
@@ -735,6 +767,7 @@ bool loadConfig(const std::string& path) {
     bool inBridges    = false;
 
     User currentUser;
+	TalkgroupInfo currentTg;
 
     for (size_t i = 0; i < lines.size(); ++i) {
         std::string l = trim(lines[i]);
@@ -838,16 +871,26 @@ bool loadConfig(const std::string& path) {
 			continue;
 		}
 		if (inTalkgroups) {
-			if (l.find(']') != std::string::npos) {
-				inTalkgroups = false;
-				continue;
+			if (l.find("{") != std::string::npos) {
+				TalkgroupInfo tg;
+				tg.mode = TalkgroupMode::PUBLIC;
+				currentTg = tg;
 			}
 
-			std::string tgName;
-			if (parseStringField(l, "name", tgName)) {
-				g_knownTalkgroups.insert(tgName);
-				g_talkgroups[tgName];
-				continue;
+			std::string sval;
+			if (parseStringField(l, "name", sval)) {
+				currentTg.name = sval;
+			}
+			if (parseStringField(l, "mode", sval)) {
+				if (sval == "hide")
+					currentTg.mode = TalkgroupMode::HIDE;
+				else if (sval == "admin")
+					currentTg.mode = TalkgroupMode::ADMIN;
+			}
+
+			if (l.find("}") != std::string::npos) {
+				g_knownTalkgroups[currentTg.name] = currentTg;
+				g_talkgroups[currentTg.name] = TalkgroupState();
 			}
 		}
 
@@ -1540,11 +1583,21 @@ static bool saveConfig(const std::string& path)
     f << "  \"talkgroups\": [\n";
     {
         bool firstTg = true;
-        for (const auto& tgName : g_knownTalkgroups) {
-            if (!firstTg) f << ",\n";
-            firstTg = false;
-            f << "    { \"name\": \"" << escapeJson(tgName) << "\" }";
-        }
+		for (const auto& kv : g_knownTalkgroups) {
+			const TalkgroupInfo& tg = kv.second;
+
+			if (!firstTg) f << ",\n";
+			firstTg = false;
+
+			f << "    { \"name\": \"" << escapeJson(tg.name) << "\"";
+
+			if (tg.mode == TalkgroupMode::HIDE)
+				f << ", \"mode\": \"hide\"";
+			else if (tg.mode == TalkgroupMode::ADMIN)
+				f << ", \"mode\": \"admin\"";
+
+			f << " }";
+		}
         f << "\n  ]\n";
     }
 
@@ -1615,6 +1668,17 @@ static void updateLastHeard(const std::string& user, const std::string& tg)
     info.when      = now;
 }
 
+static bool showOnPublicDashboard(const std::string& tgName)
+{
+    auto it = g_knownTalkgroups.find(tgName);
+    if (it == g_knownTalkgroups.end())
+        return true;
+
+    const TalkgroupInfo& tg = it->second;
+
+    return (tg.mode == TalkgroupMode::PUBLIC);
+}
+
 static std::string buildStatusJson() {
     using namespace std::chrono;
 
@@ -1683,6 +1747,9 @@ static std::string buildStatusJson() {
 			const std::string& tgName = kv.first;
 			const TalkgroupState& ts  = kv.second;
 
+			if (!showOnPublicDashboard(tgName))
+				continue;
+
 			std::string activeSpeaker = ts.activeSpeaker;
 			long long speakMs = 0;
 			if (!activeSpeaker.empty() && clientIsSpeaking(ts)) {
@@ -1713,8 +1780,17 @@ static std::string buildStatusJson() {
                     audioLevel = itLvl->second;
             }
 
-            std::vector<std::string> fanout = getLinkedFanout(tgName);
-            fanout.erase(std::remove(fanout.begin(), fanout.end(), tgName), fanout.end());
+			std::vector<std::string> fanout = getLinkedFanout(tgName);
+            fanout.erase(
+				std::remove_if(
+					fanout.begin(),
+					fanout.end(),
+					[](const std::string& name) {
+						return !showOnPublicDashboard(name);
+					}
+				),
+				fanout.end()
+			);
 
             float activity = 0.0f;
             if (ts.lastAudio.time_since_epoch().count() != 0) {
@@ -1757,6 +1833,9 @@ static std::string buildStatusJson() {
 		for (const auto& kv : g_clients) {
 			const ClientInfo& ci = kv.second;
 			if (!ci.authenticated) continue;
+
+			if (!ci.talkgroup.empty() && !showOnPublicDashboard(ci.talkgroup))
+				continue;
 
 			bool       speaking = false;
 			long long  speakMs  = 0;
@@ -2881,8 +2960,12 @@ void handleClient(SOCKET sock) {
 						} else {
 							it2->second.talkgroups.insert(tg);
 
-							g_knownTalkgroups.insert(tg);
-							g_talkgroups[tg];
+							TalkgroupInfo info;
+							info.name = tg;
+							info.mode = TalkgroupMode::PUBLIC;
+							g_knownTalkgroups[tg] = info;
+
+							g_talkgroups[tg] = TalkgroupState();
 
 							std::string resp = "ADMIN_OK add_talkgroup\n";
 							sendAll(sock, resp.c_str(), resp.size());
@@ -2957,11 +3040,11 @@ void handleClient(SOCKET sock) {
                 {
                     std::lock_guard<std::mutex> lock(g_mutex);
                     std::unordered_set<std::string>::iterator it;
-                    for (it = g_knownTalkgroups.begin(); it != g_knownTalkgroups.end(); ++it) {
-                        if (!first) oss << ",";
-                        first = false;
-                        oss << *it;
-                    }
+					for (const auto& kv : g_knownTalkgroups) {
+						if (!first) oss << ",";
+						first = false;
+						oss << kv.second.name;
+					}
                 }
                 oss << "\n";
                 std::string resp = oss.str();

@@ -79,6 +79,9 @@ function renderTalkgroups(tgs) {
   }
 
   for (const tg of tgs) {
+    if (!tg.name || tg.name === "-")
+      continue;
+
     const tr = document.createElement("tr");
     tr.dataset.tgName = tg.name;
 
@@ -272,11 +275,13 @@ function autoSelectWaveformTg(talkgroups) {
   if (!talkgroups || talkgroups.length === 0) return;
 
   if (!currentWaveTg || currentWaveTg === "gateway") {
-    const active = talkgroups.find(t => t.active_speaker);
+	const active = talkgroups.find(t => t.active_speaker && t.name && t.name !== "-");
     if (active) {
       currentWaveTg = active.name;
     } else {
       currentWaveTg = talkgroups[0].name;
+	  if (!currentWaveTg || currentWaveTg === "-")
+		return;
     }
     waveTgLabelEl.textContent = currentWaveTg || "-";
   }

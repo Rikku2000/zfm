@@ -1862,7 +1862,7 @@ int main(int argc, char** argv) {
 					if (singleWidth < 40) singleWidth = 40;
 
 					{
-						const char* label = "MIC";
+						const char* label = "Transmit";
 						int lw = 0, lh = 0;
 						TTF_SizeUTF8(font, label, &lw, &lh);
 						int lx = barX + (singleWidth - lw) / 2;
@@ -1871,7 +1871,7 @@ int main(int argc, char** argv) {
 					}
 
 					{
-						const char* label = "RX";
+						const char* label = "Receive";
 						int lw = 0, lh = 0;
 						TTF_SizeUTF8(font, label, &lw, &lh);
 						int lx = barX + singleWidth + gap + (singleWidth - lw) / 2;

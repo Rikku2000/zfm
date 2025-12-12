@@ -2153,11 +2153,16 @@ int main(int argc, char** argv) {
     g_inputGain  = g_cfg.input_gain  / 100.0f;
     g_outputGain = g_cfg.output_gain / 100.0f;
 
-    LOG_INFO("Client cfg:\n"
+	LOG_INFO("Client cfg:\n"
          "  mode: %s\n"
          "  server: %s:%d\n"
-         "  user: %s / TG=%d\n"
-		 "  VOX: %s (thr=%d)\n",g_cfg.mode.c_str(),g_cfg.server_ip.c_str(), g_cfg.server_port,g_cfg.callsign.c_str(), g_cfg.talkgroup,g_cfg.vox_enabled ? "ENABLED" : "DISABLED",g_cfg.vox_threshold);
+         "  user: %s / TG=%s\n"
+         "  VOX: %s (thr=%d)\n",
+         g_cfg.mode.c_str(),
+         g_cfg.server_ip.c_str(), g_cfg.server_port,
+         g_cfg.callsign.c_str(), g_cfg.talkgroup.c_str(),
+         g_cfg.vox_enabled ? "ENABLED" : "DISABLED",
+         g_cfg.vox_threshold);
 
     if (!initPortAudio(g_cfg)) {
         std::cerr << "PortAudio init failed.\n";
