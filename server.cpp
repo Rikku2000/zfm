@@ -316,7 +316,6 @@ static bool httpGet(const std::string& host, const std::string& path, std::strin
     return !outResponse.empty();
 }
 
-#ifdef OPUS
 #ifdef _WIN32
 #include <opus.h>
 
@@ -385,7 +384,6 @@ static void unloadOpusDllServer()
 #else
 #include <opus/opus.h>
 #endif
-#endif
 
 enum class Role {
     USER = 0,
@@ -426,9 +424,7 @@ struct ClientInfo {
     std::string talkgroup;
     bool authenticated;
     std::string remoteAddr;
-#ifdef OPUS
 	OpusDecoder* opusDec;
-#endif
 };
 
 struct TalkgroupState {
@@ -640,7 +636,6 @@ static std::mutex g_bridgeIdMutex;
 static std::unordered_map<std::string, std::string> g_activeBridgeIdByTg;
 static std::atomic<uint64_t> g_bridgeSeq(0);
 
-#ifdef OPUS
 static bool decodeClientOpus(ClientInfo& ci,
                              const std::vector<char>& inPkt,
                              std::vector<char>& outPcm)
@@ -704,12 +699,6 @@ static bool decodeClientOpus(ClientInfo& ci,
     std::memcpy(outPcm.data(), pcm.data(), outPcm.size());
     return true;
 }
-#else
-static bool decodeClientOpus(ClientInfo&, const std::vector<char>&, std::vector<char>&)
-{
-    return false;
-}
-#endif
 
 static inline std::string trim(const std::string& s) {
     size_t a = 0;
@@ -2726,7 +2715,47 @@ static void broadcastToLinkedTalkgroups(const std::string& tg,const std::string&
     }
 }
 
-static void broadcastAudioToLinkedTalkgroups(const std::string& tg,const std::string& fromUser,const std::vector<char>& buf,SOCKET exceptSock) {
+static void broadcastAdpcmToTalkgroup(const std::string& tg,
+                                     const std::string& fromUser,
+                                     uint32_t seq,
+                                     uint16_t rate,
+                                     const std::vector<char>& payload,
+                                     SOCKET excludeSock)
+{
+    std::ostringstream oss;
+    oss << "AUDIO_ADPCM_FROM " << fromUser << " " << seq << " " << rate << " " << payload.size() << "\n";
+    std::string header = oss.str();
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const auto& kv : g_clients) {
+        SOCKET cs = kv.first;
+        if (cs == excludeSock) continue;
+        const ClientInfo& ci = kv.second;
+        if (!ci.authenticated) continue;
+        if (ci.talkgroup != tg) continue;
+
+        sendAll(cs, header.data(), header.size());
+        if (!payload.empty()) {
+            sendAll(cs, payload.data(), payload.size());
+        }
+    }
+}
+
+static void broadcastAdpcmToLinkedTalkgroups(const std::string& baseTg,
+                                            const std::string& fromUser,
+                                            uint32_t seq,
+                                            uint16_t rate,
+                                            const std::vector<char>& payload,
+                                            SOCKET excludeSock)
+{
+    const std::vector<std::string> fanout = getLinkedFanout(baseTg);
+    for (const auto& tg : fanout) {
+        if (tg.empty()) continue;
+        broadcastAdpcmToTalkgroup(tg, fromUser, seq, rate, payload, excludeSock);
+    }
+}
+
+void broadcastAudioToLinkedTalkgroups(const std::string& tg,const std::string& fromUser,const std::vector<char>& buf,SOCKET exceptSock) {
     auto tgs = getLinkedFanout(tg);
     for (const auto& name : tgs) {
         broadcastAudioToTalkgroup(name, fromUser, buf, exceptSock);
@@ -2821,12 +2850,10 @@ void cleanupClient(SOCKET sock) {
 		triggerAnnouncementForTalkgroup(tg, "tg_leave");
 	}
 
-#ifdef OPUS
     if (it->second.opusDec && p_opus_decoder_destroy) {
         p_opus_decoder_destroy(it->second.opusDec);
         it->second.opusDec = nullptr;
     }
-#endif
 
     g_clients.erase(it);
 }
@@ -2930,9 +2957,7 @@ void handleClient(SOCKET sock) {
         ci.talkgroup.clear();
         ci.authenticated = false;
         ci.remoteAddr = "unknown";
-#ifdef OPUS
 		ci.opusDec = nullptr;
-#endif
 
         sockaddr_in addr;
         socklen_t len = sizeof(addr);
@@ -3218,7 +3243,66 @@ void handleClient(SOCKET sock) {
 				std::cout << "[TG " << tg << "] Mic freed by " << user << "\n";
 			}
         }
-#ifdef OPUS
+        else if (cmd == "AUDIO_ADPCM") {
+            uint32_t seq = 0;
+            uint16_t rate = 22050;
+            size_t size = 0;
+            iss >> seq >> rate >> size;
+            if (size == 0) continue;
+
+            std::vector<char> buf(size);
+            if (!recvAll(sock, buf.data(), size)) {
+                break;
+            }
+
+            std::string tg;
+            std::string user;
+            bool allowed = false;
+            bool timeOut = false;
+
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                auto it = g_clients.find(sock);
+                if (it == g_clients.end()) continue;
+
+                tg   = it->second.talkgroup;
+                user = it->second.callsign;
+
+                if (!tg.empty()) {
+                    TalkgroupState &ts = g_talkgroups[tg];
+                    auto uit = g_users.find(user);
+                    if (uit != g_users.end() && !uit->second.muted && ts.activeSpeaker == user) {
+                        auto now = std::chrono::steady_clock::now();
+                        long long elapsed =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.speakStart).count();
+                        if (elapsed <= g_max_talk_ms) {
+                            allowed      = true;
+                            ts.lastAudio = now;
+                        } else {
+                            ts.activeSpeaker.clear();
+                            timeOut = true;
+                        }
+                    }
+                }
+            }
+
+            if (allowed) {
+                broadcastAdpcmToLinkedTalkgroups(tg, user, seq, rate, buf, sock);
+            } else if (timeOut) {
+                flushAudioJitterForTalkgroup(tg, user, sock);
+
+                std::string msg = "SPEAK_REVOKED TIME_LIMIT\nMIC_FREE\n";
+                sendAll(sock, msg.c_str(), msg.size());
+                if (!tg.empty()) {
+                    std::string bmsg = "MIC_FREE\n";
+                    broadcastToTalkgroup(tg, bmsg, sock);
+
+                    std::string sMsg = "SPEAKER_NONE\n";
+                    broadcastToTalkgroup(tg, sMsg, sock);
+                }
+                LOG_INFO("[TG %s] Time limit reached for %s\n", tg.c_str(), user.c_str());
+            }
+        }
         else if (cmd == "AUDIO" || cmd == "AUDIO_OPUS") {
             size_t size;
             iss >> size;
@@ -3297,65 +3381,6 @@ void handleClient(SOCKET sock) {
                 LOG_INFO("[TG %s] Time limit reached for %s\n", tg.c_str(), user.c_str());
             }
         }
-#else
-        else if (cmd == "AUDIO") {
-            size_t size;
-            iss >> size;
-            if (size == 0) continue;
-            std::vector<char> buf(size);
-            if (!recvAll(sock, buf.data(), size)) {
-                break;
-            }
-
-            std::string tg;
-            std::string user;
-            bool allowed = false;
-            bool timeOut = false;
-
-            {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                std::unordered_map<SOCKET, ClientInfo>::iterator it = g_clients.find(sock);
-                if (it == g_clients.end()) continue;
-
-                tg = it->second.talkgroup;
-                user = it->second.callsign;
-
-                if (!tg.empty()) {
-                    TalkgroupState& ts = g_talkgroups[tg];
-                    std::unordered_map<std::string, User>::iterator uit = g_users.find(user);
-                    if (uit != g_users.end() && !uit->second.muted && ts.activeSpeaker == user) {
-                        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-                        long long elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.speakStart).count();
-                        if (elapsed <= g_max_talk_ms) {
-                            allowed = true;
-                        } else {
-                            ts.activeSpeaker.clear();
-                            timeOut = true;
-                        }
-                    }
-                }
-            }
-
-			if (allowed) {
-				broadcastAudioToLinkedTalkgroups(tg, user, buf, sock);
-			} else {
-				if (timeOut) {
-					flushAudioJitterForTalkgroup(tg, user, sock);
-
-					std::string msg = "SPEAK_REVOKED TIME_LIMIT\nMIC_FREE\n";
-					sendAll(sock, msg.c_str(), msg.size());
-					if (!tg.empty()) {
-						std::string bmsg = "MIC_FREE\n";
-						broadcastToTalkgroup(tg, bmsg, sock);
-
-						std::string sMsg = "SPEAKER_NONE\n";
-						broadcastToTalkgroup(tg, sMsg, sock);
-					}
-					LOG_INFO("[TG %s] Time limit reached for %s\n",tg.c_str(), user.c_str());
-				}
-			}
-        }
-#endif
 		else if (cmd == "ADMIN") {
 			std::string sub;
 			iss >> sub;

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <ctime>
+#include <cctype>
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
@@ -455,7 +456,6 @@ static void GuiPushToTalkLoop() {
 			}
 		}
 
-#ifdef OPUS
 		std::vector<char> payload;
 		std::string audioCmd;
 
@@ -484,22 +484,6 @@ static void GuiPushToTalkLoop() {
 			g_running = false;
 			break;
 		}
-#else
-        std::ostringstream oss;
-        oss << "AUDIO " << frame.size() << "\n";
-        std::string header = oss.str();
-
-        if (!sendAll(g_guiSock, header.data(), header.size())) {
-            GuiAppendLog("[ERROR] Failed to send AUDIO header");
-            g_running = false;
-            break;
-        }
-        if (!sendAll(g_guiSock, frame.data(), frame.size())) {
-            GuiAppendLog("[ERROR] Failed to send AUDIO data");
-            g_running = false;
-            break;
-        }
-#endif
     }
 
     if (g_canTalk) {
@@ -612,6 +596,261 @@ static std::vector<Widget> g_widgets;
 static int g_focusWidget = -1;
 static int g_activeSlider = -1;
 static bool g_mouseDown    = false;
+
+#ifdef MOBILE
+struct OsKey {
+    enum Kind { Normal, Backspace, Shift, Space, Enter, Hide, ToggleSym };
+
+    std::string label;
+    std::string out;
+    SDL_Rect rect;
+    Kind kind;
+
+    OsKey() : rect(), kind(Normal) {
+        rect.x = rect.y = rect.w = rect.h = 0;
+    }
+};
+
+static bool g_kbVisible  = false;
+static bool g_kbShift    = false;
+static bool g_kbSymbols  = false;
+static int  g_kbTargetEdit = -1;
+
+static SDL_Rect g_kbRect = {0,0,0,0};
+static std::vector<OsKey> g_kbKeys;
+
+static int g_id_cmdEdit_global = -1;
+
+static void InsertTextToFocused(const std::string& t, TTF_Font* fontForMeasure = nullptr) {
+    (void)fontForMeasure;
+    if (g_focusWidget < 0 || g_focusWidget >= (int)g_widgets.size()) return;
+    Widget& wdg = g_widgets[g_focusWidget];
+    if (wdg.type != W_EDIT || !wdg.boundText) return;
+
+    std::string& s = *wdg.boundText;
+    int len = (int)s.size();
+    if (wdg.caretPos < 0 || wdg.caretPos > len) wdg.caretPos = len;
+
+    s.insert((size_t)wdg.caretPos, t);
+    wdg.caretPos += (int)t.size();
+}
+
+static void BackspaceFocused() {
+    if (g_focusWidget < 0 || g_focusWidget >= (int)g_widgets.size()) return;
+    Widget& wdg = g_widgets[g_focusWidget];
+    if (wdg.type != W_EDIT || !wdg.boundText) return;
+
+    std::string& s = *wdg.boundText;
+    if (wdg.caretPos < 0) wdg.caretPos = (int)s.size();
+    if (wdg.caretPos > (int)s.size()) wdg.caretPos = (int)s.size();
+    if (wdg.caretPos <= 0 || s.empty()) return;
+
+    s.erase((size_t)wdg.caretPos - 1, 1);
+    wdg.caretPos--;
+}
+
+static void PushRow(std::vector<std::string>& dst, const char* const* items, int count) {
+    dst.clear();
+    for (int i = 0; i < count; ++i) dst.push_back(items[i]);
+}
+
+static void BuildOnScreenKeyboard(int winW, int winH) {
+    g_kbKeys.clear();
+
+    const int kbH = 240;
+    const int pad = 8;
+    const int rowGap = 8;
+    const int keyGap = 6;
+
+    g_kbRect.x = 0;
+    g_kbRect.y = winH - kbH;
+    g_kbRect.w = winW;
+    g_kbRect.h = kbH;
+
+    struct AddKeyHelper {
+        static void add(std::vector<OsKey>& keys, const std::string& label, const std::string& out,
+                        OsKey::Kind kind, int x, int y, int w, int h) {
+            OsKey k;
+            k.label = label;
+            k.out   = out;
+            k.kind  = kind;
+            k.rect.x = x; k.rect.y = y; k.rect.w = w; k.rect.h = h;
+            keys.push_back(k);
+        }
+    };
+
+    static const char* const R1A[] = {"q","w","e","r","t","y","u","i","o","p"};
+    static const char* const R2A[] = {"a","s","d","f","g","h","j","k","l"};
+    static const char* const R3A[] = {"z","x","c","v","b","n","m"};
+
+    static const char* const R1S[] = {"1","2","3","4","5","6","7","8","9","0"};
+    static const char* const R2S[] = {"@","#","$","%","&","-","+","(",")"};
+    static const char* const R3S[] = {"*","\"","'",";",":","!","?"};
+
+    std::vector<std::string> r1, r2, r3;
+    if (!g_kbSymbols) {
+        PushRow(r1, R1A, (int)(sizeof(R1A)/sizeof(R1A[0])));
+        PushRow(r2, R2A, (int)(sizeof(R2A)/sizeof(R2A[0])));
+        PushRow(r3, R3A, (int)(sizeof(R3A)/sizeof(R3A[0])));
+    } else {
+        PushRow(r1, R1S, (int)(sizeof(R1S)/sizeof(R1S[0])));
+        PushRow(r2, R2S, (int)(sizeof(R2S)/sizeof(R2S[0])));
+        PushRow(r3, R3S, (int)(sizeof(R3S)/sizeof(R3S[0])));
+    }
+
+    int y = g_kbRect.y + pad;
+
+    struct RowBuilder {
+        static void make(std::vector<OsKey>& keys, const std::vector<std::string>& row,
+                         int winW, int yRow, int pad, int keyGap, int leftIndent, int rightIndent) {
+            int usableW = winW - (pad * 2) - leftIndent - rightIndent;
+            int keyW = (int)((usableW - (int)(row.size() - 1) * keyGap) / (int)row.size());
+            int x = pad + leftIndent;
+            for (size_t i = 0; i < row.size(); ++i) {
+                AddKeyHelper::add(keys, row[i], row[i], OsKey::Normal, x, yRow, keyW, 44);
+                x += keyW + keyGap;
+            }
+        }
+    };
+
+    RowBuilder::make(g_kbKeys, r1, winW, y, pad, keyGap, 0, 0);
+    y += 44 + rowGap;
+
+    RowBuilder::make(g_kbKeys, r2, winW, y, pad, keyGap, 16, 16);
+    y += 44 + rowGap;
+
+    {
+        int rowH = 44;
+        int leftW = 70;
+        int rightW = 90;
+
+        int x = pad;
+        AddKeyHelper::add(g_kbKeys, g_kbShift ? "SHIFT" : "Shift", "", OsKey::Shift, x, y, leftW, rowH);
+        x += leftW + keyGap;
+
+        int usableW = winW - (pad * 2) - leftW - rightW - (keyGap * 2);
+        int keyW = (int)((usableW - (int)(r3.size() - 1) * keyGap) / (int)r3.size());
+
+        for (size_t i = 0; i < r3.size(); ++i) {
+            AddKeyHelper::add(g_kbKeys, r3[i], r3[i], OsKey::Normal, x, y, keyW, rowH);
+            x += keyW + keyGap;
+        }
+
+        AddKeyHelper::add(g_kbKeys, "Backspace", "", OsKey::Backspace, winW - pad - rightW, y, rightW, rowH);
+        y += rowH + rowGap;
+    }
+
+    {
+        int rowH = 46;
+        int x = pad;
+
+        int wToggle = 90;
+        int wHide = 60;
+        int wEnter = 90;
+
+        AddKeyHelper::add(g_kbKeys, g_kbSymbols ? "ABC" : "123", "", OsKey::ToggleSym, x, y, wToggle, rowH);
+        x += wToggle + keyGap;
+
+        AddKeyHelper::add(g_kbKeys, "Hide", "", OsKey::Hide, x, y, wHide, rowH);
+        x += wHide + keyGap;
+
+        int spaceW = (winW - (pad * 2)) - (wToggle + wHide + wEnter) - (keyGap * 3);
+        if (spaceW < 80) spaceW = 80;
+        AddKeyHelper::add(g_kbKeys, "Space", " ", OsKey::Space, x, y, spaceW, rowH);
+        x += spaceW + keyGap;
+
+        AddKeyHelper::add(g_kbKeys, "Enter", "", OsKey::Enter, x, y, wEnter, rowH);
+    }
+}
+
+static void DrawOnScreenKeyboard(SDL_Renderer* r, TTF_Font* font, int winW, int winH) {
+    if (!g_kbVisible) return;
+
+    if (g_kbRect.w != winW || g_kbRect.h <= 0) {
+        BuildOnScreenKeyboard(winW, winH);
+    }
+
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(r, 0, 0, 0, 120);
+    SDL_Rect dim = { 0, 0, winW, winH };
+    SDL_RenderFillRect(r, &dim);
+
+    SDL_Color kbBg = { 0x1a, 0x1a, 0x1a, 245 };
+    SDL_Color kbBd = { 0x33, 0x33, 0x33, 255 };
+    SDL_Color keyBg = { 0x22, 0x22, 0x22, 255 };
+    SDL_Color keyBg2= { 0x2a, 0x2a, 0x2a, 255 };
+
+    DrawRect(r, g_kbRect, kbBg);
+    DrawRectBorder(r, g_kbRect, kbBd, 1);
+
+    int mx, my;
+    SDL_GetMouseState(&mx, &my);
+    SDL_Point pt = { mx, my };
+
+    for (auto& k : g_kbKeys) {
+        bool hover = SDL_PointInRect(&pt, &k.rect);
+
+        SDL_Color bg = hover ? keyBg2 : keyBg;
+        if (k.kind != OsKey::Normal && !hover) { bg.r = 0x26; bg.g = 0x26; bg.b = 0x26; bg.a = 255; }
+
+        DrawRect(r, k.rect, bg);
+        DrawRectBorder(r, k.rect, kbBd, 1);
+        DrawTextCentered(r, font, k.label, k.rect, COL_TEXT);
+    }
+}
+
+static bool HandleOnScreenKeyboardClick(int mx, int my) {
+    if (!g_kbVisible) return false;
+
+    SDL_Point pt = { mx, my };
+    if (!SDL_PointInRect(&pt, &g_kbRect)) return false;
+
+    for (auto& k : g_kbKeys) {
+        if (!SDL_PointInRect(&pt, &k.rect)) continue;
+
+        switch (k.kind) {
+            case OsKey::Normal: {
+                std::string out = k.out;
+                if (!g_kbSymbols) {
+                    if (g_kbShift) {
+                        for (auto& ch : out) ch = (char)std::toupper((unsigned char)ch);
+                        g_kbShift = false;
+                        BuildOnScreenKeyboard(g_kbRect.w, g_kbRect.y + g_kbRect.h);
+                    }
+                }
+                InsertTextToFocused(out);
+                return true;
+            }
+            case OsKey::Space:
+                InsertTextToFocused(" ");
+                return true;
+            case OsKey::Backspace:
+                BackspaceFocused();
+                return true;
+            case OsKey::Shift:
+                g_kbShift = !g_kbShift;
+                BuildOnScreenKeyboard(g_kbRect.w, g_kbRect.y + g_kbRect.h);
+                return true;
+            case OsKey::ToggleSym:
+                g_kbSymbols = !g_kbSymbols;
+                g_kbShift = false;
+                BuildOnScreenKeyboard(g_kbRect.w, g_kbRect.y + g_kbRect.h);
+                return true;
+            case OsKey::Hide:
+                g_kbVisible = false;
+                return true;
+            case OsKey::Enter:
+                if (g_focusWidget == g_id_cmdEdit_global) {
+                    g_kbVisible = false;
+                } else {
+                    g_kbVisible = false;
+                }
+                return true;
+        }
+    }
+    return true;
+}
+#endif
 
 static SDL_Rect makeRect(int x, int y, int w, int h) {
     SDL_Rect r = { x, y, w, h };
@@ -748,6 +987,12 @@ static std::string ui_gpio_pin;
 static std::string ui_gpio_hold_ms;
 static std::string ui_vox_thresh;
 
+static bool ui_rx_squelch_en = false;
+static bool ui_rx_squelch_auto = true;
+static int  ui_rx_squelch_level = 55;
+static int  ui_rx_squelch_voice = 55;
+static int  ui_rx_squelch_hang  = 450;
+
 static int ui_in_gain  = 100;
 static int ui_out_gain = 100;
 
@@ -755,11 +1000,9 @@ static bool ui_gpio_ptt_en = false;
 static bool ui_gpio_ah     = false;
 static bool ui_vox_en      = false;
 
-#ifdef OPUS
 static std::vector<std::string> g_codecItems;
 static int         ui_codec_index = 0;
 static std::string ui_codec_text;
-#endif
 
 static std::string ui_ptt_cmd_on;
 static std::string ui_ptt_cmd_off;
@@ -830,16 +1073,25 @@ static void CfgToUi() {
     ui_in_gain  = g_cfg.input_gain;
     ui_out_gain = g_cfg.output_gain;
 
-#ifdef OPUS
+	ui_rx_squelch_en    = g_cfg.rx_squelch_enabled;
+	ui_rx_squelch_auto  = g_cfg.rx_squelch_auto;
+	ui_rx_squelch_level = g_cfg.rx_squelch_level;
+	ui_rx_squelch_voice = g_cfg.rx_squelch_voice_pct;
+	ui_rx_squelch_hang  = g_cfg.rx_squelch_hang_ms;
+
     if (g_codecItems.empty()) {
-        g_codecItems.push_back("Default (PCM)");
-        g_codecItems.push_back("Opus");
+        g_codecItems.push_back("PCM (raw)");
+        g_codecItems.push_back("ADPCM (22.05 kHz)");
+        g_codecItems.push_back("Opus (48 kHz)");
     }
-    ui_codec_index = g_cfg.use_opus ? 1 : 0;
+
+    if (g_cfg.use_adpcm)      ui_codec_index = 1;
+    else if (g_cfg.use_opus)  ui_codec_index = 2;
+    else                      ui_codec_index = 0;
+
     if (ui_codec_index < 0 || ui_codec_index >= (int)g_codecItems.size())
         ui_codec_index = 0;
     ui_codec_text = g_codecItems[ui_codec_index];
-#endif
 
     ui_ptt_cmd_on  = g_cfg.ptt_cmd_on;
     ui_ptt_cmd_off = g_cfg.ptt_cmd_off;
@@ -935,9 +1187,24 @@ static void UiToCfg() {
     g_cfg.input_gain  = ui_in_gain;
     g_cfg.output_gain = ui_out_gain;
 
-#ifdef OPUS
-	g_cfg.use_opus = (ui_codec_index == 1);
-#endif
+	g_cfg.rx_squelch_enabled   = ui_rx_squelch_en;
+	g_cfg.rx_squelch_auto      = ui_rx_squelch_auto;
+	g_cfg.rx_squelch_level     = ui_rx_squelch_level;
+	g_cfg.rx_squelch_voice_pct = ui_rx_squelch_voice;
+	g_cfg.rx_squelch_hang_ms   = ui_rx_squelch_hang;
+
+    g_cfg.use_adpcm = (ui_codec_index == 1);
+    g_cfg.use_opus  = (ui_codec_index == 2);
+
+    if (g_cfg.use_adpcm) {
+        g_cfg.sample_rate       = 22050;
+        g_cfg.frames_per_buffer = 220;
+        g_cfg.channels          = 1;
+    } else if (g_cfg.use_opus) {
+        g_cfg.sample_rate       = 48000;
+        g_cfg.frames_per_buffer = 480;
+        g_cfg.channels          = 1;
+    }
 
     g_cfg.vox_enabled          = ui_vox_en;
     g_cfg.vox_threshold        = std::atoi(ui_vox_thresh.c_str());
@@ -1132,13 +1399,16 @@ int main(int argc, char** argv) {
                                           SDL_WINDOWPOS_CENTERED,
                                           SDL_WINDOWPOS_CENTERED,
                                           460, 700,
-                                          SDL_WINDOW_SHOWN);
+                                          SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     if (!window) {
         std::cerr << "CreateWindow failed: " << SDL_GetError() << "\n";
         TTF_Quit();
         SDL_Quit();
         return 1;
     }
+
+
+    SDL_SetWindowMinimumSize(window, 460, 700);
 
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1,
         SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
@@ -1163,28 +1433,69 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+
     int w, h;
     SDL_GetWindowSize(window, &w, &h);
 
+    SDL_Rect rcTabBar, rcTabMain, rcTabAudio, rcTabGpio, rcTabSquelch, rcTabLog;
+    SDL_Rect rcLogCard, rcLogInner;
+    int contentTop = 0;
+    int bottomTop = 0;
+    int bottomAreaHeight = 0;
+
+    int id_btnLoad1 = -1, id_btnSave1 = -1, id_btnLoad2 = -1, id_btnSave2 = -1, id_btnLoad3 = -1, id_btnSave3 = -1;
+    int id_txButton = -1;
+    int id_parrotBtn = -1;
+    int id_btnConnect = -1;
+    int id_cmdEdit = -1;
+    int id_sendBtn = -1;
+    int id_btnClearLog = -1;
+    int id_btnSaveLog = -1;
+
+    bool fullscreen = false;
+
+    auto RebuildUI = [&](int newW, int newH) {
+        if (newW < 460) newW = 460;
+        if (newH < 700) newH = 700;
+
+        SDL_SetWindowSize(window, newW, newH);
+        SDL_GetWindowSize(window, &w, &h);
+
+        g_comboOpen = false;
+        g_comboWidget = -1;
+        g_comboHoverItem = -1;
+        g_focusWidget = -1;
+        g_activeSlider = -1;
+        g_mouseDown = false;
+
+        id_btnLoad1 = id_btnSave1 = id_btnLoad2 = id_btnSave2 = id_btnLoad3 = id_btnSave3 = -1;
+        id_txButton = id_parrotBtn = id_btnConnect = id_cmdEdit = id_sendBtn = -1;
+        id_btnClearLog = id_btnSaveLog = -1;
+
     g_widgets.clear();
 
-	const int tabW = 90;
-	const int tabH = 28;
-	const int space  = 10;
-	const int tabCount = 4;
+	const int tabH     = 28;
+	const int tabY     = 10;
+	const int tabCount = 5;
+	int space          = 8;
+	int sidePad        = 10;
+
+	int availW = w - 2 * sidePad - (tabCount - 1) * space;
+	int tabW   = availW / tabCount;
+
+	if (tabW < 60) { tabW = 60; space = 6; sidePad = 6; }
+
 	int totalTabsW = tabCount * tabW + (tabCount - 1) * space;
 	int startX = (w - totalTabsW) / 2;
-	int tabY = 10;
 
-	SDL_Rect rcTabBar = { 0, 0, w, 44 };
-	SDL_Rect rcTabMain  = { startX + (tabW + space) * 0, tabY, tabW, tabH };
-	SDL_Rect rcTabAudio = { startX + (tabW + space) * 1, tabY, tabW, tabH };
-	SDL_Rect rcTabGpio  = { startX + (tabW + space) * 2, tabY, tabW, tabH };
-	SDL_Rect rcTabLog   = { startX + (tabW + space) * 3, tabY, tabW, tabH };
+	rcTabBar = makeRect(0, 0, w, 44);
+	rcTabMain = makeRect(startX + (tabW + space) * 0, tabY, tabW, tabH);
+	rcTabAudio = makeRect(startX + (tabW + space) * 1, tabY, tabW, tabH);
+	rcTabGpio = makeRect(startX + (tabW + space) * 2, tabY, tabW, tabH);
+	rcTabSquelch = makeRect(startX + (tabW + space) * 3, tabY, tabW, tabH);
+	rcTabLog = makeRect(startX + (tabW + space) * 4, tabY, tabW, tabH);
 
-    int contentTop = rcTabBar.y + rcTabBar.h + 6;
-	int id_btnLoad1, id_btnSave1, id_btnLoad2, id_btnSave2;
-
+    contentTop = rcTabBar.y + rcTabBar.h + 6;
     {
         int xLabel = 16;
         int xCtrl  = 130;
@@ -1216,10 +1527,8 @@ int main(int argc, char** argv) {
 		int xCtrl  = 150;
 		int y = contentTop + 10;
 
-#ifdef OPUS
         AddLabel(1, xLabel, y, "Audio Codec");
         AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_codec_text, &ui_codec_index, &g_codecItems); y += 34;
-#endif
 
 		AddLabel(1, xLabel, y, "Sample Rate");
 		AddEdit(1, xCtrl, y - 2, w - xCtrl - 20, &ui_sample_rate); y += 34;
@@ -1278,8 +1587,41 @@ int main(int argc, char** argv) {
 		AddLabel(2, xLabel, y, "PTT cmd OFF");
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_cmd_off); y += 34;
 
+		AddCheck(2, xLabel, y, "RX Squelch", &ui_rx_squelch_en);;
+		AddCheck(2, xCtrl, y, "Auto", &ui_rx_squelch_auto); y += 30;
+
+		AddLabel(2, xLabel, y, "Level");
+		AddSlider(2, xCtrl, y, 290, &ui_rx_squelch_level, 0, 100, ""); y += 34;
+
+		AddLabel(2, xLabel, y, "Discriminator");
+		AddSlider(2, xCtrl, y, 290, &ui_rx_squelch_voice, 0, 100, ""); y += 34;
+
+		AddLabel(2, xLabel, y, "Hang (ms)");
+		AddSlider(2, xCtrl, y, 290, &ui_rx_squelch_hang, 0, 2000, ""); y += 44;
+
 		id_btnLoad2 = AddButton(2, w - 190, y + 8, 80, 30, "Load");
 		id_btnSave2 = AddButton(2, w - 100, y + 8, 80, 30, "Save");
+	}
+
+	{
+		int xLabel = 16;
+		int xCtrl  = 150;
+		int y = contentTop + 10;
+
+		AddCheck(3, xLabel, y, "RX Squelch", &ui_rx_squelch_en);;
+		AddCheck(3, xCtrl, y, "Auto", &ui_rx_squelch_auto); y += 30;
+
+		AddLabel(3, xLabel, y, "Level");
+		AddSlider(3, xCtrl, y, 290, &ui_rx_squelch_level, 0, 100, ""); y += 34;
+
+		AddLabel(3, xLabel, y, "Discriminator");
+		AddSlider(3, xCtrl, y, 290, &ui_rx_squelch_voice, 0, 100, ""); y += 34;
+
+		AddLabel(3, xLabel, y, "Hang (ms)");
+		AddSlider(3, xCtrl, y, 290, &ui_rx_squelch_hang, 0, 2000, ""); y += 44;
+
+		id_btnLoad3 = AddButton(3, w - 190, y + 8, 80, 30, "Load");
+		id_btnSave3 = AddButton(3, w - 100, y + 8, 80, 30, "Save");
 	}
 
 	const int gap           = 16;
@@ -1292,32 +1634,40 @@ int main(int argc, char** argv) {
 	int row2Y = cmdY - gap - rowHeight;
 	int txBtnY = row2Y - gap - txHeight;
 
-	int bottomTop = txBtnY;
-	int bottomAreaHeight = h - bottomTop;
+	bottomTop = txBtnY;
+	bottomAreaHeight = h - bottomTop;
 
 	SDL_Rect rcTxBtnRect = { 16, txBtnY, w - 32, txHeight };
-	int id_txButton = AddButton(-1, rcTxBtnRect.x, rcTxBtnRect.y + 4,
+	id_txButton = AddButton(-1, rcTxBtnRect.x, rcTxBtnRect.y + 4,
 								rcTxBtnRect.w, rcTxBtnRect.h, "TALK");
 
-	int id_parrotBtn = AddButton(-1, 16,  row2Y, 200, 30, "Parrot");
-	int id_btnConnect = AddButton(-1, w - 216, row2Y, 200, 30, "Connect");
+	id_parrotBtn = AddButton(-1, 16,  row2Y, 200, 30, "Parrot");
+	id_btnConnect = AddButton(-1, w - 216, row2Y, 200, 30, "Connect");
 
 	int cmdX         = 16;
 	int sendWidth    = 72;
 	int cmdW = w - cmdX - sendWidth - 24;
 
-	int id_cmdEdit = AddEdit(-1, cmdX, cmdY, cmdW, &ui_cmd);
-	int id_sendBtn = AddButton(-1, w - sendWidth - 16, cmdY, sendWidth, cmdHeight, "Send");
+	id_cmdEdit = AddEdit(-1, cmdX, cmdY, cmdW, &ui_cmd);
+	id_sendBtn = AddButton(-1, w - sendWidth - 16, cmdY, sendWidth, cmdHeight, "Send");
 
 	int logTop    = contentTop + 6;
 	int logBottom = bottomTop - 10;
 	int logHeight = logBottom - logTop;
-	SDL_Rect rcLogCard = { 10, logTop, w - 20, logHeight };
-	SDL_Rect rcLogInner = { rcLogCard.x + 8, rcLogCard.y + 24,
-						 rcLogCard.w - 16, rcLogCard.h - 72 };
+	rcLogCard = makeRect(10, logTop, w - 20, logHeight);
+	rcLogInner = makeRect(rcLogCard.x + 8, rcLogCard.y + 24, rcLogCard.w - 16, rcLogCard.h - 72);
 
-	int id_btnClearLog = AddButton(3, 20, rcLogCard.h + 16, 80, 30, "Clear Log");
-	int id_btnSaveLog = AddButton(3, w - 100, rcLogCard.h + 16, 80, 30, "Save Log");
+	id_btnClearLog = AddButton(4, 20, rcLogCard.h + 16, 80, 30, "Clear Log");
+	id_btnSaveLog = AddButton(4, w - 100, rcLogCard.h + 16, 80, 30, "Save Log");
+
+
+
+#ifdef MOBILE
+        if (g_kbVisible) BuildOnScreenKeyboard(w, h);
+#endif
+    };
+
+    RebuildUI(w, h);
 
     bool running = true;
     SDL_StartTextInput();
@@ -1327,7 +1677,12 @@ int main(int argc, char** argv) {
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_QUIT) {
                 running = false;
-			} else if (ev.type == SDL_MOUSEMOTION) {
+			} else if (ev.type == SDL_WINDOWEVENT) {
+                if (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+                    ev.window.event == SDL_WINDOWEVENT_RESIZED) {
+                    RebuildUI(ev.window.data1, ev.window.data2);
+                }
+            } else if (ev.type == SDL_MOUSEMOTION) {
 				int mx = ev.motion.x;
 				int my = ev.motion.y;
 				SDL_Point pt = { mx, my };
@@ -1365,6 +1720,14 @@ int main(int argc, char** argv) {
 				int my = ev.button.y;
 				SDL_Point pt = { mx, my };
 
+#ifdef MOBILE
+				if (g_kbVisible) {
+					if (HandleOnScreenKeyboardClick(mx, my)) {
+						continue;
+					}
+				}
+#endif
+
 				if (SDL_PointInRect(&pt, &rcTabMain)) {
 					g_activeTab = 0; g_focusWidget = -1; g_comboOpen = false;
 					continue;
@@ -1374,8 +1737,11 @@ int main(int argc, char** argv) {
 				} else if (SDL_PointInRect(&pt, &rcTabGpio)) {
 					g_activeTab = 2; g_focusWidget = -1; g_comboOpen = false;
 					continue;
-				} else if (SDL_PointInRect(&pt, &rcTabLog)) {
+				} else if (SDL_PointInRect(&pt, &rcTabSquelch)) {
 					g_activeTab = 3; g_focusWidget = -1; g_comboOpen = false;
+					continue;
+				} else if (SDL_PointInRect(&pt, &rcTabLog)) {
+					g_activeTab = 4; g_focusWidget = -1; g_comboOpen = false;
 					continue;
 				}
 
@@ -1434,7 +1800,7 @@ int main(int argc, char** argv) {
 						continue;
 					}
 
-					bool hit = SDL_PointInRect(&pt, &wdg.rect);
+					bool hit = (SDL_PointInRect(&pt, &wdg.rect) != SDL_FALSE);
 					if (!hit) {
 						wdg.focused = false;
 						continue;
@@ -1443,6 +1809,12 @@ int main(int argc, char** argv) {
 					if (wdg.type == W_EDIT) {
 						wdg.focused = true;
 						g_focusWidget = i;
+
+#ifdef MOBILE
+						g_kbVisible = true;
+						g_kbTargetEdit = i;
+						BuildOnScreenKeyboard(w, h);
+#endif
 
 						if (wdg.boundText) {
 							std::string& s = *wdg.boundText;
@@ -1526,7 +1898,7 @@ int main(int argc, char** argv) {
 								GuiStopCore();
 								wdg.label = "Connect";
 							}
-						} else if (i == id_btnLoad1 || i == id_btnLoad2) {
+						} else if (i == id_btnLoad1 || i == id_btnLoad2 || i == id_btnLoad3) {
 							ClientConfig tmp;
 							if (!loadClientConfig(g_cfgPath, tmp)) {
 								GuiAppendLog("[ERROR] Failed to load config from: " + g_cfgPath);
@@ -1535,7 +1907,7 @@ int main(int argc, char** argv) {
 								CfgToUi();
 								GuiAppendLog("Loaded config from: " + g_cfgPath);
 							}
-						} else if (i == id_btnSave1 || i == id_btnSave2) {
+						} else if (i == id_btnSave1 || i == id_btnSave2 || i == id_btnSave3) {
 							UiToCfg();
 							if (!saveClientConfigFile(g_cfgPath, g_cfg)) {
 								GuiAppendLog("[ERROR] Failed to save config to: " + g_cfgPath);
@@ -1566,6 +1938,24 @@ int main(int argc, char** argv) {
 						g_activeSlider = i;
 					}
 				}
+
+#ifdef MOBILE
+				if (g_kbVisible) {
+					bool clickedFocusedEdit = false;
+					if (g_focusWidget >= 0 && g_focusWidget < (int)g_widgets.size()) {
+						Widget& fw = g_widgets[g_focusWidget];
+						if (fw.type == W_EDIT && SDL_PointInRect(&pt, &fw.rect)) {
+							clickedFocusedEdit = true;
+						}
+					}
+					if (!clickedFocusedEdit) {
+						g_kbVisible = false;
+						g_kbShift = false;
+						g_kbSymbols = false;
+						g_kbTargetEdit = -1;
+					}
+				}
+#endif
 			} else if (ev.type == SDL_MOUSEBUTTONUP && ev.button.button == SDL_BUTTON_LEFT) {
 				g_mouseDown = false;
 				g_activeSlider = -1;
@@ -1596,7 +1986,13 @@ int main(int argc, char** argv) {
 
                 if (key == SDLK_ESCAPE) {
                     running = false;
-				} else if (key == SDLK_BACKSPACE) {
+				} else if (key == SDLK_F11 || (key == SDLK_RETURN && (ev.key.keysym.mod & KMOD_ALT))) {
+                    fullscreen = !fullscreen;
+                    SDL_SetWindowFullscreen(window, fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                    int nw, nh;
+                    SDL_GetWindowSize(window, &nw, &nh);
+                    RebuildUI(nw, nh);
+                } else if (key == SDLK_BACKSPACE) {
 					if (g_focusWidget >= 0 &&
 						g_focusWidget < (int)g_widgets.size()) {
 						Widget& wdg = g_widgets[g_focusWidget];
@@ -1698,6 +2094,19 @@ int main(int argc, char** argv) {
         g_inputGain  = ui_in_gain  / 100.0f;
         g_outputGain = ui_out_gain / 100.0f;
 
+	if (ui_rx_squelch_level < 0) ui_rx_squelch_level = 0;
+	if (ui_rx_squelch_level > 100) ui_rx_squelch_level = 100;
+	if (ui_rx_squelch_voice < 0) ui_rx_squelch_voice = 0;
+	if (ui_rx_squelch_voice > 100) ui_rx_squelch_voice = 100;
+	if (ui_rx_squelch_hang < 0) ui_rx_squelch_hang = 0;
+	if (ui_rx_squelch_hang > 5000) ui_rx_squelch_hang = 5000;
+
+	g_rxSquelchEnabled  = ui_rx_squelch_en;
+	g_rxSquelchAuto     = ui_rx_squelch_auto;
+	g_rxSquelchLevel    = ui_rx_squelch_level;
+	g_rxSquelchVoicePct = ui_rx_squelch_voice;
+	g_rxSquelchHangMs   = ui_rx_squelch_hang;
+
 		if (id_txButton >= 0 && id_txButton < (int)g_widgets.size()) {
 			bool enabled = g_connected && !g_isTalking.load();
 			g_widgets[id_txButton].enabled = enabled;
@@ -1721,18 +2130,19 @@ int main(int argc, char** argv) {
             DrawRectBorder(renderer, rc, frame, 2);
             DrawTextCentered(renderer, font, label, rc, txt);
         };
-		drawTab(rcTabMain,  "Main",  0);
-		drawTab(rcTabAudio, "Audio", 1);
-		drawTab(rcTabGpio,  "GPIO",  2);
-		drawTab(rcTabLog,   "Log",   3);
+		drawTab(rcTabMain,    "Main",    0);
+		drawTab(rcTabAudio,   "Audio",   1);
+		drawTab(rcTabGpio,    "GPIO",    2);
+		drawTab(rcTabSquelch, "Squelch", 3);
+		drawTab(rcTabLog,     "Log",     4);
 
-        if (g_activeTab == 0 || g_activeTab == 1 || g_activeTab == 2) {
+        if (g_activeTab == 0 || g_activeTab == 1 || g_activeTab == 2 || g_activeTab == 3) {
             SDL_Rect rcContent = { 10, contentTop, w - 20, (h - bottomAreaHeight) - contentTop - 6 };
             DrawRect(renderer, rcContent, COL_PANEL);
             DrawRectBorder(renderer, rcContent, COL_PANEL_BD, 1);
         }
 
-        if (g_activeTab == 3) {
+        if (g_activeTab == 4) {
             DrawRect(renderer, rcLogCard, COL_PANEL);
             DrawRectBorder(renderer, rcLogCard, COL_PANEL_BD, 1);
             DrawText(renderer, font, "Console log", rcLogCard.x + 8, rcLogCard.y + 6, COL_TEXT);
@@ -1766,6 +2176,9 @@ int main(int argc, char** argv) {
         }
 
         RenderWidgets(renderer, font);
+#ifdef MOBILE
+		DrawOnScreenKeyboard(renderer, font, w, h);
+#endif
 
 		if (g_activeTab == 0) {
 			int statusY = contentTop + 10 + 34 * 6 + 6;

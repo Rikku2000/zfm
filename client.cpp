@@ -41,6 +41,12 @@ extern "C" {
 static std::atomic<float> g_audioLevel(0.0f);
 
 std::atomic<float> g_rxAudioLevel(0.0f);
+
+std::atomic<bool> g_rxSquelchEnabled(false);
+std::atomic<bool> g_rxSquelchAuto(true);
+std::atomic<int>  g_rxSquelchLevel(55);
+std::atomic<int>  g_rxSquelchVoicePct(55);
+std::atomic<int>  g_rxSquelchHangMs(450);
 std::atomic<bool>  g_talkerActive(false);
 std::chrono::steady_clock::time_point g_talkerStart;
 #endif
@@ -356,9 +362,18 @@ struct ClientConfig {
 
 	int roger_sound;
 
-#ifdef OPUS
 	bool use_opus;
-#endif
+
+	bool use_adpcm;
+	bool adpcm_adaptive;
+	int  adpcm_jitter_frames;
+	int  adpcm_plc_ms;
+
+	bool rx_squelch_enabled;
+	bool rx_squelch_auto;
+	int  rx_squelch_level;
+	int  rx_squelch_voice_pct;
+	int  rx_squelch_hang_ms;
 };
 
 bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
@@ -391,9 +406,18 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
 
 	cfg.roger_sound = 1;
 
-#ifdef OPUS
 	cfg.use_opus = false;
-#endif
+
+	cfg.use_adpcm = false;
+	cfg.adpcm_adaptive = true;
+	cfg.adpcm_jitter_frames = 3;
+	cfg.adpcm_plc_ms = 120;
+
+	cfg.rx_squelch_enabled = false;
+	cfg.rx_squelch_auto    = true;
+	cfg.rx_squelch_level   = 55;
+	cfg.rx_squelch_voice_pct = 55;
+	cfg.rx_squelch_hang_ms = 450;
 
     std::ifstream f(path.c_str());
     if (!f.is_open()) {
@@ -436,18 +460,29 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
         else if (parseIntField(l, "input_gain", ival))    cfg.input_gain  = ival;
         else if (parseIntField(l, "output_gain", ival))   cfg.output_gain = ival;
 		else if (parseIntField(l, "roger_sound", ival)) cfg.roger_sound = ival;
-#ifdef OPUS
 		else if (parseBoolField(l, "use_opus", bval)) cfg.use_opus = bval;
-#endif
+		else if (parseBoolField(l, "use_adpcm", bval)) cfg.use_adpcm = bval;
+		else if (parseBoolField(l, "adpcm_adaptive", bval)) cfg.adpcm_adaptive = bval;
+		else if (parseIntField(l, "adpcm_jitter_frames", ival)) cfg.adpcm_jitter_frames = ival;
+		else if (parseIntField(l, "adpcm_plc_ms", ival)) cfg.adpcm_plc_ms = ival;
+		else if (parseBoolField(l, "rx_squelch_enabled", bval)) cfg.rx_squelch_enabled = bval;
+		else if (parseBoolField(l, "rx_squelch_auto", bval)) cfg.rx_squelch_auto = bval;
+		else if (parseIntField(l,  "rx_squelch_level", ival)) cfg.rx_squelch_level = ival;
+		else if (parseIntField(l,  "rx_squelch_voice_pct", ival)) cfg.rx_squelch_voice_pct = ival;
+		else if (parseIntField(l,  "rx_squelch_hang_ms", ival)) cfg.rx_squelch_hang_ms = ival;
     }
 
-#ifdef OPUS
 	if (cfg.use_opus) {
 		cfg.sample_rate       = 48000;
 		cfg.frames_per_buffer = 480;
 		cfg.channels          = 1;
 	}
-#endif
+
+	if (cfg.use_adpcm) {
+		cfg.sample_rate       = 22050;
+		cfg.frames_per_buffer = 220;
+		cfg.channels          = 1;
+	}
 
     return true;
 }
@@ -481,10 +516,17 @@ static bool saveClientConfigFile(const std::string& path, const ClientConfig& cf
     f << "  \"output_gain\": " << cfg.output_gain << ",\n";
 	f << "  \"roger_sound\": " << cfg.roger_sound << ",\n";
     f << "  \"ptt_cmd_on\": \""  << cfg.ptt_cmd_on  << "\",\n";
-    f << "  \"ptt_cmd_off\": \"" << cfg.ptt_cmd_off << "\"\n";
-#ifdef OPUS
-    f << "  \"use_opus\": " << (cfg.use_opus ? "true" : "false") << "\n";
-#endif
+	f << "  \"ptt_cmd_off\": \"" << cfg.ptt_cmd_off << "\",\n";
+	f << "  \"rx_squelch_enabled\": " << (cfg.rx_squelch_enabled ? "true" : "false") << ",\n";
+	f << "  \"rx_squelch_auto\": " << (cfg.rx_squelch_auto ? "true" : "false") << ",\n";
+	f << "  \"rx_squelch_level\": " << cfg.rx_squelch_level << ",\n";
+	f << "  \"rx_squelch_voice_pct\": " << cfg.rx_squelch_voice_pct << ",\n";
+	f << "  \"rx_squelch_hang_ms\": " << cfg.rx_squelch_hang_ms << ",\n";
+	f << "  \"use_opus\": " << (cfg.use_opus ? "true" : "false") << ",\n";
+	f << "  \"use_adpcm\": " << (cfg.use_adpcm ? "true" : "false") << ",\n";
+	f << "  \"adpcm_adaptive\": " << (cfg.adpcm_adaptive ? "true" : "false") << ",\n";
+	f << "  \"adpcm_jitter_frames\": " << cfg.adpcm_jitter_frames << ",\n";
+	f << "  \"adpcm_plc_ms\": " << cfg.adpcm_plc_ms << "\n";
     f << "}\n";
 
     return true;
@@ -509,7 +551,6 @@ extern ClientConfig g_cfg;
 extern std::atomic<float> g_inputGain;
 extern std::atomic<float> g_outputGain;
 
-#ifdef OPUS
 #ifdef _WIN32
 #include <opus.h>
 #else
@@ -652,7 +693,7 @@ static void shutdownOpus()
     unloadOpusDll();
 }
 
-static std::vector<char> encodeOpusFrame(const std::vector<char>& pcmBytes)
+std::vector<char> encodeOpusFrame(const std::vector<char>& pcmBytes)
 {
 	if (!g_cfg.use_opus || !g_opusEnc || !p_opus_encode) {
 		std::cerr << "encodeOpusFrame: Opus not initialized, cannot encode.\n";
@@ -726,7 +767,6 @@ static std::vector<char> decodeOpusFrame(const std::vector<char>& pktBytes)
 
     return out;
 }
-#endif
 
 static void ParseCm108Command(const std::string& cmd, std::string& hiddev, int& pinOut)
 {
@@ -1173,6 +1213,12 @@ bool initPortAudio(const ClientConfig& cfg) {
     g_sampleRate      = cfg.sample_rate;
     g_framesPerBuffer = cfg.frames_per_buffer;
 
+	g_rxSquelchEnabled  = cfg.rx_squelch_enabled;
+	g_rxSquelchAuto     = cfg.rx_squelch_auto;
+	g_rxSquelchLevel    = cfg.rx_squelch_level;
+	g_rxSquelchVoicePct = cfg.rx_squelch_voice_pct;
+	g_rxSquelchHangMs   = cfg.rx_squelch_hang_ms;
+
     int devCount = Pa_GetDeviceCount();
     if (devCount < 0) {
         LOG_ERROR("No input device with channels > 0 found.\n");
@@ -1367,6 +1413,59 @@ std::vector<char> captureAudioFrame() {
     return bytes;
 }
 
+struct RxVoiceMetrics {
+    float rms;
+    float voiceRatio;
+    RxVoiceMetrics() : rms(0.0f), voiceRatio(0.0f) {}
+};
+
+static RxVoiceMetrics analyzeRxVoice(const int16_t* samples, size_t sampleCount, int channels, int sampleRate) {
+	RxVoiceMetrics m;
+	if (!samples || sampleCount == 0 || channels <= 0 || sampleRate <= 0) return m;
+
+	static float hp_y = 0.0f;
+	static float hp_x1 = 0.0f;
+	static float lp_y = 0.0f;
+
+	float dt = 1.0f / (float)sampleRate;
+	float rc_hp = 1.0f / (2.0f * 3.14159265f * 300.0f);
+	float a = rc_hp / (rc_hp + dt);
+	float rc_lp = 1.0f / (2.0f * 3.14159265f * 3000.0f);
+	float b = rc_lp / (rc_lp + dt);
+
+	double sumSq = 0.0;
+	double sumBandSq = 0.0;
+	size_t frames = sampleCount / (size_t)channels;
+
+	for (size_t f = 0; f < frames; ++f) {
+		double acc = 0.0;
+		for (int c = 0; c < channels; ++c) {
+			acc += samples[f * (size_t)channels + (size_t)c] / 32768.0;
+		}
+		float x = (float)(acc / (double)channels);
+		sumSq += (double)x * (double)x;
+
+		float hp = a * (hp_y + x - hp_x1);
+		hp_y = hp;
+		hp_x1 = x;
+		float lp = b * lp_y + (1.0f - b) * hp;
+		lp_y = lp;
+
+		sumBandSq += (double)lp * (double)lp;
+	}
+
+	if (frames > 0) {
+		m.rms = (float)std::sqrt(sumSq / (double)frames);
+		double totalE = sumSq / (double)frames;
+		double bandE  = sumBandSq / (double)frames;
+		m.voiceRatio = (totalE > 1e-12) ? (float)(bandE / totalE) : 0.0f;
+		if (m.voiceRatio < 0.0f) m.voiceRatio = 0.0f;
+		if (m.voiceRatio > 1.0f) m.voiceRatio = 1.0f;
+	}
+
+	return m;
+}
+
 void playAudioFrame(const std::vector<char>& frame) {
     if (frame.empty()) return;
     size_t sampleCount = frame.size() / sizeof(int16_t);
@@ -1393,7 +1492,61 @@ void playAudioFrame(const std::vector<char>& frame) {
         applySoftLimiter(outSamples, 0.95f);
     }
 
-    PaError err = Pa_WriteStream(g_outputStream, outSamples.data(), frames);
+	static bool gateOpen = true;
+	static std::chrono::steady_clock::time_point lastVoice = std::chrono::steady_clock::now();
+	static std::chrono::steady_clock::time_point lastAudio = std::chrono::steady_clock::now();
+	static float noiseFloor = 0.015f;
+
+	const bool sqEnabled = g_rxSquelchEnabled.load();
+	const bool sqAuto    = g_rxSquelchAuto.load();
+	int sqLevel          = g_rxSquelchLevel.load();
+	int sqVoicePct       = g_rxSquelchVoicePct.load();
+	int sqHangMs         = g_rxSquelchHangMs.load();
+	if (sqLevel < 0) sqLevel = 0; if (sqLevel > 100) sqLevel = 100;
+	if (sqVoicePct < 0) sqVoicePct = 0; if (sqVoicePct > 100) sqVoicePct = 100;
+	if (sqHangMs < 0) sqHangMs = 0; if (sqHangMs > 5000) sqHangMs = 5000;
+
+	RxVoiceMetrics met = analyzeRxVoice(outSamples.data(), sampleCount, g_channels, g_sampleRate);
+
+	float t = (float)sqLevel / 100.0f;
+	float thrStatic = 0.08f + (0.01f - 0.08f) * t;
+	float voiceThr  = (float)sqVoicePct / 100.0f;
+
+	float thr = thrStatic;
+	if (sqAuto) {
+		bool looksVoice = (met.voiceRatio >= voiceThr);
+		if (!gateOpen && !looksVoice) {
+			noiseFloor = noiseFloor * 0.995f + met.rms * 0.005f;
+			if (noiseFloor < 0.004f) noiseFloor = 0.004f;
+			if (noiseFloor > 0.30f)  noiseFloor = 0.30f;
+		}
+		thr = std::max(0.008f, noiseFloor * 2.8f);
+		thr *= (1.4f - 0.7f * t);
+	}
+
+	bool isVoiceNow = (met.rms >= thr) && (met.voiceRatio >= voiceThr);
+	auto now = std::chrono::steady_clock::now();
+	if (isVoiceNow) {
+		lastVoice = now;
+		lastAudio = now;
+		gateOpen = true;
+	}
+
+	if (sqEnabled) {
+		long long sinceVoiceMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastVoice).count();
+		if (sinceVoiceMs > (long long)sqHangMs) {
+			gateOpen = false;
+		}
+		if (!gateOpen) {
+			std::fill(outSamples.begin(), outSamples.end(), 0);
+		}
+	}
+
+	if (!sqEnabled || gateOpen) {
+		g_lastRxAudioTime = std::chrono::steady_clock::now();
+	}
+
+	PaError err = Pa_WriteStream(g_outputStream, outSamples.data(), frames);
 
     static int underflowWarnCount = 0;
 
@@ -1452,6 +1605,329 @@ static const int VOX_SPEAK_GRANT_TIMEOUT_MS = 50;
 static const int VOX_CALIB_FRAMES        = 40;
 static const int VOX_MIN_THRESHOLD_PEAK  = 1000;
 static const int VOX_MAX_THRESHOLD_PEAK  = 25000;
+
+#include <map>
+#include <deque>
+
+std::vector<char> captureAudioFrame();
+void playAudioFrame(const std::vector<char>& pcm);
+std::vector<char> encodeOpusFrame(const std::vector<char>& pcm);
+
+static std::mutex g_adpcmJbMutex;
+static std::atomic<bool> g_adpcmPlayoutRun(false);
+static std::thread g_adpcmPlayoutThread;
+
+static inline int clamp16i(int v) {
+    if (v > 32767) return 32767;
+    if (v < -32768) return -32768;
+    return v;
+}
+
+static const int g_imaIndexTable[16] = {
+    -1,-1,-1,-1, 2,4,6,8,
+    -1,-1,-1,-1, 2,4,6,8
+};
+static const int g_imaStepTable[89] = {
+     7,8,9,10,11,12,13,14,16,17,
+     19,21,23,25,28,31,34,37,41,45,
+     50,55,60,66,73,80,88,97,107,118,
+     130,143,157,173,190,209,230,253,279,307,
+     337,371,408,449,494,544,598,658,724,796,
+     876,963,1060,1166,1282,1411,1552,1707,1878,2066,
+     2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,
+     5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,
+     15289,16818,18500,20350,22385,24623,27086,29794,32767
+};
+
+static inline int clamp16(int v) {
+    return (v > 32767) ? 32767 : (v < -32768 ? -32768 : v);
+}
+
+
+
+static std::vector<char> imaAdpcmEncode(const int16_t* pcm, size_t n)
+{
+    std::vector<char> out;
+    if (!pcm || n < 1) return out;
+
+    int pred = pcm[0];
+    int idx  = 0;
+
+    out.resize(4);
+    out[0] = (char)(pred & 0xFF);
+    out[1] = (char)((pred >> 8) & 0xFF);
+    out[2] = (char)(idx & 0xFF);
+    out[3] = 0;
+
+    int step = g_imaStepTable[idx];
+    unsigned char curByte = 0;
+    bool highNibble = false;
+
+    for (size_t i = 1; i < n; ++i) {
+        int diff = (int)pcm[i] - pred;
+        int sign = (diff < 0) ? 8 : 0;
+        if (diff < 0) diff = -diff;
+
+        int delta = 0;
+        int vpdiff = step >> 3;
+
+        if (diff >= step) { delta |= 4; diff -= step; vpdiff += step; }
+        if (diff >= (step >> 1)) { delta |= 2; diff -= (step >> 1); vpdiff += (step >> 1); }
+        if (diff >= (step >> 2)) { delta |= 1; vpdiff += (step >> 2); }
+
+        if (sign) pred -= vpdiff; else pred += vpdiff;
+        pred = clamp16i(pred);
+
+        delta |= sign;
+
+        idx += g_imaIndexTable[delta & 0x0F];
+        if (idx < 0) idx = 0;
+        if (idx > 88) idx = 88;
+        step = g_imaStepTable[idx];
+
+        unsigned char nib = (unsigned char)(delta & 0x0F);
+        if (!highNibble) {
+            curByte = nib;
+            highNibble = true;
+        } else {
+            curByte |= (unsigned char)(nib << 4);
+            out.push_back((char)curByte);
+            highNibble = false;
+        }
+    }
+
+    if (highNibble) {
+        out.push_back((char)curByte);
+    }
+
+    out[2] = (char)(idx & 0xFF);
+    return out;
+}
+
+static std::vector<int16_t> imaAdpcmDecode(const char* data, size_t len, size_t outSamples)
+{
+    std::vector<int16_t> pcm;
+    if (!data || len < 4 || outSamples < 1) return pcm;
+
+    int pred = (int)(int16_t)((unsigned char)data[0] | ((unsigned char)data[1] << 8));
+    int idx  = (int)(unsigned char)data[2];
+    if (idx < 0) idx = 0;
+    if (idx > 88) idx = 88;
+
+    int step = g_imaStepTable[idx];
+    pcm.resize(outSamples);
+    pcm[0] = (int16_t)pred;
+
+    size_t si = 1;
+    for (size_t bi = 4; bi < len && si < outSamples; ++bi) {
+        unsigned char b = (unsigned char)data[bi];
+        for (int half = 0; half < 2 && si < outSamples; ++half) {
+            int delta = (half == 0) ? (b & 0x0F) : ((b >> 4) & 0x0F);
+            idx += g_imaIndexTable[delta];
+            if (idx < 0) idx = 0;
+            if (idx > 88) idx = 88;
+
+            int sign = delta & 8;
+            int mag  = delta & 7;
+
+            int vpdiff = step >> 3;
+            if (mag & 4) vpdiff += step;
+            if (mag & 2) vpdiff += (step >> 1);
+            if (mag & 1) vpdiff += (step >> 2);
+
+            if (sign) pred -= vpdiff; else pred += vpdiff;
+            pred = clamp16i(pred);
+
+            step = g_imaStepTable[idx];
+            pcm[si++] = (int16_t)pred;
+        }
+    }
+
+    for (; si < outSamples; ++si) {
+        pcm[si] = pcm[si ? (si - 1) : 0];
+    }
+    return pcm;
+}
+
+static std::vector<int16_t> downsample2x(const int16_t* in, size_t n)
+{
+    std::vector<int16_t> out;
+    if (!in || n < 2) return out;
+    out.reserve(n / 2);
+    for (size_t i = 0; i + 1 < n; i += 2) out.push_back(in[i]);
+    return out;
+}
+
+static std::vector<int16_t> upsample2x_dup(const int16_t* in, size_t n)
+{
+    std::vector<int16_t> out;
+    if (!in || n < 1) return out;
+    out.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(in[i]);
+        out.push_back(in[i]);
+    }
+    return out;
+}
+
+struct AdpcmRxFrame {
+    std::string from;
+    uint32_t    seq;
+    uint16_t    rate;
+    std::vector<char> payload;
+};
+
+static std::mutex g_adpcmJitMutex;
+static std::map<uint32_t, AdpcmRxFrame> g_adpcmReorder;
+static std::atomic<uint32_t> g_adpcmExpectedSeq(0);
+static std::vector<int16_t> g_adpcmLastGood;
+static std::chrono::steady_clock::time_point g_adpcmLastRx = std::chrono::steady_clock::now();
+
+static inline std::vector<int16_t> plcFromLast(size_t n)
+{
+    std::vector<int16_t> out(n, 0);
+    if (g_adpcmLastGood.empty()) return out;
+
+    for (size_t i = 0; i < n; ++i) {
+        int16_t s = g_adpcmLastGood[i < g_adpcmLastGood.size() ? i : (g_adpcmLastGood.size() - 1)];
+        int v = (int)s;
+        v = (v * 7) / 8;
+        out[i] = (int16_t)v;
+    }
+    return out;
+}
+
+static void ensureAdpcmPlayoutThread()
+{
+    if (g_adpcmPlayoutRun.load()) return;
+
+    g_adpcmPlayoutRun = true;
+    g_adpcmPlayoutThread = std::thread([]() {
+        const int baseRate = 22050;
+        const int frameSamples = 220;
+        const auto tick = std::chrono::milliseconds(10);
+
+        while (g_running && g_adpcmPlayoutRun.load()) {
+            auto t0 = std::chrono::steady_clock::now();
+
+            AdpcmRxFrame fr;
+            bool have = false;
+
+            {
+                std::lock_guard<std::mutex> lock(g_adpcmJitMutex);
+                uint32_t want = g_adpcmExpectedSeq.load();
+
+                auto it = g_adpcmReorder.find(want);
+                if (it != g_adpcmReorder.end()) {
+                    fr = std::move(it->second);
+                    g_adpcmReorder.erase(it);
+                    g_adpcmExpectedSeq = want + 1;
+                    have = true;
+                }
+            }
+
+            std::vector<int16_t> pcm;
+            if (have) {
+                size_t outS = (fr.rate == 11025) ? 110 : 220;
+                pcm = imaAdpcmDecode(fr.payload.data(), fr.payload.size(), outS);
+
+                if (fr.rate == 11025) {
+                    auto up = upsample2x_dup(pcm.data(), pcm.size());
+                    pcm.swap(up);
+                }
+
+                if (!pcm.empty()) {
+                    g_adpcmLastGood = pcm;
+                }
+            } else {
+                pcm = plcFromLast(frameSamples);
+            }
+
+            if (!pcm.empty()) {
+                std::vector<char> bytes(pcm.size() * sizeof(int16_t));
+                std::memcpy(bytes.data(), pcm.data(), bytes.size());
+                playAudioFrame(bytes);
+            }
+
+            auto t1 = std::chrono::steady_clock::now();
+            auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
+            if (dt < tick) std::this_thread::sleep_for(tick - dt);
+        }
+    });
+    g_adpcmPlayoutThread.detach();
+}
+
+static std::atomic<uint32_t> g_adpcmTxSeq(1);
+static std::atomic<uint16_t> g_adpcmTxRate(22050);
+
+static bool sendVoiceFrameToServer(SOCKET sock, const std::vector<char>& pcmBytes)
+{
+    if (pcmBytes.empty()) return true;
+
+    if (g_cfg.use_opus) {
+        std::vector<char> payload = encodeOpusFrame(pcmBytes);
+        std::string cmd = payload.empty() ? "AUDIO" : "AUDIO_OPUS";
+        if (payload.empty()) payload = pcmBytes;
+
+        std::ostringstream oss;
+        oss << cmd << " " << payload.size() << "\n";
+        std::string header = oss.str();
+        if (!sendAll(sock, header.data(), header.size())) return false;
+        if (!sendAll(sock, payload.data(), payload.size())) return false;
+        return true;
+    }
+
+    if (!g_cfg.use_adpcm) {
+        std::ostringstream oss;
+        oss << "AUDIO " << pcmBytes.size() << "\n";
+        std::string header = oss.str();
+        if (!sendAll(sock, header.data(), header.size())) return false;
+        if (!sendAll(sock, pcmBytes.data(), pcmBytes.size())) return false;
+        return true;
+    }
+
+    const uint32_t seq = g_adpcmTxSeq.fetch_add(1);
+    const int16_t* pcm = reinterpret_cast<const int16_t*>(pcmBytes.data());
+    size_t nSamp = pcmBytes.size() / sizeof(int16_t);
+
+    uint16_t rate = g_adpcmTxRate.load();
+    if (!g_cfg.adpcm_adaptive) rate = 22050;
+
+    std::vector<int16_t> work;
+    const int frameSamples22 = 220;
+    const int frameSamples11 = 110;
+
+    if (rate == 11025 && nSamp >= (size_t)frameSamples22) {
+        work = downsample2x(pcm, frameSamples22);
+    } else {
+        work.assign(pcm, pcm + std::min(nSamp, (size_t)frameSamples22));
+    }
+
+    if (rate == 11025) {
+        if (work.size() < (size_t)frameSamples11) work.resize(frameSamples11, work.empty() ? 0 : work.back());
+    } else {
+        if (work.size() < (size_t)frameSamples22) work.resize(frameSamples22, work.empty() ? 0 : work.back());
+    }
+
+    std::vector<char> enc = imaAdpcmEncode(work.data(), work.size());
+    if (enc.empty()) return true;
+
+    std::ostringstream oss;
+    oss << "AUDIO_ADPCM " << seq << " " << rate << " " << enc.size() << "\n";
+    std::string header = oss.str();
+
+    auto t0 = std::chrono::steady_clock::now();
+    if (!sendAll(sock, header.data(), header.size())) return false;
+    if (!sendAll(sock, enc.data(), enc.size())) return false;
+    auto t1 = std::chrono::steady_clock::now();
+
+    long long txMs = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    if (g_cfg.adpcm_adaptive) {
+        if (txMs > 18) g_adpcmTxRate = 11025;
+        else if (txMs < 8) g_adpcmTxRate = 22050;
+    }
+    return true;
+}
 
 static int frameMaxAbsSample(const std::vector<char>& frame)
 {
@@ -1617,53 +2093,11 @@ void voxAutoLoop(SOCKET sock) {
         }
 
         if (above) {
-#ifdef OPUS
-            std::ostringstream oss;
-			std::vector<char> frame = captureAudioFrame();
-			std::vector<char> payload;
-			std::string audioCmd;
-
-			if (g_cfg.use_opus) {
-				payload = encodeOpusFrame(frame);
-
-				if (payload.empty()) {
-					payload  = std::move(frame);
-					audioCmd = "AUDIO";
-				} else {
-					audioCmd = "AUDIO_OPUS";
-				}
-			} else {
-				payload = std::move(frame);
-				audioCmd = "AUDIO";
-			}
-
-			oss << audioCmd << " " << payload.size() << "\n";
-			std::string header = oss.str();
-
-			if (!sendAll(sock, header.data(), header.size())) {
-				std::cout << "Failed to send AUDIO header (ending talk session).\n";
-				break;
-			}
-			if (!sendAll(sock, payload.data(), payload.size())) {
-				std::cout << "Failed to send AUDIO data (ending talk session).\n";
-				break;
-			}
-#else
-            std::ostringstream oss;
-            oss << "AUDIO " << frame.size() << "\n";
-            std::string header = oss.str();
-
-            if (!sendAll(sock, header.data(), header.size())) {
-                std::cerr << "Failed to send AUDIO header\n";
-                g_running = false;
+            std::vector<char> frame = captureAudioFrame();
+            if (!sendVoiceFrameToServer(sock, frame)) {
+                std::cout << "Failed to send voice frame (ending talk session).";
                 break;
             }
-            if (!sendAll(sock, frame.data(), frame.size())) {
-                std::cerr << "Failed to send AUDIO data\n";
-                g_running = false;
-                break;
-            }
-#endif
         }
     }
 
@@ -1680,6 +2114,212 @@ void voxAutoLoop(SOCKET sock) {
     std::cout << "[VOX] Loop ended.\n";
 }
 
+static inline int16_t seqDiff(uint16_t a, uint16_t b) {
+    return (int16_t)(a - b);
+}
+
+static void downsample_by_2_mono16(const int16_t* in, size_t n, std::vector<int16_t>& out) {
+    out.clear();
+    out.reserve((n + 1) / 2);
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        int v = (int)in[i] + (int)in[i + 1];
+        out.push_back((int16_t)(v / 2));
+    }
+    if (n & 1) out.push_back(in[n - 1]);
+}
+
+static void upsample_by_2_hold_mono16(const int16_t* in, size_t n, std::vector<int16_t>& out) {
+    out.clear();
+    out.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(in[i]);
+        out.push_back(in[i]);
+    }
+}
+
+static std::vector<char> adpcmEncode(const int16_t* pcm, size_t n)
+{
+    std::vector<char> out;
+    if (!pcm || n == 0) return out;
+
+    int pred = pcm[0];
+    int idx = 0;
+
+    out.resize(4);
+    out[0] = (char)(pred & 0xFF);
+    out[1] = (char)((pred >> 8) & 0xFF);
+    out[2] = (char)(idx & 0xFF);
+    out[3] = 0;
+
+    int step = g_imaStepTable[idx];
+
+    size_t nNibbles = (n >= 1) ? (n - 1) : 0;
+    out.resize(4 + (nNibbles + 1) / 2, 0);
+
+    size_t nib = 0;
+    for (size_t i = 1; i < n; ++i, ++nib) {
+        int diff = (int)pcm[i] - pred;
+        int sign = (diff < 0) ? 8 : 0;
+        if (diff < 0) diff = -diff;
+
+        int delta = 0;
+        int vpdiff = step >> 3;
+        if (diff >= step)      { delta |= 4; diff -= step;      vpdiff += step; }
+        if (diff >= (step>>1)) { delta |= 2; diff -= (step>>1); vpdiff += (step>>1); }
+        if (diff >= (step>>2)) { delta |= 1;                    vpdiff += (step>>2); }
+
+        pred += sign ? -vpdiff : vpdiff;
+        pred = clamp16(pred);
+
+        delta |= sign;
+
+        idx += g_imaIndexTable[delta & 0x0F];
+        if (idx < 0) idx = 0; else if (idx > 88) idx = 88;
+        step = g_imaStepTable[idx];
+
+        size_t bytePos = 4 + (nib / 2);
+        if ((nib & 1) == 0) out[bytePos] = (char)(delta & 0x0F);
+        else out[bytePos] = (char)((out[bytePos] & 0x0F) | ((delta & 0x0F) << 4));
+    }
+
+    return out;
+}
+
+static bool adpcmDecode(const std::vector<char>& in, std::vector<int16_t>& pcm)
+{
+    pcm.clear();
+    if (in.size() < 4) return false;
+
+    int pred = (int16_t)((uint8_t)in[0] | ((uint8_t)in[1] << 8));
+    int idx  = (uint8_t)in[2];
+    if (idx < 0) idx = 0; else if (idx > 88) idx = 88;
+
+    int step = g_imaStepTable[idx];
+    pcm.push_back((int16_t)pred);
+
+    for (size_t i = 4; i < in.size(); ++i) {
+        uint8_t b = (uint8_t)in[i];
+        for (int k = 0; k < 2; ++k) {
+            int d = (k == 0) ? (b & 0x0F) : ((b >> 4) & 0x0F);
+            int sign = d & 8;
+            int code = d & 7;
+
+            int vpdiff = step >> 3;
+            if (code & 4) vpdiff += step;
+            if (code & 2) vpdiff += (step >> 1);
+            if (code & 1) vpdiff += (step >> 2);
+
+            pred += sign ? -vpdiff : vpdiff;
+            pred = clamp16(pred);
+
+            idx += g_imaIndexTable[d];
+            if (idx < 0) idx = 0; else if (idx > 88) idx = 88;
+            step = g_imaStepTable[idx];
+
+            pcm.push_back((int16_t)pred);
+        }
+    }
+    return true;
+}
+
+struct PlcState {
+    int16_t lastSample;
+    int plcSamplesLeft;
+
+    PlcState() : lastSample(0), plcSamplesLeft(0) {}
+};
+
+static void plcMakeFrame(std::vector<char>& outPcmBytes, PlcState& st, int samplesPerFrame) {
+    outPcmBytes.resize(samplesPerFrame * 2);
+    int16_t* p = (int16_t*)outPcmBytes.data();
+
+    int32_t s = st.lastSample;
+    for (int i = 0; i < samplesPerFrame; ++i) {
+        s = (s * 995) / 1000;
+        p[i] = (int16_t)s;
+    }
+    if (samplesPerFrame > 0) st.lastSample = p[samplesPerFrame - 1];
+}
+
+struct AdpcmJitterBuffer {
+    AdpcmJitterBuffer() : nextSeq(0), haveSync(false), targetFrames(3), samplesPerFrame(220), srDiv(1) {}
+    std::map<uint16_t, std::vector<char>> q;
+    uint16_t nextSeq;
+    bool haveSync;
+    int targetFrames;
+    int samplesPerFrame;
+    int srDiv;
+    PlcState plc;
+
+    void reset(int tgtFrames, int spf) {
+        q.clear();
+        haveSync = false;
+        targetFrames = std::max(2, std::min(8, tgtFrames));
+        samplesPerFrame = spf;
+        srDiv = 1;
+        plc = PlcState();
+    }
+
+    void push(uint16_t seq, int inSrDiv, const std::vector<char>& payload) {
+        if (inSrDiv != 1 && inSrDiv != 2) inSrDiv = 1;
+        srDiv = inSrDiv;
+
+        q[seq] = payload;
+
+        if (!haveSync) {
+            if ((int)q.size() >= targetFrames) {
+                nextSeq = q.begin()->first;
+                haveSync = true;
+            }
+        }
+    }
+
+    bool pop(std::vector<char>& outPcmBytes) {
+        outPcmBytes.clear();
+        if (!haveSync) return false;
+
+        auto it = q.find(nextSeq);
+        if (it == q.end()) {
+            plcMakeFrame(outPcmBytes, plc, samplesPerFrame);
+            nextSeq++;
+            return true;
+        }
+
+        std::vector<int16_t> pcm;
+        if (!adpcmDecode(it->second, pcm) || pcm.empty()) {
+            plcMakeFrame(outPcmBytes, plc, samplesPerFrame);
+            q.erase(it);
+            nextSeq++;
+            return true;
+        }
+
+        std::vector<int16_t> norm;
+
+        if (srDiv == 2) {
+            std::vector<int16_t> up;
+            upsample_by_2_hold_mono16(pcm.data(), pcm.size(), up);
+            norm.swap(up);
+        } else {
+            norm.swap(pcm);
+        }
+
+        if ((int)norm.size() < samplesPerFrame) {
+            int16_t last = norm.empty() ? 0 : norm.back();
+            norm.resize(samplesPerFrame, last);
+        } else if ((int)norm.size() > samplesPerFrame) {
+            norm.resize(samplesPerFrame);
+        }
+
+        plc.lastSample = norm.back();
+
+        outPcmBytes.resize(samplesPerFrame * 2);
+        std::memcpy(outPcmBytes.data(), norm.data(), outPcmBytes.size());
+
+        q.erase(it);
+        nextSeq++;
+        return true;
+    }
+};
 
 void receiverLoop(SOCKET sock) {
     while (g_running) {
@@ -1802,7 +2442,6 @@ void receiverLoop(SOCKET sock) {
             }
 #endif
         }
-#ifdef OPUS
 		else if (cmd == "AUDIO_FROM" || cmd == "AUDIO_FROM_OPUS") {
 			std::string user;
 			size_t size;
@@ -1837,32 +2476,57 @@ void receiverLoop(SOCKET sock) {
 			if (!pcm.empty()) {
 				playAudioFrame(pcm);
 			}
-#else
-		else if (cmd == "AUDIO_FROM") {
-			std::string user;
-			size_t size;
-			iss >> user >> size;
-			std::vector<char> buf(size);
-			if (!recvAll(sock, buf.data(), size)) {
-				LOG_ERROR("Failed to receive audio frame\n");
-				g_running = false;
-				break;
-			}
-			{
-				std::lock_guard<std::mutex> lock(g_speakerMutex);
-				if (g_currentSpeaker != user) {
-					g_currentSpeaker = user;
-#ifdef GUI
-					g_talkerStart  = std::chrono::steady_clock::now();
-					g_talkerActive = true;
-#endif
-					std::cout << "[TG] Now talking: " << user << "\n";
-				}
-			}
-			g_lastRxAudioTime = std::chrono::steady_clock::now();
-			playAudioFrame(buf);
-#endif
 		}
+        else if (cmd == "AUDIO_ADPCM_FROM") {
+            std::string user;
+            uint32_t seq = 0;
+            uint16_t rate = 22050;
+            size_t size = 0;
+            iss >> user >> seq >> rate >> size;
+            if (size == 0) continue;
+
+            std::vector<char> buf(size);
+            if (!recvAll(sock, buf.data(), size)) {
+                LOG_ERROR("Failed to receive ADPCM frame");
+                g_running = false;
+                break;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_speakerMutex);
+                if (g_currentSpeaker != user) {
+                    g_currentSpeaker = user;
+#ifdef GUI
+                    g_talkerStart  = std::chrono::steady_clock::now();
+                    g_talkerActive = true;
+#endif
+                    std::cout << "[TG] Now talking: " << user << "";
+                }
+            }
+            g_lastRxAudioTime = std::chrono::steady_clock::now();
+
+            ensureAdpcmPlayoutThread();
+            {
+                std::lock_guard<std::mutex> lock(g_adpcmJitMutex);
+
+                if (g_adpcmExpectedSeq.load() == 0) {
+                    g_adpcmExpectedSeq = seq;
+                }
+
+                AdpcmRxFrame fr;
+                fr.from = user;
+                fr.seq  = seq;
+                fr.rate = rate;
+                fr.payload = std::move(buf);
+                g_adpcmReorder[seq] = std::move(fr);
+
+                const size_t maxFrames = (size_t)std::max(2, g_cfg.adpcm_jitter_frames) * 8;
+                while (g_adpcmReorder.size() > maxFrames) {
+                    g_adpcmReorder.erase(g_adpcmReorder.begin());
+                }
+            }
+        }
+
         else if (cmd == "ADMIN_INFO") {
             std::string info;
             iss >> info;
@@ -1985,16 +2649,8 @@ void doTalkSession(SOCKET sock) {
             }
         }
 
-        std::ostringstream oss;
-        oss << "AUDIO " << frame.size() << "\n";
-        std::string header = oss.str();
-
-        if (!sendAll(sock, header.data(), header.size())) {
-            std::cout << "Failed to send AUDIO header (ending talk session).\n";
-            break;
-        }
-        if (!sendAll(sock, frame.data(), frame.size())) {
-            std::cout << "Failed to send AUDIO data (ending talk session).\n";
+        if (!sendVoiceFrameToServer(sock, frame)) {
+            std::cout << "Failed to send voice frame (ending talk session).";
             break;
         }
     }
@@ -2174,14 +2830,12 @@ int main(int argc, char** argv) {
         std::cerr << "PortAudio init failed.\n";
         return 1;
     }
-#ifdef OPUS
 	if (g_cfg.use_opus) {
 		if (!initOpus(g_cfg)) {
 			std::cerr << "Opus init failed, falling back to PCM.\n";
 			g_cfg.use_opus = false;
 		}
 	}
-#endif
 	loadRogerFromConfig();
     if (!initGpioPtt(g_cfg)) {
         std::cerr << "GPIO PTT init failed.\n";
@@ -2194,9 +2848,7 @@ int main(int argc, char** argv) {
     if (g_cfg.mode == "parrot") {
         parrotLoop(g_cfg);
         shutdownPortAudio();
-#ifdef OPUS
 		shutdownOpus();
-#endif
         shutdownGpioPtt();
         return 0;
     }
@@ -2207,9 +2859,7 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to create socket\n";
         cleanupSockets();
         shutdownPortAudio();
-#ifdef OPUS
 		shutdownOpus();
-#endif
         shutdownGpioPtt();
         return 1;
     }
@@ -2233,9 +2883,7 @@ int main(int argc, char** argv) {
 		closeSocket(sock);
 		cleanupSockets();
 		shutdownPortAudio();
-#ifdef OPUS
 		shutdownOpus();
-#endif
 		shutdownGpioPtt();
 		return 1;
 	}
@@ -2255,9 +2903,7 @@ int main(int argc, char** argv) {
 		closeSocket(sock);
 		cleanupSockets();
 		shutdownPortAudio();
-#ifdef OPUS
 		shutdownOpus();
-#endif
 		shutdownGpioPtt();
 		return 1;
 	}
@@ -2271,9 +2917,7 @@ int main(int argc, char** argv) {
         closeSocket(sock);
         cleanupSockets();
         shutdownPortAudio();
-#ifdef OPUS
 		shutdownOpus();
-#endif
         shutdownGpioPtt();
         return 1;
     }
@@ -2287,9 +2931,7 @@ int main(int argc, char** argv) {
 			closeSocket(sock);
 			cleanupSockets();
 			shutdownPortAudio();
-#ifdef OPUS
 			shutdownOpus();
-#endif
 			shutdownGpioPtt();
 			return 1;
 		}
@@ -2298,9 +2940,7 @@ int main(int argc, char** argv) {
 		closeSocket(sock);
 		cleanupSockets();
 		shutdownPortAudio();
-#ifdef OPUS
 		shutdownOpus();
-#endif
 		shutdownGpioPtt();
 		return 1;
 #endif
@@ -2322,9 +2962,7 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-#ifdef OPUS
 			shutdownOpus();
-#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -2334,9 +2972,7 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-#ifdef OPUS
 			shutdownOpus();
-#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -2345,9 +2981,7 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-#ifdef OPUS
 			shutdownOpus();
-#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -2363,9 +2997,7 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-#ifdef OPUS
 			shutdownOpus();
-#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -2375,9 +3007,7 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-#ifdef OPUS
 			shutdownOpus();
-#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -2387,9 +3017,7 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-#ifdef OPUS
 			shutdownOpus();
-#endif
             shutdownGpioPtt();
             return 1;
         }
@@ -2436,9 +3064,7 @@ int main(int argc, char** argv) {
     if (recvThread.joinable()) recvThread.join();
 
     shutdownPortAudio();
-#ifdef OPUS
 	shutdownOpus();
-#endif
     shutdownGpioPtt();
     cleanupSockets();
     return 0;
