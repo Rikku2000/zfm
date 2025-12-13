@@ -1437,7 +1437,7 @@ int main(int argc, char** argv) {
     int w, h;
     SDL_GetWindowSize(window, &w, &h);
 
-    SDL_Rect rcTabBar, rcTabMain, rcTabAudio, rcTabGpio, rcTabSquelch, rcTabLog;
+    SDL_Rect rcTabBar, rcTabMain, rcTabAudio, rcTabGpio, rcTabRadio, rcTabLog;
     SDL_Rect rcLogCard, rcLogInner;
     int contentTop = 0;
     int bottomTop = 0;
@@ -1492,7 +1492,7 @@ int main(int argc, char** argv) {
 	rcTabMain = makeRect(startX + (tabW + space) * 0, tabY, tabW, tabH);
 	rcTabAudio = makeRect(startX + (tabW + space) * 1, tabY, tabW, tabH);
 	rcTabGpio = makeRect(startX + (tabW + space) * 2, tabY, tabW, tabH);
-	rcTabSquelch = makeRect(startX + (tabW + space) * 3, tabY, tabW, tabH);
+	rcTabRadio = makeRect(startX + (tabW + space) * 3, tabY, tabW, tabH);
 	rcTabLog = makeRect(startX + (tabW + space) * 4, tabY, tabW, tabH);
 
     contentTop = rcTabBar.y + rcTabBar.h + 6;
@@ -1586,18 +1586,6 @@ int main(int argc, char** argv) {
 
 		AddLabel(2, xLabel, y, "PTT cmd OFF");
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_cmd_off); y += 34;
-
-		AddCheck(2, xLabel, y, "RX Squelch", &ui_rx_squelch_en);;
-		AddCheck(2, xCtrl, y, "Auto", &ui_rx_squelch_auto); y += 30;
-
-		AddLabel(2, xLabel, y, "Level");
-		AddSlider(2, xCtrl, y, 290, &ui_rx_squelch_level, 0, 100, ""); y += 34;
-
-		AddLabel(2, xLabel, y, "Discriminator");
-		AddSlider(2, xCtrl, y, 290, &ui_rx_squelch_voice, 0, 100, ""); y += 34;
-
-		AddLabel(2, xLabel, y, "Hang (ms)");
-		AddSlider(2, xCtrl, y, 290, &ui_rx_squelch_hang, 0, 2000, ""); y += 44;
 
 		id_btnLoad2 = AddButton(2, w - 190, y + 8, 80, 30, "Load");
 		id_btnSave2 = AddButton(2, w - 100, y + 8, 80, 30, "Save");
@@ -1737,7 +1725,7 @@ int main(int argc, char** argv) {
 				} else if (SDL_PointInRect(&pt, &rcTabGpio)) {
 					g_activeTab = 2; g_focusWidget = -1; g_comboOpen = false;
 					continue;
-				} else if (SDL_PointInRect(&pt, &rcTabSquelch)) {
+				} else if (SDL_PointInRect(&pt, &rcTabRadio)) {
 					g_activeTab = 3; g_focusWidget = -1; g_comboOpen = false;
 					continue;
 				} else if (SDL_PointInRect(&pt, &rcTabLog)) {
@@ -2133,7 +2121,7 @@ int main(int argc, char** argv) {
 		drawTab(rcTabMain,    "Main",    0);
 		drawTab(rcTabAudio,   "Audio",   1);
 		drawTab(rcTabGpio,    "GPIO",    2);
-		drawTab(rcTabSquelch, "Squelch", 3);
+		drawTab(rcTabRadio,   "Radio",   3);
 		drawTab(rcTabLog,     "Log",     4);
 
         if (g_activeTab == 0 || g_activeTab == 1 || g_activeTab == 2 || g_activeTab == 3) {
