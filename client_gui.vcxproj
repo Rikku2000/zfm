@@ -81,6 +81,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="private.h" />
+    <ClInclude Include="ptt_hal.h" />
+    <ClInclude Include="ptt_input_evdev.h" />
     <ClInclude Include="client.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -90,6 +92,10 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="ptt_input_evdev.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="client_gui.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">NotUsing</PrecompiledHeader>

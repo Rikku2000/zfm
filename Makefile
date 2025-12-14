@@ -79,6 +79,16 @@ CLI_SRC := client.cpp
 GUI_SRC := client_gui.cpp
 CM108_SRC := cm108.c
 
+ifeq ($(PLATFORM),posix)
+  PTT_INPUT_SRC := ptt_input_evdev.cpp
+  PTT_INPUT_OBJ := $(BUILD_DIR)/ptt_input_evdev.o
+  PTT_INPUT_DEPS := $(PTT_INPUT_OBJ:.o=.d)
+else
+  PTT_INPUT_SRC :=
+  PTT_INPUT_OBJ :=
+  PTT_INPUT_DEPS :=
+endif
+
 SRV_OBJ := $(BUILD_DIR)/server.o
 CLI_OBJ := $(BUILD_DIR)/client.o
 GUI_OBJ := $(BUILD_DIR)/client_gui.o
@@ -100,10 +110,10 @@ $(BUILD_DIR):
 server: $(SRV_OBJ)
 	$(CXX) -o $@ $^ $(LDLIBS_SERVER)
 
-client: $(CLI_OBJ) $(CM108_OBJ)
+client: $(CLI_OBJ) $(CM108_OBJ) $(PTT_INPUT_OBJ)
 	$(CXX) -o $@ $^ $(LDLIBS_CLIENT)
 
-client_gui: $(GUI_OBJ) $(CM108_OBJ)
+client_gui: $(GUI_OBJ) $(CM108_OBJ) $(PTT_INPUT_OBJ)
 	$(CXX) -o $@ $^ $(LDLIBS_GUI)
 
 $(SRV_OBJ): $(SRV_SRC) | $(BUILD_DIR)
@@ -118,7 +128,12 @@ $(GUI_OBJ): $(GUI_SRC) $(CLI_SRC) | $(BUILD_DIR)
 $(CM108_OBJ): $(CM108_SRC) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(CM108_CFLAGS) -c $< -o $@
 
+ifeq ($(PLATFORM),posix)
+$(PTT_INPUT_OBJ): $(PTT_INPUT_SRC) | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+endif
+
 clean:
 	rm -rf $(BUILD_DIR) $(ALL_TARGETS)
 
--include $(SRV_DEPS) $(CLI_DEPS) $(GUI_DEPS) $(CM108_DEPS)
+-include $(SRV_DEPS) $(CLI_DEPS) $(GUI_DEPS) $(CM108_DEPS) $(PTT_INPUT_DEPS)

@@ -37,7 +37,6 @@ extern "C" {
     int cm108_set_gpio_pin(char *name, int num, int state);
 }
 
-#ifdef GUI
 static std::atomic<float> g_audioLevel(0.0f);
 
 std::atomic<float> g_rxAudioLevel(0.0f);
@@ -47,6 +46,8 @@ std::atomic<bool> g_rxSquelchAuto(true);
 std::atomic<int>  g_rxSquelchLevel(55);
 std::atomic<int>  g_rxSquelchVoicePct(55);
 std::atomic<int>  g_rxSquelchHangMs(450);
+
+#ifdef GUI
 std::atomic<bool>  g_talkerActive(false);
 std::chrono::steady_clock::time_point g_talkerStart;
 #endif
@@ -360,7 +361,11 @@ struct ClientConfig {
     std::string ptt_cmd_on;
     std::string ptt_cmd_off;
 
-	int roger_sound;
+    std::string ptt_serial_port;
+    std::string ptt_serial_line;
+    bool        ptt_serial_invert;
+
+int roger_sound;
 
 	bool use_opus;
 
@@ -404,7 +409,11 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
     cfg.ptt_cmd_on.clear();
     cfg.ptt_cmd_off.clear();
 
-	cfg.roger_sound = 1;
+	
+    cfg.ptt_serial_port.clear();
+    cfg.ptt_serial_line = "RTS";
+    cfg.ptt_serial_invert = false;
+cfg.roger_sound = 1;
 
 	cfg.use_opus = false;
 
@@ -455,7 +464,11 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
         else if (parseIntField(l, "ptt_hold_ms", ival)) cfg.gpio_ptt_hold_ms = ival;
         else if (parseStringField(l, "ptt_cmd_on", sval))  cfg.ptt_cmd_on  = sval;
         else if (parseStringField(l, "ptt_cmd_off", sval)) cfg.ptt_cmd_off = sval;
-        else if (parseBoolField(l, "vox_enabled", bval)) cfg.vox_enabled = bval;
+        
+        else if (parseStringField(l, "ptt_serial_port", sval)) cfg.ptt_serial_port = sval;
+        else if (parseStringField(l, "ptt_serial_line", sval)) cfg.ptt_serial_line = sval;
+        else if (parseBoolField(l, "ptt_serial_invert", bval)) cfg.ptt_serial_invert = bval;
+else if (parseBoolField(l, "vox_enabled", bval)) cfg.vox_enabled = bval;
         else if (parseIntField(l, "vox_threshold", ival)) cfg.vox_threshold = ival;
         else if (parseIntField(l, "input_gain", ival))    cfg.input_gain  = ival;
         else if (parseIntField(l, "output_gain", ival))   cfg.output_gain = ival;
@@ -517,7 +530,10 @@ static bool saveClientConfigFile(const std::string& path, const ClientConfig& cf
 	f << "  \"roger_sound\": " << cfg.roger_sound << ",\n";
     f << "  \"ptt_cmd_on\": \""  << cfg.ptt_cmd_on  << "\",\n";
 	f << "  \"ptt_cmd_off\": \"" << cfg.ptt_cmd_off << "\",\n";
-	f << "  \"rx_squelch_enabled\": " << (cfg.rx_squelch_enabled ? "true" : "false") << ",\n";
+	    f << "  \"ptt_serial_port\": \"" << cfg.ptt_serial_port << "\",\n";
+    f << "  \"ptt_serial_line\": \"" << cfg.ptt_serial_line << "\",\n";
+    f << "  \"ptt_serial_invert\": " << (cfg.ptt_serial_invert ? "true" : "false") << ",\n";
+f << "  \"rx_squelch_enabled\": " << (cfg.rx_squelch_enabled ? "true" : "false") << ",\n";
 	f << "  \"rx_squelch_auto\": " << (cfg.rx_squelch_auto ? "true" : "false") << ",\n";
 	f << "  \"rx_squelch_level\": " << cfg.rx_squelch_level << ",\n";
 	f << "  \"rx_squelch_voice_pct\": " << cfg.rx_squelch_voice_pct << ",\n";
@@ -799,209 +815,8 @@ static void ParseCm108Command(const std::string& cmd, std::string& hiddev, int& 
     }
 }
 
-#ifdef __linux__
-#include <sys/stat.h>
-#include <fcntl.h>
-
-static int  g_gpioPin        = -1;
-static bool g_gpioActiveHigh = true;
-static bool g_gpioConfigured = false;
-
-bool gpioExport(int pin) {
-    std::ofstream ofs("/sys/class/gpio/export");
-    if (!ofs.is_open()) return false;
-    ofs << pin;
-    return true;
-}
-
-bool gpioUnexport(int pin) {
-    std::ofstream ofs("/sys/class/gpio/unexport");
-    if (!ofs.is_open()) return false;
-    ofs << pin;
-    return true;
-}
-
-bool gpioSetDirection(int pin, const std::string& dir) {
-    std::ostringstream path;
-    path << "/sys/class/gpio/gpio" << pin << "/direction";
-    std::ofstream ofs(path.str().c_str());
-    if (!ofs.is_open()) return false;
-    ofs << dir;
-    return true;
-}
-
-bool gpioSetValue(int pin, int value) {
-    std::ostringstream path;
-    path << "/sys/class/gpio/gpio" << pin << "/value";
-    std::ofstream ofs(path.str().c_str());
-    if (!ofs.is_open()) return false;
-    ofs << value;
-    return true;
-}
-
-bool initGpioPtt(const ClientConfig& cfg) {
-    if (!cfg.gpio_ptt_enabled)
-        return true;
-
-    g_pttCmdOn.clear();
-    g_pttCmdOff.clear();
-    g_pttUseShell = false;
-    g_pttUseCm108 = false;
-    g_cm108Dev.clear();
-    g_cm108Pin = 0;
-
-    if (!cfg.ptt_cmd_on.empty() &&
-        cfg.ptt_cmd_on.find("cm108") != std::string::npos)
-    {
-        ParseCm108Command(cfg.ptt_cmd_on, g_cm108Dev, g_cm108Pin);
-
-		LOG_INFO("PTT: using built-in CM108, dev=%s pin=%d\n",g_cm108Dev.c_str(), g_cm108Pin);
-
-        g_pttUseCm108 = true;
-        return true;
-    }
-
-    if (!cfg.ptt_cmd_on.empty() || !cfg.ptt_cmd_off.empty()) {
-        g_pttCmdOn  = cfg.ptt_cmd_on;
-        g_pttCmdOff = cfg.ptt_cmd_off;
-        g_pttUseShell = true;
-
-        LOG_INFO("PTT: using shell commands: ON=\"%s\" OFF=\"%s\"\n", g_pttCmdOn.c_str(), g_pttCmdOff.c_str());
-
-        return true;
-    }
-
-    g_gpioPin        = cfg.gpio_ptt_pin;
-    g_gpioActiveHigh = cfg.gpio_ptt_active_high;
-
-    gpioExport(g_gpioPin);
-    if (!gpioSetDirection(g_gpioPin, "out")) {
-        LOG_ERROR("Failed to set GPIO direction (need root or udev rules).\n");
-        return false;
-    }
-
-    gpioSetValue(g_gpioPin, g_gpioActiveHigh ? 0 : 1);
-    g_gpioConfigured = true;
-    LOG_INFO("GPIO PTT on pin %d (active_%s)\n",g_gpioPin, g_gpioActiveHigh ? "high" : "low");
-    return true;
-}
-
-void setPtt(bool on)
-{
-    if (!g_cfg.gpio_ptt_enabled)
-        return;
-
-    if (g_pttUseCm108) {
-        const char* dev = g_cm108Dev.empty() ? nullptr : g_cm108Dev.c_str();
-        int state = on ? 1 : 0;
-        int rc = cm108_set_gpio_pin((char*)dev, g_cm108Pin, state);
-        if (rc != 0) {
-            LOG_WARN("PTT: cm108_set_gpio_pin failed (rc=%d, dev=%s, pin=%d)\n",rc, (dev ? dev : "auto"), g_cm108Pin);
-        }
-        return;
-    }
-
-    if (g_pttUseShell) {
-        const std::string& cmd = on ? g_pttCmdOn : g_pttCmdOff;
-        if (!cmd.empty()) {
-            LOG_INFO("PTT: executing \"%s\"\n", cmd.c_str());
-            system(cmd.c_str());
-        }
-        return;
-    }
-
-    int v = (g_gpioActiveHigh ? (on ? 1 : 0) : (on ? 0 : 1));
-    gpioSetValue(g_gpioPin, v);
-}
-
-void shutdownGpioPtt() {
-    if (!g_gpioConfigured) return;
-
-    setPtt(false);
-
-    if (!g_pttUseShell) {
-        gpioUnexport(g_gpioPin);
-    }
-
-    g_gpioConfigured = false;
-    g_pttUseShell = false;
-    g_pttCmdOn.clear();
-    g_pttCmdOff.clear();
-}
-
-#else
-
-static HANDLE g_gpioHandle     = INVALID_HANDLE_VALUE;
-static bool   g_gpioConfigured = false;
-static bool   g_gpioActiveHigh = true;
-
-bool initGpioPtt(const ClientConfig& cfg)
-{
-    if (!cfg.gpio_ptt_enabled)
-        return true;
-
-    g_pttCmdOn.clear();
-    g_pttCmdOff.clear();
-    g_pttUseShell = false;
-    g_pttUseCm108 = false;
-    g_cm108Dev.clear();
-    g_cm108Pin = 0;
-
-    if (!cfg.ptt_cmd_on.empty() &&
-        cfg.ptt_cmd_on.find("cm108") != std::string::npos)
-    {
-        ParseCm108Command(cfg.ptt_cmd_on, g_cm108Dev, g_cm108Pin);
-
-        LOG_INFO("PTT: using built-in CM108 (Windows), pin=%d\n", g_cm108Pin);
-
-        g_pttUseCm108 = true;
-        return true;
-    }
-
-    if (!cfg.ptt_cmd_on.empty() || !cfg.ptt_cmd_off.empty()) {
-        g_pttCmdOn  = cfg.ptt_cmd_on;
-        g_pttCmdOff = cfg.ptt_cmd_off;
-        g_pttUseShell = true;
-
-        LOG_INFO("PTT: using shell commands: ON=\"%s\" OFF=\"%s\"\n",g_pttCmdOn.c_str(), g_pttCmdOff.c_str());
-
-        return true;
-    }
-
-    return true;
-}
-
-void setPtt(bool on)
-{
-    if (!g_cfg.gpio_ptt_enabled)
-        return;
-
-    if (g_pttUseCm108) {
-        int state = on ? 1 : 0;
-        int rc = cm108_set_gpio_pin(nullptr, g_cm108Pin, state);
-        if (rc != 0) {
-            LOG_WARN("PTT: cm108_set_gpio_pin (Windows) failed, rc=%d, pin=%d\n",rc, g_cm108Pin);
-        }
-        return;
-    }
-
-    if (g_pttUseShell) {
-        const std::string& cmd = on ? g_pttCmdOn : g_pttCmdOff;
-        if (!cmd.empty()) {
-            int rc = std::system(cmd.c_str());
-            (void)rc;
-        }
-        return;
-    }
-}
-
-void shutdownGpioPtt() {
-    setPtt(false);
-    g_pttUseShell = false;
-    g_pttCmdOn.clear();
-    g_pttCmdOff.clear();
-}
-#endif
+#define PTT_HAL_IMPLEMENTATION
+#include "ptt_hal.h"
 
 std::atomic<bool> g_pttAutoEnabled(false);
 std::atomic<bool> g_pttState(false);

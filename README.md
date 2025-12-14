@@ -5,7 +5,7 @@ zFM is a cross-platform digital voice communication framework consisting of a:
 - **Server**
 - **Command-line client**
 - **SDL2 GUI client**
-- **Optional GPIO / CM108 / VOX support**
+- **Hardware PTT abstraction (GPIO / CM108 / Serial / VOX)**
 - **HTTP Dashboard**
 
 zFM is not strictly a ham-radio system, but its architecture is similar to digital‑voice systems (DMR, YSF, etc.).  
@@ -82,6 +82,30 @@ Use Visual Studio and the included `.vcxproj` files.
 
 # 🚀 Features
 
+## ✔ Hardware PTT Abstraction
+zFM supports multiple **hardware Push‑To‑Talk backends**, selectable at runtime:
+
+| Backend | Linux | Windows |
+|------|------|------|
+| GPIO (sysfs) | ✅ | ❌ |
+| CM108 USB audio | ✅ | ✅ |
+| **Serial RTS/DTR** | ✅ | ✅ |
+| VOX | ✅ | ✅ |
+| Shell command | ✅ | ✅ |
+
+### Serial PTT
+Supports USB‑serial radio interfaces using **RTS or DTR**:
+
+```text
+serial COM4 RTS
+serial COM4 DTR ACTIVE_LOW
+serial /dev/ttyUSB0 RTS
+```
+
+Configured via GUI or `client.json`.
+
+---
+
 ## ✔ Cross‑platform audio (PortAudio)
 Real‑time PCM capture & playback.
 
@@ -97,11 +121,12 @@ Commands include:
 - `AUDIO_OPUS <bytes>` (if OPUS enabled)
 
 ## ✔ SDL2 GUI Client
-- Audio meter  
-- Device selection  
-- PTT / VOX indicators  
-- Log viewer  
-- Dynamic talkgroup dropdown  
+- Audio meter
+- Device selection
+- **Hardware PTT selection & configuration**
+- PTT / VOX indicators
+- Log viewer
+- Dynamic talkgroup dropdown 
 
 ## ✔ Server Features
 - User accounts with permissions  
@@ -207,9 +232,19 @@ Talkgroups now support **visibility modes** defined in the server configuration:
   "callsign": "DL0XYZ",
   "password": "passw0rd",
   "talkgroup": "gateway",
+
   "sample_rate": 22050,
   "frames_per_buffer": 1440,
-  "channels": 1
+  "channels": 1,
+
+  "ptt_enabled": true,
+
+  "ptt_serial_port": "COM4",
+  "ptt_serial_line": "RTS",
+  "ptt_serial_invert": false,
+
+  "ptt_cmd_on": "serial COM4 RTS",
+  "ptt_cmd_off": ""
 }
 ```
 

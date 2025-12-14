@@ -1007,10 +1007,16 @@ static std::string ui_codec_text;
 static std::string ui_ptt_cmd_on;
 static std::string ui_ptt_cmd_off;
 
+
 static std::vector<std::string> g_pttMethodItems;
 static int ui_ptt_method_index = 0;
 static std::string ui_ptt_method;
 
+static std::string ui_serial_port;
+static std::vector<std::string> g_serialLineItems;
+static int ui_serial_line_index = 0;
+static std::string ui_serial_line_text;
+static bool ui_serial_invert = false;
 static std::string ui_in_dev_text;
 static std::string ui_out_dev_text;
 static int ui_in_dev_index  = 0;
@@ -1099,19 +1105,91 @@ static void CfgToUi() {
     if (g_pttMethodItems.empty()) {
         g_pttMethodItems.push_back("None");
         g_pttMethodItems.push_back("CM108 Audio Interface");
+        g_pttMethodItems.push_back("Serial RTS");
+        g_pttMethodItems.push_back("Serial DTR");
+        g_pttMethodItems.push_back("Serial RTS (inv)");
+        g_pttMethodItems.push_back("Serial DTR (inv)");
         g_pttMethodItems.push_back("Custom");
     }
 
+	if (g_serialLineItems.empty()) {
+		g_serialLineItems.push_back("RTS");
+		g_serialLineItems.push_back("DTR");
+	}
+
     int idx = 0;
-    if (!g_cfg.ptt_cmd_on.empty() || !g_cfg.ptt_cmd_off.empty()) {
-        if (g_cfg.ptt_cmd_on.find("cm108") != std::string::npos) {
+    std::string on = g_cfg.ptt_cmd_on;
+    std::string off = g_cfg.ptt_cmd_off;
+
+    auto toLower = [](std::string x) {
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = (char)tolower((unsigned char)x[i]);
+        return x;
+    };
+
+    std::string onL = toLower(on);
+
+    if (ui_serial_port.empty()) {
+#if defined(_WIN32) || defined(_WIN64)
+        ui_serial_port = "COM4";
+#else
+        ui_serial_port = "/dev/ttyUSB0";
+#endif
+    }
+    ui_serial_line_index = 0;
+    ui_serial_line_text = "RTS";
+    ui_serial_invert = false;
+
+	if (!g_cfg.ptt_serial_port.empty()) {
+		ui_serial_port = g_cfg.ptt_serial_port;
+		std::string lineCfg = toLower(g_cfg.ptt_serial_line);
+		if (lineCfg == "dtr") {
+			ui_serial_line_index = 1;
+			ui_serial_line_text = "DTR";
+		} else {
+			ui_serial_line_index = 0;
+			ui_serial_line_text = "RTS";
+		}
+		ui_serial_invert = g_cfg.ptt_serial_invert;
+	}
+
+    if (!on.empty() || !off.empty()) {
+        if (onL.find("cm108") != std::string::npos) {
             idx = 1;
+        } else if (onL.find("serial") == 0) {
+            std::istringstream iss(on);
+            std::string head, port, line, opt;
+            iss >> head;
+            iss >> port;
+            iss >> line;
+            if (!port.empty()) ui_serial_port = port;
+            std::string lineL = toLower(line);
+            if (lineL == "dtr") {
+                ui_serial_line_index = 1;
+                ui_serial_line_text = "DTR";
+            } else {
+                ui_serial_line_index = 0;
+                ui_serial_line_text = "RTS";
+            }
+            while (iss >> opt) {
+                std::string optL = toLower(opt);
+                if (optL == "active_low" || optL == "activelow" || optL == "invert" || optL == "inverted") {
+                    ui_serial_invert = true;
+                }
+            }
+            if (ui_serial_line_index == 0 && !ui_serial_invert) idx = 2;
+            else if (ui_serial_line_index == 1 && !ui_serial_invert) idx = 3;
+            else if (ui_serial_line_index == 0 && ui_serial_invert) idx = 4;
+            else idx = 5;
         } else {
-            idx = 2;
+            idx = 6;
         }
     }
+
     ui_ptt_method_index = idx;
-    ui_ptt_method       = g_pttMethodItems[ui_ptt_method_index];
+    if (ui_ptt_method_index < 0 || ui_ptt_method_index >= (int)g_pttMethodItems.size())
+        ui_ptt_method_index = 0;
+    ui_ptt_method = g_pttMethodItems[ui_ptt_method_index];
 
     if (g_rogerItems.empty()) {
         g_rogerItems.push_back("None");
@@ -1219,16 +1297,81 @@ static void UiToCfg() {
             ui_ptt_cmd_on.clear();
             ui_ptt_cmd_off.clear();
             break;
+
         case 1:
             ui_ptt_cmd_on  = "cm108 -H /dev/hidraw0 -P 3 -L 1";
             ui_ptt_cmd_off = "cm108 -H /dev/hidraw0 -P 3 -L 0";
             break;
+
         case 2:
+        case 3:
+        case 4:
+        case 5:
+        {
+            std::string line = (ui_ptt_method_index == 3 || ui_ptt_method_index == 5) ? "DTR" : "RTS";
+            bool inv = (ui_ptt_method_index == 4 || ui_ptt_method_index == 5) ? true : false;
+
+            ui_serial_line_text = line;
+            ui_serial_line_index = (line == "DTR") ? 1 : 0;
+            ui_serial_invert = inv;
+
+            if (ui_serial_port.empty()) {
+#if defined(_WIN32) || defined(_WIN64)
+                ui_serial_port = "COM4";
+#else
+                ui_serial_port = "/dev/ttyUSB0";
+#endif
+            }
+
+            ui_ptt_cmd_on = std::string("serial ") + ui_serial_port + " " + line;
+            if (inv) ui_ptt_cmd_on += " ACTIVE_LOW";
+            ui_ptt_cmd_off.clear();
+            break;
+        }
+
+        case 6:
         default:
             break;
     }
 
     g_cfg.ptt_cmd_on  = ui_ptt_cmd_on;
+    g_cfg.ptt_cmd_off = ui_ptt_cmd_off;
+
+	if (ui_ptt_method_index >= 2 && ui_ptt_method_index <= 5) {
+		g_cfg.ptt_serial_port   = ui_serial_port;
+		g_cfg.ptt_serial_line   = ui_serial_line_text;
+		g_cfg.ptt_serial_invert = ui_serial_invert;
+	} else {
+		auto toLower2 = [](std::string x) {
+			for (size_t i = 0; i < x.size(); ++i)
+				x[i] = (char)tolower((unsigned char)x[i]);
+			return x;
+		};
+		std::string on2 = ui_ptt_cmd_on;
+		std::string on2L = toLower2(on2);
+		if (on2L.find("serial") == 0) {
+			std::istringstream iss(on2);
+			std::string head, port, line, opt;
+			iss >> head;
+			iss >> port;
+			iss >> line;
+			g_cfg.ptt_serial_port = port;
+			std::string lineL = toLower2(line);
+			g_cfg.ptt_serial_line = (lineL == "dtr") ? "DTR" : "RTS";
+			g_cfg.ptt_serial_invert = false;
+			while (iss >> opt) {
+				std::string optL = toLower2(opt);
+				if (optL == "active_low" || optL == "activelow" || optL == "invert" || optL == "inverted") {
+					g_cfg.ptt_serial_invert = true;
+				}
+			}
+		} else {
+			g_cfg.ptt_serial_port.clear();
+			g_cfg.ptt_serial_line = "RTS";
+			g_cfg.ptt_serial_invert = false;
+		}
+	}
+	g_cfg.ptt_cmd_on  = ui_ptt_cmd_on;
     g_cfg.ptt_cmd_off = ui_ptt_cmd_off;
 
 	g_cfg.roger_sound = ui_roger_index;
@@ -1578,10 +1721,17 @@ int main(int argc, char** argv) {
 		AddLabel(2, xLabel, y, "PTT Hold (ms)");
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_gpio_hold_ms); y += 34;
 
-		AddLabel(2, xLabel, y, "PTT Method");
-		AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_method, &ui_ptt_method_index, &g_pttMethodItems); y += 34;
+		
+AddLabel(2, xLabel, y, "PTT Method");
+AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_method, &ui_ptt_method_index, &g_pttMethodItems); y += 34;
 
-		AddLabel(2, xLabel, y, "PTT cmd ON");
+AddLabel(2, xLabel, y, "Serial Port");
+AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_serial_port); y += 34;
+
+AddLabel(2, xLabel, y, "Serial Line");
+AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_serial_line_text, &ui_serial_line_index, &g_serialLineItems); y += 34;
+
+AddCheck(2, xLabel, y, "Serial Invert (ACTIVE_LOW)", &ui_serial_invert); y += 34;AddLabel(2, xLabel, y, "PTT cmd ON");
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_cmd_on); y += 34;
 
 		AddLabel(2, xLabel, y, "PTT cmd OFF");
