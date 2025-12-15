@@ -1,0 +1,6 @@
+gradle.ext.buildToolsVersion = '29.0.0'
+gradle.ext.sdkVersion = 33
+gradle.ext.minSdkVersion = 21
+gradle.ext.targetSdkVersion = 33
+gradle.ext.libDistributionRoot = '../distribution'
+include ':app'

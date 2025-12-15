@@ -31,10 +31,18 @@
   typedef int SOCKET;
 #endif
 
+#if !defined(__ANDROID__)
 #include <portaudio.h>
+#else
+#include <SDL.h>
+#endif
 
 extern "C" {
+#if defined(__ANDROID__)
+    static int cm108_set_gpio_pin(char*, int, int) { return -1; }
+#else
     int cm108_set_gpio_pin(char *name, int num, int state);
+#endif
 }
 
 static std::atomic<float> g_audioLevel(0.0f);
@@ -197,9 +205,13 @@ void closeSocket(SOCKET s) {
 }
 
 bool sendAll(SOCKET sock, const void* data, size_t len) {
-    const char* buf = static_cast<const char*>(data);
+    const char* buf = (const char*)data;
     while (len > 0) {
+#if defined(__ANDROID__) || defined(__linux__)
+        int sent = send(sock, buf, (int)len, MSG_NOSIGNAL);
+#else
         int sent = send(sock, buf, (int)len, 0);
+#endif
         if (sent <= 0) return false;
         buf += sent;
         len -= sent;
@@ -365,7 +377,7 @@ struct ClientConfig {
     std::string ptt_serial_line;
     bool        ptt_serial_invert;
 
-int roger_sound;
+	int roger_sound;
 
 	bool use_opus;
 
@@ -413,7 +425,7 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
     cfg.ptt_serial_port.clear();
     cfg.ptt_serial_line = "RTS";
     cfg.ptt_serial_invert = false;
-cfg.roger_sound = 1;
+	cfg.roger_sound = 1;
 
 	cfg.use_opus = false;
 
@@ -464,11 +476,10 @@ cfg.roger_sound = 1;
         else if (parseIntField(l, "ptt_hold_ms", ival)) cfg.gpio_ptt_hold_ms = ival;
         else if (parseStringField(l, "ptt_cmd_on", sval))  cfg.ptt_cmd_on  = sval;
         else if (parseStringField(l, "ptt_cmd_off", sval)) cfg.ptt_cmd_off = sval;
-        
         else if (parseStringField(l, "ptt_serial_port", sval)) cfg.ptt_serial_port = sval;
         else if (parseStringField(l, "ptt_serial_line", sval)) cfg.ptt_serial_line = sval;
         else if (parseBoolField(l, "ptt_serial_invert", bval)) cfg.ptt_serial_invert = bval;
-else if (parseBoolField(l, "vox_enabled", bval)) cfg.vox_enabled = bval;
+        else if (parseBoolField(l, "vox_enabled", bval)) cfg.vox_enabled = bval;
         else if (parseIntField(l, "vox_threshold", ival)) cfg.vox_threshold = ival;
         else if (parseIntField(l, "input_gain", ival))    cfg.input_gain  = ival;
         else if (parseIntField(l, "output_gain", ival))   cfg.output_gain = ival;
@@ -530,10 +541,10 @@ static bool saveClientConfigFile(const std::string& path, const ClientConfig& cf
 	f << "  \"roger_sound\": " << cfg.roger_sound << ",\n";
     f << "  \"ptt_cmd_on\": \""  << cfg.ptt_cmd_on  << "\",\n";
 	f << "  \"ptt_cmd_off\": \"" << cfg.ptt_cmd_off << "\",\n";
-	    f << "  \"ptt_serial_port\": \"" << cfg.ptt_serial_port << "\",\n";
+	f << "  \"ptt_serial_port\": \"" << cfg.ptt_serial_port << "\",\n";
     f << "  \"ptt_serial_line\": \"" << cfg.ptt_serial_line << "\",\n";
     f << "  \"ptt_serial_invert\": " << (cfg.ptt_serial_invert ? "true" : "false") << ",\n";
-f << "  \"rx_squelch_enabled\": " << (cfg.rx_squelch_enabled ? "true" : "false") << ",\n";
+    f << "  \"rx_squelch_enabled\": " << (cfg.rx_squelch_enabled ? "true" : "false") << ",\n";
 	f << "  \"rx_squelch_auto\": " << (cfg.rx_squelch_auto ? "true" : "false") << ",\n";
 	f << "  \"rx_squelch_level\": " << cfg.rx_squelch_level << ",\n";
 	f << "  \"rx_squelch_voice_pct\": " << cfg.rx_squelch_voice_pct << ",\n";
@@ -548,11 +559,71 @@ f << "  \"rx_squelch_enabled\": " << (cfg.rx_squelch_enabled ? "true" : "false")
     return true;
 }
 
+#if defined(__ANDROID__)
+struct PaStream {};
+using PaDeviceIndex = int;
+struct PaDeviceInfo { const char* name; int maxInputChannels; int maxOutputChannels; };
+
+static inline int Pa_GetDeviceCount() { return 1; }
+static inline const PaDeviceInfo* Pa_GetDeviceInfo(PaDeviceIndex) {
+    static PaDeviceInfo di{"Android Default", 1, 1};
+    return &di;
+}
+static inline const char* Pa_GetErrorText(int) { return "PortAudio disabled on Android"; }
+
+static std::mutex g_sdlAudioMutex;
+#endif
+
 PaStream* g_inputStream = NULL;
 PaStream* g_outputStream = NULL;
+
 int g_sampleRate = 48000;
 unsigned long g_framesPerBuffer = 480;
 int g_channels = 1;
+
+#if defined(__ANDROID__)
+static SDL_AudioDeviceID g_sdlInDev  = 0;
+static SDL_AudioDeviceID g_sdlOutDev = 0;
+static SDL_AudioSpec     g_sdlInSpec;
+static SDL_AudioSpec     g_sdlOutSpec;
+static const int         ZFM_ANDROID_MAX_QUEUE_MS = 250;
+
+static inline void AndroidFlushMicQueue() {
+    if (g_sdlInDev) SDL_ClearQueuedAudio(g_sdlInDev);
+}
+#endif
+
+static bool audioOutWrite(const int16_t* samples, unsigned long frames) {
+#if !defined(__ANDROID__)
+    if (!g_outputStream || !samples || frames == 0) return false;
+    PaError err = Pa_WriteStream(g_outputStream, samples, frames);
+    static int underflowWarnCount = 0;
+    if (err == paOutputUnderflowed) {
+        if (underflowWarnCount < 5) {
+            LOG_WARN("Warning: output underflow (audio may glitch)\n");
+            underflowWarnCount++;
+        }
+        return true;
+    }
+    if (err != paNoError) {
+        LOG_ERROR("Pa_WriteStream fatal error: %s\n", Pa_GetErrorText(err));
+        return false;
+    }
+    return true;
+#else
+    if (!g_sdlOutDev || !samples || frames == 0) return false;
+    const Uint32 bytes = (Uint32)(frames * (unsigned long)g_channels * sizeof(int16_t));
+    const Uint32 maxQueueBytes = (Uint32)((uint64_t)g_sampleRate * (uint64_t)g_channels * sizeof(int16_t) * (uint64_t)ZFM_ANDROID_MAX_QUEUE_MS / 1000ULL);
+    if (SDL_GetQueuedAudioSize(g_sdlOutDev) > maxQueueBytes) {
+        SDL_ClearQueuedAudio(g_sdlOutDev);
+    }
+    if (SDL_QueueAudio(g_sdlOutDev, samples, bytes) != 0) {
+        LOG_WARN("SDL_QueueAudio failed: %s\n", SDL_GetError());
+        return false;
+    }
+    return true;
+#endif
+}
 
 static bool g_pttUseShell = false;
 static std::string g_pttCmdOn;
@@ -564,9 +635,12 @@ static int          g_cm108Pin    = 0;
 
 extern ClientConfig g_cfg;
 
+std::atomic<bool> g_running(true);
+
 extern std::atomic<float> g_inputGain;
 extern std::atomic<float> g_outputGain;
 
+#if !defined(__ANDROID__)
 #ifdef _WIN32
 #include <opus.h>
 #else
@@ -814,6 +888,7 @@ static void ParseCm108Command(const std::string& cmd, std::string& hiddev, int& 
         pinOut = 3;
     }
 }
+#endif
 
 #define PTT_HAL_IMPLEMENTATION
 #include "ptt_hal.h"
@@ -853,6 +928,14 @@ void pttManagerThreadFunc() {
     }
 }
 
+#if defined(__ANDROID__)
+struct OpusEncoder{}; struct OpusDecoder{};
+static bool initOpus(const ClientConfig&) { return false; }
+static void shutdownOpus() {}
+std::vector<char> encodeOpusFrame(const std::vector<char>&) { return {}; }
+static std::vector<char> decodeOpusFrame(const std::vector<char>&) { return {}; }
+#endif
+
 #pragma pack(push, 1)
 struct WavHeader {
     char riff[4];
@@ -875,6 +958,7 @@ std::vector<int16_t> g_rogerSamples;
 uint32_t g_rogerSampleRate = 0;
 
 bool loadWavMono16(const std::string& path, std::vector<int16_t>& outPcm, uint32_t& outSampleRate) {
+#if !defined(__ANDROID__)
     std::ifstream f(path.c_str(), std::ios::binary);
     if (!f.is_open()) {
         LOG_WARN("Roger WAV open failed: %s\n", path.c_str());
@@ -884,7 +968,7 @@ bool loadWavMono16(const std::string& path, std::vector<int16_t>& outPcm, uint32
     WavHeader h;
     f.read(reinterpret_cast<char*>(&h), sizeof(h));
     if (!f.good()) {
-        LOG_WARN("Failed to read WAV header for roger.wav\n");
+        LOG_WARN("Failed to read WAV header for %s\n", path.c_str());
         return false;
     }
 
@@ -892,12 +976,12 @@ bool loadWavMono16(const std::string& path, std::vector<int16_t>& outPcm, uint32
         std::strncmp(h.wave, "WAVE", 4) != 0 ||
         std::strncmp(h.fmt,  "fmt ", 4)  != 0 ||
         std::strncmp(h.dataId, "data", 4) != 0) {
-        LOG_WARN("Roger.wav is not a simple PCM WAV\n");
+        LOG_WARN("%s is not a simple PCM WAV\n", path.c_str());
         return false;
     }
 
     if (h.audioFormat != 1 || h.numChannels != 1 || h.bitsPerSample != 16) {
-        LOG_WARN("Roger.wav must be PCM, mono, 16-bit\n");
+        LOG_WARN("%s must be PCM, mono, 16-bit\n", path.c_str());
         return false;
     }
 
@@ -906,10 +990,65 @@ bool loadWavMono16(const std::string& path, std::vector<int16_t>& outPcm, uint32
     outPcm.resize(numSamples);
     f.read(reinterpret_cast<char*>(outPcm.data()), h.dataSize);
     if (!f.good()) {
-        LOG_WARN("Failed to read roger.wav samples\n");
+        LOG_WARN("Failed to read %s samples\n", path.c_str());
         return false;
     }
     return true;
+#else
+    (void)outSampleRate;
+
+    SDL_AudioSpec srcSpec;
+    Uint8* srcBuf = nullptr;
+    Uint32 srcLen = 0;
+
+	SDL_RWops* rw = SDL_RWFromFile(path.c_str(), "rb");
+	if (!rw) SDL_Log("SDL_RWFromFile roger.wav failed: %s", SDL_GetError());
+
+    if (!SDL_LoadWAV_RW(rw, 1, &srcSpec, &srcBuf, &srcLen)) {
+        LOG_WARN("Roger WAV open failed (SDL_LoadWAV_RW): %s (%s)\n", path.c_str(), SDL_GetError());
+        return false;
+    }
+
+    SDL_AudioSpec dstSpec;
+    SDL_zero(dstSpec);
+
+    dstSpec.freq     = g_sampleRate;
+    dstSpec.format   = AUDIO_S16SYS;
+    dstSpec.channels = 1;
+
+    SDL_AudioCVT cvt;
+    if (SDL_BuildAudioCVT(&cvt,
+                          srcSpec.format, srcSpec.channels, srcSpec.freq,
+                          dstSpec.format, dstSpec.channels, dstSpec.freq) < 0) {
+        LOG_WARN("SDL_BuildAudioCVT failed for %s: %s\n", path.c_str(), SDL_GetError());
+        SDL_FreeWAV(srcBuf);
+        return false;
+    }
+
+    cvt.len = (int)srcLen;
+    cvt.buf = (Uint8*)SDL_malloc((size_t)cvt.len * (size_t)cvt.len_mult);
+    if (!cvt.buf) {
+        LOG_WARN("SDL_malloc failed while loading %s\n", path.c_str());
+        SDL_FreeWAV(srcBuf);
+        return false;
+    }
+    SDL_memcpy(cvt.buf, srcBuf, srcLen);
+    SDL_FreeWAV(srcBuf);
+
+    if (SDL_ConvertAudio(&cvt) < 0) {
+        LOG_WARN("SDL_ConvertAudio failed for %s: %s\n", path.c_str(), SDL_GetError());
+        SDL_free(cvt.buf);
+        return false;
+    }
+
+    const size_t outSamples = (size_t)cvt.len_cvt / sizeof(int16_t);
+    outPcm.resize(outSamples);
+    SDL_memcpy(outPcm.data(), cvt.buf, (size_t)cvt.len_cvt);
+    SDL_free(cvt.buf);
+
+    outSampleRate = (uint32_t)dstSpec.freq;
+    return true;
+#endif
 }
 
 void loadRogerSound(const std::string& path = "roger.wav") {
@@ -954,7 +1093,7 @@ void loadRogerFromConfig()
 }
 
 void playMicFreeSound() {
-    if (g_outputStream && !g_rogerSamples.empty()) {
+    if (!g_rogerSamples.empty()) {
         std::vector<int16_t> out;
         if (g_channels == 1) {
             out = g_rogerSamples;
@@ -967,10 +1106,7 @@ void playMicFreeSound() {
             }
         }
         unsigned long frames = (unsigned long)(out.size() / g_channels);
-        PaError err = Pa_WriteStream(g_outputStream, out.data(), frames);
-        if (err != paNoError && err != paOutputUnderflowed) {
-            LOG_WARN("Failed to play roger.wav: %s\n", Pa_GetErrorText(err));
-        }
+        audioOutWrite(out.data(), frames);
     } else {
         LOG_INFO("[SOUND] Mic is now free!\n");
     }
@@ -1016,6 +1152,7 @@ bool findFirstOutputDevice(PaDeviceIndex& idxOut) {
     return false;
 }
 
+#if !defined(__ANDROID__)
 bool initPortAudio(const ClientConfig& cfg) {
     PaError err = Pa_Initialize();
     if (err != paNoError) {
@@ -1158,8 +1295,53 @@ bool initPortAudio(const ClientConfig& cfg) {
 
     return true;
 }
+#else
+bool initPortAudio(const ClientConfig& cfg) {
+    g_sampleRate      = cfg.sample_rate;
+    g_framesPerBuffer = cfg.frames_per_buffer;
+    g_channels        = cfg.channels;
 
+    g_rxSquelchEnabled  = cfg.rx_squelch_enabled;
+    g_rxSquelchAuto     = cfg.rx_squelch_auto;
+    g_rxSquelchLevel    = cfg.rx_squelch_level;
+    g_rxSquelchVoicePct = cfg.rx_squelch_voice_pct;
+    g_rxSquelchHangMs   = cfg.rx_squelch_hang_ms;
 
+    SDL_AudioSpec want;
+    SDL_zero(want);
+    want.freq     = g_sampleRate;
+    want.format   = AUDIO_S16SYS;
+    want.channels = (Uint8)g_channels;
+    want.samples  = (Uint16)g_framesPerBuffer;
+    want.callback = nullptr;
+
+    SDL_zero(g_sdlOutSpec);
+    g_sdlOutDev = SDL_OpenAudioDevice(nullptr, 0, &want, &g_sdlOutSpec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+    if (!g_sdlOutDev) {
+        LOG_ERROR("SDL_OpenAudioDevice(output) failed: %s\n", SDL_GetError());
+        return false;
+    }
+
+    SDL_zero(g_sdlInSpec);
+    g_sdlInDev = SDL_OpenAudioDevice(nullptr, 1, &want, &g_sdlInSpec, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+    if (!g_sdlInDev) {
+        LOG_ERROR("SDL_OpenAudioDevice(input) failed: %s\n", SDL_GetError());
+        SDL_CloseAudioDevice(g_sdlOutDev); g_sdlOutDev = 0;
+        return false;
+    }
+
+    g_sampleRate = g_sdlOutSpec.freq;
+    g_channels   = g_sdlOutSpec.channels;
+
+    SDL_PauseAudioDevice(g_sdlOutDev, 0);
+    SDL_PauseAudioDevice(g_sdlInDev, 0);
+
+    LOG_OK("Android SDL audio ready: %d Hz, ch=%d, fpb=%lu\n", g_sampleRate, g_channels, g_framesPerBuffer);
+    return true;
+}
+#endif
+
+#if !defined(__ANDROID__)
 void shutdownPortAudio() {
     if (g_inputStream) {
         Pa_StopStream(g_inputStream);
@@ -1173,6 +1355,24 @@ void shutdownPortAudio() {
     }
     Pa_Terminate();
 }
+#else
+void shutdownPortAudio() {
+    std::lock_guard<std::mutex> lk(g_sdlAudioMutex);
+
+    if (g_sdlInDev)  {
+        SDL_PauseAudioDevice(g_sdlInDev, 1);
+        SDL_ClearQueuedAudio(g_sdlInDev);
+        SDL_CloseAudioDevice(g_sdlInDev);
+        g_sdlInDev = 0;
+    }
+    if (g_sdlOutDev) {
+        SDL_PauseAudioDevice(g_sdlOutDev, 1);
+        SDL_ClearQueuedAudio(g_sdlOutDev);
+        SDL_CloseAudioDevice(g_sdlOutDev);
+        g_sdlOutDev = 0;
+    }
+}
+#endif
 
 static void applySoftLimiter(std::vector<int16_t>& samples, float threshold)
 {
@@ -1193,6 +1393,7 @@ static void applySoftLimiter(std::vector<int16_t>& samples, float threshold)
     }
 }
 
+#if !defined(__ANDROID__)
 std::vector<char> captureAudioFrame() {
     std::vector<int16_t> samples(g_framesPerBuffer * g_channels);
     PaError err = Pa_ReadStream(g_inputStream, samples.data(), g_framesPerBuffer);
@@ -1227,6 +1428,51 @@ std::vector<char> captureAudioFrame() {
     std::memcpy(bytes.data(), samples.data(), bytes.size());
     return bytes;
 }
+#else
+std::vector<char> captureAudioFrame() {
+    std::lock_guard<std::mutex> lk(g_sdlAudioMutex);
+
+    const Uint32 bytesNeeded = (Uint32)(g_framesPerBuffer * (unsigned long)g_channels * sizeof(int16_t));
+    if (!g_sdlInDev || bytesNeeded == 0) return {};
+
+    for (int spins = 0; spins < 200; ++spins) {
+        Uint32 have = SDL_GetQueuedAudioSize(g_sdlInDev);
+        if (have >= bytesNeeded) break;
+        SDL_Delay(2);
+        if (!g_running) return {};
+        if (!g_sdlInDev) return {};
+    }
+
+    std::vector<char> bytes(bytesNeeded);
+    Uint32 got = SDL_DequeueAudio(g_sdlInDev, bytes.data(), bytesNeeded);
+    if (got < bytesNeeded) bytes.resize(got);
+    if (got < bytesNeeded) {
+        bytes.resize(got);
+        if (bytes.empty()) return {};
+    }
+
+    size_t sampleCount = bytes.size() / sizeof(int16_t);
+    int16_t* samples = (int16_t*)bytes.data();
+
+    float gain = g_inputGain.load();
+    if (gain != 1.0f) {
+        for (size_t i = 0; i < sampleCount; ++i) {
+            float v = samples[i] * gain;
+            if (v > 32767.0f)  v = 32767.0f;
+            if (v < -32768.0f) v = -32768.0f;
+            samples[i] = (int16_t)v;
+        }
+    }
+
+    if (sampleCount > 0) {
+        std::vector<int16_t> tmp(samples, samples + sampleCount);
+        applySoftLimiter(tmp, 0.9f);
+        std::memcpy(samples, tmp.data(), sampleCount * sizeof(int16_t));
+    }
+
+    return bytes;
+}
+#endif
 
 struct RxVoiceMetrics {
     float rms;
@@ -1361,18 +1607,7 @@ void playAudioFrame(const std::vector<char>& frame) {
 		g_lastRxAudioTime = std::chrono::steady_clock::now();
 	}
 
-	PaError err = Pa_WriteStream(g_outputStream, outSamples.data(), frames);
-
-    static int underflowWarnCount = 0;
-
-    if (err == paOutputUnderflowed) {
-        if (underflowWarnCount < 5) {
-            LOG_WARN("Warning: output underflow (audio may glitch)\n");
-            underflowWarnCount++;
-        }
-    } else if (err != paNoError) {
-        LOG_ERROR("Pa_WriteStream fatal error: %s\n", Pa_GetErrorText(err));
-    }
+	audioOutWrite(outSamples.data(), frames);
 
 #ifdef GUI
     const int16_t* samples = outSamples.data();
@@ -1393,7 +1628,6 @@ void playAudioFrame(const std::vector<char>& frame) {
 #endif
 }
 
-std::atomic<bool> g_running(true);
 std::atomic<bool> g_canTalk(false);
 std::atomic<int>  g_maxTalkMs(0);
 ClientConfig g_cfg;
@@ -2419,6 +2653,9 @@ void doTalkSession(SOCKET sock) {
     } else {
         LOG_INFO(" Press ENTER to stop.\n");
     }
+#if defined(__ANDROID__)
+	AndroidFlushMicQueue();
+#endif
 
     auto start = std::chrono::steady_clock::now();
     std::atomic<bool> stopTalk(false);
@@ -2473,6 +2710,10 @@ void doTalkSession(SOCKET sock) {
     if (!voxMode && stopThread.joinable()) {
         stopThread.join();
     }
+
+#if defined(__ANDROID__)
+	AndroidFlushMicQueue();
+#endif
 
     std::string endCmd = "END_SPEAK\n";
     sendAll(sock, endCmd.data(), endCmd.size());
@@ -2681,7 +2922,8 @@ int main(int argc, char** argv) {
 
 	struct addrinfo hints;
 	std::memset(&hints, 0, sizeof(hints));
-	hints.ai_family   = AF_INET;
+
+	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_STREAM;
 
 	struct addrinfo* res = NULL;

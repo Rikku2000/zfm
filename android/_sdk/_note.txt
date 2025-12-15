@@ -1,0 +1,6 @@
+SDL Stuff
+
+- https://github.com/libsdl-org
+
+SDL2     => SDL2-2.32.6     (https://github.com/libsdl-org/SDL/releases/download/release-2.32.6/SDL2-2.32.6.zip)
+SDL2_ttf => SDL2_ttf-2.24.0 (https://github.com/libsdl-org/SDL_ttf/releases/download/release-2.24.0/SDL2_ttf-2.24.0.zip)

@@ -5,8 +5,13 @@
 #include <ctime>
 #include <cctype>
 
+#if defined(__ANDROID__)
+#include "SDL.h"
+#include "../../SDL2_ttf/SDL_ttf.h"
+#else
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
+#endif
 
 static std::vector<int> g_inputDevices;
 static std::vector<int> g_outputDevices;
@@ -14,6 +19,7 @@ static std::vector<std::string> g_inputDeviceNames;
 static std::vector<std::string> g_outputDeviceNames;
 
 static void BuildPaDeviceLists() {
+#if !defined(__ANDROID__)
     g_inputDevices.clear();
     g_outputDevices.clear();
     g_inputDeviceNames.clear();
@@ -50,6 +56,16 @@ static void BuildPaDeviceLists() {
     }
 
     Pa_Terminate();
+#else
+    g_inputDevices.clear();
+    g_outputDevices.clear();
+    g_inputDeviceNames.clear();
+    g_outputDeviceNames.clear();
+    g_inputDevices.push_back(0);
+    g_outputDevices.push_back(0);
+    g_inputDeviceNames.push_back("Default (Android)");
+    g_outputDeviceNames.push_back("Default (Android)");
+#endif
 }
 
 static SOCKET g_guiSock = INVALID_SOCKET;
@@ -152,7 +168,23 @@ static void GuiStopCore() {
     if (!g_connected) return;
 
     GuiAppendLog("Disconnecting...");
+
+    g_guiPttHeld = false;
+    g_canTalk = false;
     g_running = false;
+
+    for (int i = 0; i < 200; ++i) {
+        if (!g_guiPttThreadRunning.load() && !g_isTalking.load()) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    shutdownPortAudio();
+
+#if defined(__ANDROID__) || defined(__linux__)
+		if (g_guiSock != INVALID_SOCKET) shutdown(g_guiSock, SHUT_RDWR);
+#else
+		if (g_guiSock != INVALID_SOCKET) shutdown(g_guiSock, SD_BOTH);
+#endif
 
     if (g_guiSock != INVALID_SOCKET) {
         closeSocket(g_guiSock);
@@ -161,12 +193,11 @@ static void GuiStopCore() {
     if (g_recvThread.joinable()) g_recvThread.join();
     if (g_voxThread.joinable())  g_voxThread.join();
 
-    shutdownPortAudio();
     shutdownGpioPtt();
     cleanupSockets();
 
     g_connected = false;
-	g_isTalking = false;
+    g_isTalking = false;
 
     GuiAppendLog("Disconnected");
 }
@@ -182,6 +213,7 @@ static bool GuiStartCore() {
         GuiAppendLog("[ERROR] PortAudio init failed");
         return false;
     }
+
 	loadRogerFromConfig();
     if (!initGpioPtt(g_cfg)) {
         GuiAppendLog("GPIO PTT init failed (continuing without)");
@@ -211,8 +243,14 @@ static bool GuiStartCore() {
 
     struct addrinfo hints;
     std::memset(&hints, 0, sizeof(hints));
+
+#if !defined(__ANDROID__)
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
+#else
+	hints.ai_family   = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+#endif
 
     struct addrinfo* res = nullptr;
     std::ostringstream portStr;
@@ -228,12 +266,28 @@ static bool GuiStartCore() {
     }
 
     bool connected = false;
+
+#if !defined(__ANDROID__)
+    for (addrinfo* p = res; p; p = p->ai_next) {
+        sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (sock == INVALID_SOCKET) continue;
+
+        if (connect(sock, p->ai_addr, (int)p->ai_addrlen) == 0) {
+            connected = true;
+            break;
+        }
+
+        closeSocket(sock);
+        sock = INVALID_SOCKET;
+    }
+#else
     for (struct addrinfo* p = res; p != NULL; p = p->ai_next) {
         if (connect(sock, p->ai_addr, (int)p->ai_addrlen) == 0) {
             connected = true;
             break;
         }
     }
+#endif
     freeaddrinfo(res);
 
     if (!connected) {
@@ -415,6 +469,9 @@ static void GuiPushToTalkLoop() {
     auto start = std::chrono::steady_clock::now();
 
     GuiAppendLog("[PTT] You may talk now (hold Talk button)");
+#if defined(__ANDROID__)
+	AndroidFlushMicQueue();
+#endif
 
 	g_currentSpeaker = g_cfg.callsign;
 	g_talkerStart = std::chrono::steady_clock::now();
@@ -485,6 +542,10 @@ static void GuiPushToTalkLoop() {
 			break;
 		}
     }
+
+#if defined(__ANDROID__)
+	AndroidFlushMicQueue();
+#endif
 
     if (g_canTalk) {
         std::string endCmd = "END_SPEAK\n";
@@ -597,7 +658,7 @@ static int g_focusWidget = -1;
 static int g_activeSlider = -1;
 static bool g_mouseDown    = false;
 
-#ifdef MOBILE
+#if defined(__ANDROID__)
 struct OsKey {
     enum Kind { Normal, Backspace, Shift, Space, Enter, Hide, ToggleSym };
 
@@ -679,19 +740,29 @@ static void BuildOnScreenKeyboard(int winW, int winH) {
         }
     };
 
-    static const char* const R1A[] = {"q","w","e","r","t","y","u","i","o","p"};
-    static const char* const R2A[] = {"a","s","d","f","g","h","j","k","l"};
-    static const char* const R3A[] = {"z","x","c","v","b","n","m"};
+	static const char* const R1A[] = {"q","w","e","r","t","y","u","i","o","p"};
+	static const char* const R2A[] = {"a","s","d","f","g","h","j","k","l"};
+	static const char* const R3A[] = {"z","x","c","v","b","n","m",".","_"};
+
+	static const char* const R1AShift[] = {"Q","W","E","R","T","Y","U","I","O","P"};
+	static const char* const R2AShift[] = {"A","S","D","F","G","H","J","K","L"};
+	static const char* const R3AShift[] = {"Z","X","C","V","B","N","M"};
 
     static const char* const R1S[] = {"1","2","3","4","5","6","7","8","9","0"};
-    static const char* const R2S[] = {"@","#","$","%","&","-","+","(",")"};
-    static const char* const R3S[] = {"*","\"","'",";",":","!","?"};
+    static const char* const R2S[] = {"-","/",":",";","(",")","$","&","@","\""};
+    static const char* const R3S[] = {".",",","?","!","'"};
 
-    std::vector<std::string> r1, r2, r3;
+    std::vector<std::string> r0, r1, r2, r3;
     if (!g_kbSymbols) {
-        PushRow(r1, R1A, (int)(sizeof(R1A)/sizeof(R1A[0])));
-        PushRow(r2, R2A, (int)(sizeof(R2A)/sizeof(R2A[0])));
-        PushRow(r3, R3A, (int)(sizeof(R3A)/sizeof(R3A[0])));
+		if (g_kbShift) {
+			PushRow(r1, R1AShift, (int)(sizeof(R1AShift)/sizeof(R1AShift[0])));
+			PushRow(r2, R2AShift, (int)(sizeof(R2AShift)/sizeof(R2AShift[0])));
+			PushRow(r3, R3AShift, (int)(sizeof(R3AShift)/sizeof(R3AShift[0])));
+		} else {
+			PushRow(r1, R1A, (int)(sizeof(R1A)/sizeof(R1A[0])));
+			PushRow(r2, R2A, (int)(sizeof(R2A)/sizeof(R2A[0])));
+			PushRow(r3, R3A, (int)(sizeof(R3A)/sizeof(R3A[0])));
+		}
     } else {
         PushRow(r1, R1S, (int)(sizeof(R1S)/sizeof(R1S[0])));
         PushRow(r2, R2S, (int)(sizeof(R2S)/sizeof(R2S[0])));
@@ -974,7 +1045,12 @@ static std::string ui_server_ip;
 static std::string ui_server_port;
 static std::string ui_callsign;
 static std::string ui_password;
+
+#if defined(__ANDROID__)
+std::string ui_talkgroup;
+#else
 static std::string ui_talkgroup;
+#endif
 
 std::vector<std::string> g_tgComboItems;
 int ui_tg_index = 0;
@@ -1088,11 +1164,15 @@ static void CfgToUi() {
     if (g_codecItems.empty()) {
         g_codecItems.push_back("PCM (raw)");
         g_codecItems.push_back("ADPCM (22.05 kHz)");
+#if !defined(__ANDROID__)
         g_codecItems.push_back("Opus (48 kHz)");
+#endif
     }
 
     if (g_cfg.use_adpcm)      ui_codec_index = 1;
+#if !defined(__ANDROID__)
     else if (g_cfg.use_opus)  ui_codec_index = 2;
+#endif
     else                      ui_codec_index = 0;
 
     if (ui_codec_index < 0 || ui_codec_index >= (int)g_codecItems.size())
@@ -1516,7 +1596,16 @@ static int       g_comboWidget    = -1;
 static SDL_Rect  g_comboPopupRect = {0,0,0,0};
 static int       g_comboHoverItem = -1;
 
+#if defined(__ANDROID__)
+int SDL_main(int argc, char* argv[]) {
+	char* pref = SDL_GetPrefPath("zfm", "client");
+	if (pref) {
+		g_cfgPath = std::string(pref) + "client.json";
+		SDL_free(pref);
+	}
+#else
 int main(int argc, char** argv) {
+#endif
     loadClientConfig(g_cfgPath, g_cfg);
     BuildPaDeviceLists();
 
@@ -1528,7 +1617,11 @@ int main(int argc, char** argv) {
     CfgToUi();
     GuiAppendLog("Welcome to zFM");
 
+#ifdef __ANDROID__
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
+#else
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+#endif
         std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
         return 1;
     }
@@ -1538,11 +1631,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    SDL_Window* window = SDL_CreateWindow("zFM Client",
-                                          SDL_WINDOWPOS_CENTERED,
-                                          SDL_WINDOWPOS_CENTERED,
-                                          460, 700,
-                                          SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+#ifdef __ANDROID__
+	SDL_Window* window = SDL_CreateWindow("zFM Client", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 0, 0, SDL_WINDOW_FULLSCREEN_DESKTOP);
+#else
+	SDL_Window* window = SDL_CreateWindow("zFM Client", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 460, 700, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+#endif
     if (!window) {
         std::cerr << "CreateWindow failed: " << SDL_GetError() << "\n";
         TTF_Quit();
@@ -1550,11 +1643,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+#if defined(__ANDROID__)
+    SDL_StopTextInput();
+    SDL_SetHint(SDL_HINT_ENABLE_SCREEN_KEYBOARD, "0");
+#endif
 
     SDL_SetWindowMinimumSize(window, 460, 700);
 
-    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+#if defined(__ANDROID__)
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+#else
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+#endif
     if (!renderer) {
         std::cerr << "CreateRenderer failed: " << SDL_GetError() << "\n";
         SDL_DestroyWindow(window);
@@ -1562,6 +1662,14 @@ int main(int argc, char** argv) {
         SDL_Quit();
         return 1;
     }
+
+#if defined(__ANDROID__)
+	constexpr int BASE_W = 460;
+	constexpr int BASE_H = 818;
+
+	SDL_RenderSetLogicalSize(renderer, BASE_W, BASE_H);
+	SDL_RenderSetIntegerScale(renderer, SDL_FALSE);
+#endif
 
     const char* fontPath = "opensans-regular.ttf";
 	TTF_Font* fontTiny = TTF_OpenFont(fontPath, 12);
@@ -1578,7 +1686,12 @@ int main(int argc, char** argv) {
 
 
     int w, h;
-    SDL_GetWindowSize(window, &w, &h);
+#ifdef __ANDROID__
+	w = BASE_W;
+	h = BASE_H;
+#else
+	SDL_GetWindowSize(window, &w, &h);
+#endif
 
     SDL_Rect rcTabBar, rcTabMain, rcTabAudio, rcTabGpio, rcTabRadio, rcTabLog;
     SDL_Rect rcLogCard, rcLogInner;
@@ -1598,11 +1711,15 @@ int main(int argc, char** argv) {
     bool fullscreen = false;
 
     auto RebuildUI = [&](int newW, int newH) {
-        if (newW < 460) newW = 460;
-        if (newH < 700) newH = 700;
-
-        SDL_SetWindowSize(window, newW, newH);
-        SDL_GetWindowSize(window, &w, &h);
+#ifdef __ANDROID__
+		w = BASE_W;
+		h = BASE_H;
+#else
+		if (newW < 460) newW = 460;
+		if (newH < 700) newH = 700;
+		SDL_SetWindowSize(window, newW, newH);
+		SDL_GetWindowSize(window, &w, &h);
+#endif
 
         g_comboOpen = false;
         g_comboWidget = -1;
@@ -1721,17 +1838,16 @@ int main(int argc, char** argv) {
 		AddLabel(2, xLabel, y, "PTT Hold (ms)");
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_gpio_hold_ms); y += 34;
 
-		
-AddLabel(2, xLabel, y, "PTT Method");
-AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_method, &ui_ptt_method_index, &g_pttMethodItems); y += 34;
+		AddLabel(2, xLabel, y, "PTT Method");
+		AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_method, &ui_ptt_method_index, &g_pttMethodItems); y += 34;
 
-AddLabel(2, xLabel, y, "Serial Port");
-AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_serial_port); y += 34;
+		AddLabel(2, xLabel, y, "Serial Port");
+		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_serial_port); y += 34;
 
-AddLabel(2, xLabel, y, "Serial Line");
-AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_serial_line_text, &ui_serial_line_index, &g_serialLineItems); y += 34;
+		AddLabel(2, xLabel, y, "Serial Line");
+		AddCombo(2, xCtrl, y - 2, w - xCtrl - 20, &ui_serial_line_text, &ui_serial_line_index, &g_serialLineItems); y += 34;
 
-AddCheck(2, xLabel, y, "Serial Invert (ACTIVE_LOW)", &ui_serial_invert); y += 34;AddLabel(2, xLabel, y, "PTT cmd ON");
+		AddCheck(2, xLabel, y, "Serial Invert (ACTIVE_LOW)", &ui_serial_invert); y += 34;AddLabel(2, xLabel, y, "PTT cmd ON");
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_cmd_on); y += 34;
 
 		AddLabel(2, xLabel, y, "PTT cmd OFF");
@@ -1798,9 +1914,7 @@ AddCheck(2, xLabel, y, "Serial Invert (ACTIVE_LOW)", &ui_serial_invert); y += 34
 	id_btnClearLog = AddButton(4, 20, rcLogCard.h + 16, 80, 30, "Clear Log");
 	id_btnSaveLog = AddButton(4, w - 100, rcLogCard.h + 16, 80, 30, "Save Log");
 
-
-
-#ifdef MOBILE
+#if defined(__ANDROID__)
         if (g_kbVisible) BuildOnScreenKeyboard(w, h);
 #endif
     };
@@ -1858,7 +1972,7 @@ AddCheck(2, xLabel, y, "Serial Invert (ACTIVE_LOW)", &ui_serial_invert); y += 34
 				int my = ev.button.y;
 				SDL_Point pt = { mx, my };
 
-#ifdef MOBILE
+#if defined(__ANDROID__)
 				if (g_kbVisible) {
 					if (HandleOnScreenKeyboardClick(mx, my)) {
 						continue;
@@ -1948,7 +2062,7 @@ AddCheck(2, xLabel, y, "Serial Invert (ACTIVE_LOW)", &ui_serial_invert); y += 34
 						wdg.focused = true;
 						g_focusWidget = i;
 
-#ifdef MOBILE
+#if defined(__ANDROID__)
 						g_kbVisible = true;
 						g_kbTargetEdit = i;
 						BuildOnScreenKeyboard(w, h);
@@ -2077,7 +2191,7 @@ AddCheck(2, xLabel, y, "Serial Invert (ACTIVE_LOW)", &ui_serial_invert); y += 34
 					}
 				}
 
-#ifdef MOBILE
+#if defined(__ANDROID__)
 				if (g_kbVisible) {
 					bool clickedFocusedEdit = false;
 					if (g_focusWidget >= 0 && g_focusWidget < (int)g_widgets.size()) {
@@ -2314,7 +2428,7 @@ AddCheck(2, xLabel, y, "Serial Invert (ACTIVE_LOW)", &ui_serial_invert); y += 34
         }
 
         RenderWidgets(renderer, font);
-#ifdef MOBILE
+#if defined(__ANDROID__)
 		DrawOnScreenKeyboard(renderer, font, w, h);
 #endif
 
