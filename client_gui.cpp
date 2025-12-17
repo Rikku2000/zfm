@@ -226,11 +226,11 @@ static bool GuiStartCore() {
     g_running = true;
     g_canTalk = false;
 
-    if (g_cfg.mode == "parrot") {
-        g_connected = true;
-        GuiAppendLog("Parrot mode active (no server connection).");
-        return true;
-    }
+	if (g_cfg.mode == "parrot") {
+		g_connected = true;
+		GuiAppendLog("Parrot mode active (no server connection).");
+		return true;
+	}
 
     initSockets();
     SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -1821,7 +1821,6 @@ int main(int argc, char** argv) {
 
     int id_btnLoad1 = -1, id_btnSave1 = -1, id_btnLoad2 = -1, id_btnSave2 = -1, id_btnLoad3 = -1, id_btnSave3 = -1;
     int id_txButton = -1;
-    int id_parrotBtn = -1;
     int id_btnConnect = -1;
     int id_cmdEdit = -1;
     int id_sendBtn = -1;
@@ -1849,7 +1848,7 @@ int main(int argc, char** argv) {
         g_mouseDown = false;
 
         id_btnLoad1 = id_btnSave1 = id_btnLoad2 = id_btnSave2 = id_btnLoad3 = id_btnSave3 = -1;
-        id_txButton = id_parrotBtn = id_btnConnect = id_cmdEdit = id_sendBtn = -1;
+        id_txButton = id_btnConnect = id_cmdEdit = id_sendBtn = -1;
         id_btnClearLog = id_btnSaveLog = -1;
 
     g_widgets.clear();
@@ -2015,8 +2014,7 @@ int main(int argc, char** argv) {
 	id_txButton = AddButton(-1, rcTxBtnRect.x, rcTxBtnRect.y + 4,
 								rcTxBtnRect.w, rcTxBtnRect.h, "TALK");
 
-	id_parrotBtn = AddButton(-1, 16,  row2Y, 200, 30, "Parrot");
-	id_btnConnect = AddButton(-1, w - 216, row2Y, 200, 30, "Connect");
+	id_btnConnect = AddButton(-1, 16, row2Y, w - 32, 30, "Connect");
 
 	int cmdX         = 16;
 	int sendWidth    = 72;
@@ -2254,8 +2252,6 @@ int main(int argc, char** argv) {
 									g_guiPttHeld = true;
 								}
 							}
-						} else if (i == id_parrotBtn) {
-							GuiHandleCommand("/talk");
 						} else if (i == id_sendBtn) {
 							GuiHandleCommand(ui_cmd);
 						} else if (i == id_btnConnect) {

@@ -2936,23 +2936,24 @@ static inline void FlushAudioOutput()
 #endif
 }
 
-void doParrotSession(bool usePtt) {
+void doParrotSession(bool usePtt)
+{
     const bool voxMode = g_cfg.vox_enabled;
 
-    std::cout << "Parrot test: recording mic, then replaying.\n";
-    if (voxMode) {
-        std::cout << "VOX is ENABLED (threshold=" << g_cfg.vox_threshold
-                  << "). Talk to record; staying silent will automatically stop and start playback.\n";
-    } else {
-        std::cout << "VOX is DISABLED. Press ENTER to stop recording and hear the playback.\n";
-    }
+#ifdef GUI
+    const int maxRecordMs = 3500;
+    const int minRecordMs = 800;
+#else
+    const int maxRecordMs = 0;
+    const int minRecordMs = 0;
+#endif
 
     if (usePtt) {
         setPtt(true);
 #ifdef GUI
-		g_currentSpeaker = g_cfg.callsign;
-		g_talkerStart = std::chrono::steady_clock::now();
-		g_talkerActive = true;
+        g_currentSpeaker = g_cfg.callsign;
+        g_talkerStart = std::chrono::steady_clock::now();
+        g_talkerActive = true;
 #endif
     }
 
@@ -2961,64 +2962,82 @@ void doParrotSession(bool usePtt) {
     bool hadVoice      = false;
 
     std::vector<std::vector<char>> recordedFrames;
+    recordedFrames.reserve(400);
 
-    if (voxMode) {
-        while (true) {
-            std::vector<char> frame = captureAudioFrame();
-            if (frame.empty()) {
-                continue;
-            }
-			UpdateTxMicLevelFromFrame(frame);
+    auto tStart = std::chrono::steady_clock::now();
 
-            bool above = frameAboveVoxThreshold(frame, g_cfg.vox_threshold);
-
-            if (above) {
-                hadVoice = true;
-                silenceFrames = 0;
-                recordedFrames.push_back(std::move(frame));
-            } else {
-                if (hadVoice) {
-                    ++silenceFrames;
-                    if (silenceFrames >= silenceFramesNeeded) {
-                        std::cout << "[PARROT] VOX: silence detected, stopping recording.\n";
-                        break;
-                    }
-                }
-            }
-        }
-    } else {
-        std::atomic<bool> stop(false);
-        std::thread stopThread([&]() {
+#ifndef GUI
+    std::atomic<bool> stop(false);
+    std::thread stopThread;
+    if (!voxMode) {
+        stopThread = std::thread([&]() {
             std::string s;
             std::getline(std::cin, s);
             stop = true;
         });
+    }
+#endif
 
-        while (!stop) {
-            std::vector<char> frame = captureAudioFrame();
-            if (frame.empty()) {
-                continue;
+    while (g_running) {
+        if (maxRecordMs > 0) {
+            auto now = std::chrono::steady_clock::now();
+            int elapsed = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - tStart).count();
+            if (elapsed >= maxRecordMs) break;
+        }
+
+#ifndef GUI
+        if (!voxMode && stop.load()) break;
+#endif
+
+        std::vector<char> frame = captureAudioFrame();
+        if (frame.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+        UpdateTxMicLevelFromFrame(frame);
+        recordedFrames.push_back(frame);
+
+        if (voxMode) {
+            bool above = frameAboveVoxThreshold(frame, g_cfg.vox_threshold);
+            if (above) {
+                hadVoice = true;
+                silenceFrames = 0;
+            } else if (hadVoice) {
+                ++silenceFrames;
+                auto now = std::chrono::steady_clock::now();
+                int elapsed = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - tStart).count();
+                if (silenceFrames >= silenceFramesNeeded && elapsed >= minRecordMs) break;
             }
-			UpdateTxMicLevelFromFrame(frame);
-            recordedFrames.push_back(std::move(frame));
-        }
-
-        if (stopThread.joinable()) {
-            stopThread.join();
         }
     }
 
-    if (usePtt) {
-        setPtt(false);
-    }
+#ifndef GUI
+    if (!voxMode && stopThread.joinable()) stopThread.join();
+#endif
+
+    if (usePtt) setPtt(false);
+
+#ifdef GUI
+    g_talkerActive = false;
+    g_audioLevel = 0.0f;
+#endif
 
     if (recordedFrames.empty()) {
         std::cout << "Parrot: nothing recorded.\n";
-        std::cout << "Parrot session ended.\n";
         return;
     }
 
-	FlushAudioOutput();
+    const bool savedSqEn   = g_rxSquelchEnabled.load();
+    const bool savedSqAuto = g_rxSquelchAuto.load();
+    const int  savedSqLvl  = g_rxSquelchLevel.load();
+    const int  savedSqVPct = g_rxSquelchVoicePct.load();
+    const int  savedSqHang = g_rxSquelchHangMs.load();
+
+    g_rxSquelchEnabled = false;
+    g_rxSquelchAuto    = false;
+
+    FlushAudioOutput();
 
 #ifdef GUI
     g_currentSpeaker = "PARROT";
@@ -3026,19 +3045,49 @@ void doParrotSession(bool usePtt) {
     g_talkerActive = true;
 #endif
 
-    for (auto &f : recordedFrames) {
-        playAudioFrame(f);
+    for (const auto& f : recordedFrames) {
+        if (f.empty()) continue;
+
+        size_t sampleCount = f.size() / sizeof(int16_t);
+        unsigned long frames = (unsigned long)(sampleCount / (size_t)g_channels);
+        if (frames == 0) continue;
+
+        const int16_t* inSamples = reinterpret_cast<const int16_t*>(f.data());
+
+        float gain = g_outputGain.load();
+        std::vector<int16_t> outSamples(sampleCount);
+
+        if (gain == 1.0f) {
+            std::memcpy(outSamples.data(), inSamples, sampleCount * sizeof(int16_t));
+        } else {
+            for (size_t i = 0; i < sampleCount; ++i) {
+                float v = inSamples[i] * gain;
+                if (v > 32767.0f)  v = 32767.0f;
+                if (v < -32768.0f) v = -32768.0f;
+                outSamples[i] = (int16_t)v;
+            }
+        }
+
+        if (!outSamples.empty()) {
+            applySoftLimiter(outSamples, 0.95f);
+        }
+
+        audioOutWriteBlockingChunked(outSamples.data(), frames);
     }
 
 #ifdef GUI
     g_talkerActive = false;
     g_audioLevel = 0.0f;
-
-    if (g_currentSpeaker == "PARROT")
-        g_currentSpeaker.clear();
+    if (g_currentSpeaker == "PARROT") g_currentSpeaker.clear();
 #endif
 
-    std::cout << "Parrot session ended.\n";
+    g_rxSquelchEnabled  = savedSqEn;
+    g_rxSquelchAuto     = savedSqAuto;
+    g_rxSquelchLevel    = savedSqLvl;
+    g_rxSquelchVoicePct = savedSqVPct;
+    g_rxSquelchHangMs   = savedSqHang;
+
+    std::cout << "Parrot done.\n";
 }
 
 void parrotLoop(const ClientConfig& cfg) {
