@@ -178,6 +178,7 @@ static void GuiStopCore() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+	stopAdpcmPlayoutThread();
     shutdownPortAudio();
 
 #if defined(__ANDROID__) || defined(__linux__)
@@ -527,6 +528,12 @@ static void GuiPushToTalkLoop() {
 			audioCmd = "AUDIO";
 		}
 
+        if (payload.size() > ZFM_MAX_TX_PAYLOAD) {
+            GuiAppendLog("[ERROR] Refusing to send huge audio payload: " + std::to_string(payload.size()));
+            g_running = false;
+            break;
+        }
+
 		std::ostringstream oss;
 		oss << audioCmd << " " << payload.size() << "\n";
 		std::string header = oss.str();
@@ -620,6 +627,109 @@ static void DrawTextCentered(SDL_Renderer* r, TTF_Font* font, const std::string&
     int x = rc.x + (rc.w - tw) / 2;
     int y = rc.y + (rc.h - th) / 2;
     DrawText(r, font, text, x, y, col);
+}
+
+int GetTextWidth(TTF_Font* font, const char* text)
+{
+    int w = 0, h = 0;
+    if (TTF_SizeUTF8(font, text, &w, &h) == 0)
+        return w;
+    return 0;
+}
+
+static bool ShowSplashScreen(SDL_Window* window,
+                            SDL_Renderer* renderer,
+                            TTF_Font* font,
+                            const char* bmpPath,
+                            int durationMs)
+{
+    if (!window || !renderer || !font || !bmpPath || durationMs <= 0) return true;
+
+    SDL_Surface* surf = SDL_LoadBMP(bmpPath);
+    if (!surf) {
+        std::cerr << "[WARN] Splash: failed to load '" << bmpPath << "': " << SDL_GetError() << "\n";
+        return true;
+    }
+    SDL_Texture* tex = SDL_CreateTextureFromSurface(renderer, surf);
+    const int imgW = surf->w;
+    const int imgH = surf->h;
+    SDL_FreeSurface(surf);
+    if (!tex) {
+        std::cerr << "[WARN] Splash: failed to create texture: " << SDL_GetError() << "\n";
+        return true;
+    }
+
+    int outW = 0, outH = 0;
+    if (SDL_GetRendererOutputSize(renderer, &outW, &outH) != 0) {
+        SDL_GetWindowSize(window, &outW, &outH);
+    }
+    if (outW <= 0) outW = 460;
+    if (outH <= 0) outH = 700;
+
+    const Uint32 start = SDL_GetTicks();
+    bool running = true;
+    while (running) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                running = false;
+                break;
+            }
+        }
+
+        Uint32 now = SDL_GetTicks();
+        int elapsed = (int)(now - start);
+        if (elapsed >= durationMs) break;
+
+        float t = (float)elapsed / (float)durationMs;
+        if (t < 0.f) t = 0.f;
+        if (t > 1.f) t = 1.f;
+
+        SDL_SetRenderDrawColor(renderer, COL_BG.r, COL_BG.g, COL_BG.b, COL_BG.a);
+        SDL_RenderClear(renderer);
+
+        const int padX = 28;
+        const int padTop = 28;
+        const int padBottom = 90;
+        int maxW = outW - padX * 2;
+        int maxH = outH - padTop - padBottom;
+        if (maxW < 10) maxW = 10;
+        if (maxH < 10) maxH = 10;
+
+        float sx = (float)maxW / (float)imgW;
+        float sy = (float)maxH / (float)imgH;
+        float s = (sx < sy) ? sx : sy;
+        if (s > 1.f) s = 1.f;
+        int drawW = static_cast<int>(imgW * s + 0.5f);
+        int drawH = static_cast<int>(imgH * s + 0.5f);
+        SDL_Rect dst = { (outW - drawW) / 2, padTop + (maxH - drawH) / 2, drawW, drawH };
+        SDL_RenderCopy(renderer, tex, nullptr, &dst);
+
+		const char* loadingText = "programmed by 13MAD86";
+		int textW = GetTextWidth(font, loadingText);
+
+		int textX = (outW - textW) / 2;
+		int textY = outH - 70;
+
+		DrawText(renderer, font, loadingText, textX, textY, COL_TEXT_MUT);
+
+        const int barW = static_cast<int>(outW * 0.72 + 0.5f);
+        const int barH = 14;
+        SDL_Rect barOuter = { (outW - barW) / 2, outH - 46, barW, barH };
+        SDL_Rect barInner = { barOuter.x + 2, barOuter.y + 2, barOuter.w - 4, barOuter.h - 4 };
+        SDL_Rect barFill  = { barInner.x, barInner.y, static_cast<int>(barInner.w * t + 0.5f), barInner.h };
+
+        DrawRect(renderer, barOuter, COL_PANEL);
+        DrawRectBorder(renderer, barOuter, COL_PANEL_BD, 1);
+        DrawRect(renderer, barInner, COL_INPUT_BG);
+        DrawRect(renderer, barFill, COL_FOCUS_BD);
+
+        SDL_RenderPresent(renderer);
+        SDL_Delay(16);
+    }
+
+    SDL_DestroyTexture(tex);
+    return running;
 }
 
 enum WidgetType {
@@ -1684,6 +1794,16 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (!ShowSplashScreen(window, renderer, font, "splash.bmp", 1000)) {
+        if (fontBig)  TTF_CloseFont(fontBig);
+        if (font)     TTF_CloseFont(font);
+        if (fontTiny) TTF_CloseFont(fontTiny);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        TTF_Quit();
+        SDL_Quit();
+        return 0;
+    }
 
     int w, h;
 #ifdef __ANDROID__

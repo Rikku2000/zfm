@@ -212,14 +212,25 @@ bool recvAll(SOCKET sock, void* data, size_t len) {
     return true;
 }
 
+static const size_t MAX_LINE_LEN = 4096;
+
 bool recvLine(SOCKET sock, std::string& line) {
     line.clear();
+    line.reserve(128);
+
     char c;
     while (true) {
         int r = recv(sock, &c, 1, 0);
         if (r <= 0) return false;
+
         if (c == '\n') break;
-        if (c != '\r') line.push_back(c);
+
+        if (c != '\r') {
+            if (line.size() >= MAX_LINE_LEN) {
+                return false;
+            }
+            line.push_back(c);
+        }
     }
     return true;
 }
@@ -1344,6 +1355,71 @@ static void clearTalkgroupSpeakerIfMatches(const std::string& tg, const std::str
 
 static bool startsWith(const std::string& s, const std::string& p);
 
+static const size_t MAX_HTTP_REQ_LINE = 2048;
+static const size_t MAX_HTTP_REL_PATH = 512;
+
+static const size_t MAX_PEER_AUDIO_BYTES   = 4096 * 4;
+static const size_t MAX_CLIENT_AUDIO_BYTES = 4096 * 4;
+
+static inline std::string stripQueryAndFragment(const std::string& p) {
+    size_t q = p.find('?');
+    size_t h = p.find('#');
+    size_t cut = std::min(q == std::string::npos ? p.size() : q,
+                          h == std::string::npos ? p.size() : h);
+    return p.substr(0, cut);
+}
+
+static bool sanitizeHttpRelPath(const std::string& rawPath, std::string& outRel) {
+    outRel.clear();
+
+    std::string path = stripQueryAndFragment(rawPath);
+
+    if (path.empty() || path[0] != '/') return false;
+
+    if (path == "/") path = "/index.html";
+
+    std::string rel = path.substr(1);
+
+    if (rel.empty()) rel = "index.html";
+    if (rel.size() > MAX_HTTP_REL_PATH) return false;
+
+    if (rel.find('\\') != std::string::npos) return false;
+    if (rel.find(':')  != std::string::npos) return false;
+    if (rel.find('\0') != std::string::npos) return false;
+
+    if (rel == "..") return false;
+    if (rel.size() >= 3 && rel.compare(0, 3, "../") == 0) return false;
+    if (rel.size() >= 3 && rel.compare(rel.size() - 3, 3, "/..") == 0) return false;
+    if (rel.find("/../") != std::string::npos) return false;
+
+    if (rel.find("//") != std::string::npos) return false;
+
+    outRel = rel;
+    return true;
+}
+
+static void collectTalkgroupSockets(const std::string& tg,
+                                    SOCKET exceptSock,
+                                    std::vector<SOCKET>& out)
+{
+    out.clear();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    out.reserve(g_clients.size());
+
+    for (const auto& kv : g_clients) {
+        SOCKET cs = kv.first;
+        if (cs == exceptSock) continue;
+
+        const ClientInfo& ci = kv.second;
+
+        if (!ci.authenticated) continue;
+
+        if (ci.talkgroup == tg) {
+            out.push_back(cs);
+        }
+    }
+}
+
 static void handlePeerLine(PeerConn* pc, const std::string& line)
 {
     std::istringstream iss(line);
@@ -1370,34 +1446,47 @@ static void handlePeerLine(PeerConn* pc, const std::string& line)
         return;
     }
 
-    if (cmd == "PEER_AUD") {
-        std::string bridgeId, tg;
-        int hop = 0;
-        size_t bytes = 0;
-        iss >> bridgeId >> hop >> tg >> bytes;
-        if (bridgeId.empty() || tg.empty() || bytes == 0) return;
-        if (seenBridgeRecently(bridgeId) && hop > 0) return;
+	if (cmd == "PEER_AUD") {
+		std::string bridgeId, tg;
+		int hop = 0;
+		size_t bytes = 0;
+		iss >> bridgeId >> hop >> tg >> bytes;
 
-        std::vector<char> pcm(bytes);
-        if (!recvAll(pc->sock, pcm.data(), bytes)) { pc->running = false; return; }
+		if (bridgeId.empty() || tg.empty() || bytes == 0) return;
 
-        int newHop = hop + 1;
-        if (newHop > PEER_HOP_MAX) newHop = PEER_HOP_MAX;
+		if (bytes > MAX_PEER_AUDIO_BYTES) {
+			LOG_WARN("PEER_AUD drop: too large (%zu bytes) from %s\n",
+					 bytes, pc ? pc->peerName.c_str() : "peer");
+			pc->running = false;
+			return;
+		}
 
-        std::string who;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            who = g_talkgroups[tg].activeSpeaker;
-            if (who.empty()) who = pc->peerName + ":remote";
-            g_talkgroups[tg].lastAudio = std::chrono::steady_clock::now();
-        }
+		if (seenBridgeRecently(bridgeId) && hop > 0) return;
 
-        broadcastAudioToLinkedTalkgroups(tg, who, pcm, INVALID_SOCKET);
-        if (hop < PEER_HOP_MAX) {
-            peerForwardAudio(tg, pcm, bridgeId, hop + 1);
-        }
-        return;
-    }
+		std::vector<char> pcm(bytes);
+		if (!recvAll(pc->sock, pcm.data(), bytes)) {
+			pc->running = false;
+			return;
+		}
+
+		int newHop = hop + 1;
+		if (newHop > PEER_HOP_MAX) newHop = PEER_HOP_MAX;
+
+		std::string who;
+		{
+			std::lock_guard<std::mutex> lock(g_mutex);
+			who = g_talkgroups[tg].activeSpeaker;
+			if (who.empty()) who = pc->peerName + ":remote";
+			g_talkgroups[tg].lastAudio = std::chrono::steady_clock::now();
+		}
+
+		broadcastAudioToLinkedTalkgroups(tg, who, pcm, INVALID_SOCKET);
+
+		if (hop < PEER_HOP_MAX) {
+			peerForwardAudio(tg, pcm, bridgeId, hop + 1);
+		}
+		return;
+	}
 
     if (cmd == "PEER_END") {
         std::string bridgeId, tg;
@@ -1738,6 +1827,43 @@ bool isRxOnlyTalkgroup(const std::string& tg) {
     return false;
 }
 
+
+static inline std::string baseCallsignFromSpeaker(const std::string& spk)
+{
+    size_t p = spk.rfind(':');
+    if (p == std::string::npos) return spk;
+    return spk.substr(p + 1);
+}
+
+static inline int computeUserRank(const std::string& callsign)
+{
+    auto it = g_users.find(callsign);
+    if (it == g_users.end()) return 0;
+    const User& u = it->second;
+    return (int)u.role * 1000 + u.priority;
+}
+
+static inline bool userCanSpeakNow(const std::string& callsign, const std::string& tg, std::string& denyReason)
+{
+    denyReason.clear();
+
+    auto uit = g_users.find(callsign);
+    if (uit == g_users.end()) { denyReason = "unknown_user"; return false; }
+
+    if (uit->second.banned) { denyReason = "banned"; return false; }
+    if (uit->second.muted)  { denyReason = "muted";  return false; }
+
+    if (tg.empty()) { denyReason = "no_tg"; return false; }
+    if (isRxOnlyTalkgroup(tg)) { denyReason = "rx_only_tg"; return false; }
+
+    if (uit->second.talkgroups.find(tg) == uit->second.talkgroups.end()) {
+        denyReason = "not_in_talkgroup";
+        return false;
+    }
+
+    return true;
+}
+
 static size_t curlWriteCb(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t total = size * nmemb;
     std::string* s = reinterpret_cast<std::string*>(userp);
@@ -1901,14 +2027,29 @@ std::vector<std::string> buildWeatherSegmentKeys(const WeatherData& wd) {
     return keys;
 }
 
-void broadcastToTalkgroup(const std::string& tg, const std::string& message, SOCKET exceptSock = INVALID_SOCKET) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    std::unordered_map<SOCKET, ClientInfo>::iterator it;
-    for (it = g_clients.begin(); it != g_clients.end(); ++it) {
-        const ClientInfo& ci = it->second;
-        if (ci.talkgroup == tg && it->first != exceptSock) {
-            sendAll(it->first, message.c_str(), message.size());
+void broadcastToTalkgroup(const std::string& tg,
+                          const std::string& message,
+                          SOCKET exceptSock = INVALID_SOCKET)
+{
+    std::vector<SOCKET> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        targets.reserve(g_clients.size());
+
+        for (const auto& kv : g_clients) {
+            SOCKET cs = kv.first;
+            if (cs == exceptSock) continue;
+
+            const ClientInfo& ci = kv.second;
+            if (!ci.authenticated) continue;
+            if (ci.talkgroup != tg) continue;
+
+            targets.push_back(cs);
         }
+    }
+
+    for (SOCKET cs : targets) {
+        sendAll(cs, message.c_str(), message.size());
     }
 }
 
@@ -2441,43 +2582,83 @@ static void sendHttpResponse(SOCKET s,
     }
 }
 
+static const size_t MAX_HTTP_LINE = 4096;
+static const size_t MAX_HTTP_PATH = 512;
+
+static bool readHttpLine(SOCKET s, std::string& out) {
+    out.clear();
+    out.reserve(256);
+
+    char c = 0;
+    while (true) {
+        int r = recv(s, &c, 1, 0);
+        if (r <= 0) return false;
+
+        if (c == '\n') break;
+        if (c != '\r') {
+            if (out.size() >= MAX_HTTP_LINE) return false;
+            out.push_back(c);
+        }
+    }
+    return true;
+}
+
+static bool isSafeRelPath(const std::string& rel) {
+    if (rel.empty()) return true;
+    if (rel.size() > MAX_HTTP_PATH) return false;
+    if (rel.find('\\') != std::string::npos) return false;
+    if (rel.find(':')  != std::string::npos) return false;
+    if (rel.find('\0') != std::string::npos) return false;
+    if (rel == "..") return false;
+    if (rel.rfind("../", 0) == 0) return false;
+    if (rel.size() >= 3 && rel.compare(rel.size()-3, 3, "/..") == 0) return false;
+    if (rel.find("/../") != std::string::npos) return false;
+    return true;
+}
+
 static void handleHttpClient(SOCKET s) {
-    char buf[2048];
-    int n = recv(s, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) {
-        closeSocket(s);
-        return;
-    }
-    buf[n] = 0;
-    std::string req(buf);
-
-    size_t lineEnd = req.find("\r\n");
-    if (lineEnd == std::string::npos) lineEnd = req.find('\n');
-    if (lineEnd == std::string::npos) {
+    std::string line;
+    if (!readHttpLine(s, line)) {
         closeSocket(s);
         return;
     }
 
-    std::string line = req.substr(0, lineEnd);
+    for (;;) {
+        std::string h;
+        if (!readHttpLine(s, h)) break;
+        if (h.empty()) break;
+    }
+
     std::istringstream iss(line);
     std::string method, url, ver;
     iss >> method >> url >> ver;
 
     if (method != "GET") {
-        std::string body = "Method Not Allowed";
-        sendHttpResponse(s, "HTTP/1.1 405 Method Not Allowed", "text/plain", body);
+        sendHttpResponse(s, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed");
         closeSocket(s);
         return;
     }
 
     if (url.empty()) url = "/";
 
-    if (url.rfind("/api/waveform", 0) == 0) {
+    std::string pathOnly = url;
+    size_t qpos = pathOnly.find('?');
+    if (qpos != std::string::npos) pathOnly = pathOnly.substr(0, qpos);
+
+    if (pathOnly == "/api/status") {
+        std::string json = buildStatusJson();
+        sendHttpResponse(s, "HTTP/1.1 200 OK",
+                         "application/json; charset=utf-8", json);
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly.rfind("/api/waveform", 0) == 0) {
         std::string tg;
 
-        size_t qpos = url.find('?');
-        if (qpos != std::string::npos) {
-            std::string qs = url.substr(qpos + 1);
+        size_t q = url.find('?');
+        if (q != std::string::npos) {
+            std::string qs = url.substr(q + 1);
             const std::string key = "tg=";
             size_t kpos = qs.find(key);
             if (kpos != std::string::npos) {
@@ -2488,7 +2669,7 @@ static void handleHttpClient(SOCKET s) {
         if (tg.empty()) {
             sendHttpResponse(s,
                              "HTTP/1.1 400 Bad Request",
-                             "application/json",
+                             "application/json; charset=utf-8",
                              "{\"error\":\"missing tg param\"}");
             closeSocket(s);
             return;
@@ -2497,13 +2678,11 @@ static void handleHttpClient(SOCKET s) {
         std::vector<int16_t> samples;
         {
             std::lock_guard<std::mutex> lock(g_audioBufMutex);
-            std::map<std::string, std::vector<char> >::const_iterator it =
-                g_tgAudioBuf.find(tg);
+            auto it = g_tgAudioBuf.find(tg);
             if (it != g_tgAudioBuf.end()) {
                 const std::vector<char>& bufPcm = it->second;
                 size_t sampleCount = bufPcm.size() / sizeof(int16_t);
-                const int16_t* pcm =
-                    reinterpret_cast<const int16_t*>(bufPcm.data());
+                const int16_t* pcm = reinterpret_cast<const int16_t*>(bufPcm.data());
 
                 const size_t maxSamples = 256;
                 if (sampleCount > maxSamples) {
@@ -2524,34 +2703,31 @@ static void handleHttpClient(SOCKET s) {
 
         sendHttpResponse(s,
                          "HTTP/1.1 200 OK",
-                         "application/json",
+                         "application/json; charset=utf-8",
                          body.str());
         closeSocket(s);
         return;
     }
 
-    size_t qpos = url.find('?');
-    if (qpos != std::string::npos) {
-        url = url.substr(0, qpos);
-    }
+    std::string rel = pathOnly;
+    if (!rel.empty() && rel[0] == '/') rel.erase(0, 1);
+    if (rel.empty()) rel = "index.html";
 
-    if (url == "/api/status") {
-        std::string json = buildStatusJson();
-        sendHttpResponse(s, "HTTP/1.1 200 OK",
-                         "application/json; charset=utf-8", json);
+    if (!isSafeRelPath(rel)) {
+        sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "text/plain", "Forbidden");
         closeSocket(s);
         return;
     }
 
-    std::string rel = url;
-    if (!rel.empty() && rel[0] == '/') rel.erase(0, 1);
-    if (rel.empty()) rel = "index.html";
-
+#ifdef _WIN32
+    std::string full = g_http_root + "\\" + rel;
+#else
     std::string full = g_http_root + "/" + rel;
+#endif
+
     std::string body;
     if (!loadFileToString(full, body)) {
-        std::string msg = "404 Not Found";
-        sendHttpResponse(s, "HTTP/1.1 404 Not Found", "text/plain", msg);
+        sendHttpResponse(s, "HTTP/1.1 404 Not Found", "text/plain", "404 Not Found");
         closeSocket(s);
         return;
     }
@@ -2628,43 +2804,57 @@ static void flushAudioJitterForTalkgroup(const std::string& tg,const std::string
     if (remaining.empty())
         return;
 
-    std::lock_guard<std::mutex> lock(g_mutex);
     std::ostringstream oss;
     oss << "AUDIO_FROM " << fromUser << " " << remaining.size() << "\n";
     std::string header = oss.str();
 
-    std::unordered_map<SOCKET, ClientInfo>::iterator it;
-    for (it = g_clients.begin(); it != g_clients.end(); ++it) {
-        const ClientInfo& ci = it->second;
-        if (ci.talkgroup == tg && it->first != exceptSock) {
-            if (!sendAll(it->first, header.data(), header.size())) continue;
-            sendAll(it->first, remaining.data(), remaining.size());
-        }
+    std::vector<SOCKET> targets;
+    collectTalkgroupSockets(tg, exceptSock, targets);
+
+    for (SOCKET cs : targets) {
+        if (!sendAll(cs, header.data(), header.size())) continue;
+        sendAll(cs, remaining.data(), remaining.size());
     }
 }
 
-void broadcastAudioToTalkgroup(const std::string& tg, const std::string& fromUser,const std::vector<char>& audio, SOCKET exceptSock) {
-    if (fromUser == "SERVER" || fromUser == "Weather Forecast") {
-        std::lock_guard<std::mutex> lock(g_mutex);
+void broadcastAudioToTalkgroup(const std::string& tg,
+                               const std::string& fromUser,
+                               const std::vector<char>& audio,
+                               SOCKET exceptSock)
+{
+    auto sendPcm = [&](const std::vector<char>& pcm) {
         std::ostringstream oss;
-        oss << "AUDIO_FROM " << fromUser << " " << audio.size() << "\n";
+        oss << "AUDIO_FROM " << fromUser << " " << pcm.size() << "\n";
         std::string header = oss.str();
 
-        std::unordered_map<SOCKET, ClientInfo>::iterator it;
-        for (it = g_clients.begin(); it != g_clients.end(); ++it) {
-            const ClientInfo& ci = it->second;
-            if (ci.talkgroup == tg && it->first != exceptSock) {
-                if (!sendAll(it->first, header.data(), header.size())) continue;
-                sendAll(it->first, audio.data(), audio.size());
+        std::vector<SOCKET> targets;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            targets.reserve(g_clients.size());
+            for (const auto& kv : g_clients) {
+                SOCKET cs = kv.first;
+                if (cs == exceptSock) continue;
+                const ClientInfo& ci = kv.second;
+                if (!ci.authenticated) continue;
+                if (ci.talkgroup != tg) continue;
+                targets.push_back(cs);
             }
         }
 
-		return;
+        for (SOCKET cs : targets) {
+            if (!sendAll(cs, header.data(), header.size())) continue;
+            sendAll(cs, pcm.data(), pcm.size());
+        }
+    };
+
+    if (fromUser == "SERVER" || fromUser == "Weather Forecast" || fromUser == "Weather") {
+        sendPcm(audio);
+        return;
     }
 
-	updateLastHeard(fromUser, tg);
-    const size_t JITTER_TARGET_BYTES = 640;
+    updateLastHeard(fromUser, tg);
 
+    const size_t JITTER_TARGET_BYTES = 640;
     std::vector<char> toSend;
 
     {
@@ -2683,7 +2873,6 @@ void broadcastAudioToTalkgroup(const std::string& tg, const std::string& fromUse
         }
 
         std::vector<char>& buf = g_tgAudioBuf[tg];
-
         buf.insert(buf.end(), audio.begin(), audio.end());
 
         if (buf.size() < JITTER_TARGET_BYTES) {
@@ -2693,18 +2882,8 @@ void broadcastAudioToTalkgroup(const std::string& tg, const std::string& fromUse
         toSend.swap(buf);
     }
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    std::ostringstream oss;
-    oss << "AUDIO_FROM " << fromUser << " " << toSend.size() << "\n";
-    std::string header = oss.str();
-
-    std::unordered_map<SOCKET, ClientInfo>::iterator it;
-    for (it = g_clients.begin(); it != g_clients.end(); ++it) {
-        const ClientInfo& ci = it->second;
-        if (ci.talkgroup == tg && it->first != exceptSock) {
-            if (!sendAll(it->first, header.data(), header.size())) continue;
-            sendAll(it->first, toSend.data(), toSend.size());
-        }
+    if (!toSend.empty()) {
+        sendPcm(toSend);
     }
 }
 
@@ -2716,25 +2895,32 @@ static void broadcastToLinkedTalkgroups(const std::string& tg,const std::string&
 }
 
 static void broadcastAdpcmToTalkgroup(const std::string& tg,
-                                     const std::string& fromUser,
-                                     uint32_t seq,
-                                     uint16_t rate,
-                                     const std::vector<char>& payload,
-                                     SOCKET excludeSock)
+                                      const std::string& fromUser,
+                                      uint32_t seq,
+                                      uint16_t rate,
+                                      const std::vector<char>& payload,
+                                      SOCKET excludeSock)
 {
     std::ostringstream oss;
     oss << "AUDIO_ADPCM_FROM " << fromUser << " " << seq << " " << rate << " " << payload.size() << "\n";
     std::string header = oss.str();
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    for (const auto& kv : g_clients) {
-        SOCKET cs = kv.first;
-        if (cs == excludeSock) continue;
-        const ClientInfo& ci = kv.second;
-        if (!ci.authenticated) continue;
-        if (ci.talkgroup != tg) continue;
+    std::vector<SOCKET> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        targets.reserve(g_clients.size());
+        for (const auto& kv : g_clients) {
+            SOCKET cs = kv.first;
+            if (cs == excludeSock) continue;
+            const ClientInfo& ci = kv.second;
+            if (!ci.authenticated) continue;
+            if (ci.talkgroup != tg) continue;
+            targets.push_back(cs);
+        }
+    }
 
-        sendAll(cs, header.data(), header.size());
+    for (SOCKET cs : targets) {
+        if (!sendAll(cs, header.data(), header.size())) continue;
         if (!payload.empty()) {
             sendAll(cs, payload.data(), payload.size());
         }
@@ -2827,37 +3013,58 @@ SOCKET findClientByCallsign(const std::string& callsign) {
 }
 
 void cleanupClient(SOCKET sock) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    std::unordered_map<SOCKET, ClientInfo>::iterator it = g_clients.find(sock);
-    if (it == g_clients.end()) return;
+    std::string tg;
+    std::string user;
 
-    std::string tg = it->second.talkgroup;
-    std::string user = it->second.callsign;
+    bool speakerCleared = false;
 
-	if (!tg.empty()) {
-		TalkgroupState& ts = g_talkgroups[tg];
-		if (ts.activeSpeaker == user) {
-			ts.activeSpeaker.clear();
-			std::string msg = "MIC_FREE\n";
-			std::unordered_map<SOCKET, ClientInfo>::iterator it2;
-			for (it2 = g_clients.begin(); it2 != g_clients.end(); ++it2) {
-				if (it2->second.talkgroup == tg && it2->first != sock) {
-					sendAll(it2->first, msg.c_str(), msg.size());
-				}
-			}
-		}
+    OpusDecoder* decToDestroy = nullptr;
 
-		triggerAnnouncementForTalkgroup(tg, "tg_leave");
-	}
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
 
-    if (it->second.opusDec && p_opus_decoder_destroy) {
-        p_opus_decoder_destroy(it->second.opusDec);
+        auto it = g_clients.find(sock);
+        if (it == g_clients.end()) return;
+
+        tg   = it->second.talkgroup;
+        user = it->second.callsign;
+
+        if (!tg.empty()) {
+            TalkgroupState& ts = g_talkgroups[tg];
+            if (ts.activeSpeaker == user) {
+                ts.activeSpeaker.clear();
+                speakerCleared = true;
+            }
+        }
+
+        decToDestroy = it->second.opusDec;
         it->second.opusDec = nullptr;
+
+        g_clients.erase(it);
     }
 
-    g_clients.erase(it);
-}
+    if (decToDestroy) {
+#ifdef _WIN32
+        if (p_opus_decoder_destroy) {
+            p_opus_decoder_destroy(decToDestroy);
+        }
+#else
+        opus_decoder_destroy(decToDestroy);
+#endif
+        decToDestroy = nullptr;
+    }
 
+    if (!tg.empty()) {
+        if (speakerCleared) {
+            std::string msg1 = "MIC_FREE\n";
+            std::string msg2 = "SPEAKER_NONE\n";
+            broadcastToTalkgroup(tg, msg1, sock);
+            broadcastToTalkgroup(tg, msg2, sock);
+        }
+
+        triggerAnnouncementForTalkgroup(tg, "tg_leave");
+    }
+}
 
 static bool startsWith(const std::string& s, const std::string& p)
 {
@@ -3123,41 +3330,68 @@ void handleClient(SOCKET sock) {
 		else if (cmd == "REQ_SPEAK") {
 			std::string tg;
 			std::string user;
-			bool        granted   = false;
-			bool        preempted = false;
+
+			bool granted   = false;
+			bool preempted = false;
+
 			std::string prevSpeaker;
+			std::string denyReason;
 
 			{
 				std::lock_guard<std::mutex> lock(g_mutex);
-				ClientInfo &ci = g_clients[sock];
-				tg   = ci.talkgroup;
-				user = ci.callsign;
 
-				if (!tg.empty() && !isRxOnlyTalkgroup(tg)) {
-					TalkgroupState &ts = g_talkgroups[tg];
+				auto itc = g_clients.find(sock);
+				if (itc == g_clients.end() || !itc->second.authenticated) {
+					denyReason = "not_authenticated";
+				} else {
+					ClientInfo &ci = itc->second;
+					tg   = ci.talkgroup;
+					user = ci.callsign;
 
-					auto now = std::chrono::steady_clock::now();
+					if (!userCanSpeakNow(user, tg, denyReason)) {
 
-					if (!ts.activeSpeaker.empty()) {
-						if (ts.lastAudio.time_since_epoch().count() != 0) {
-							long long idleMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.lastAudio).count();
+					} else {
+						TalkgroupState &ts = g_talkgroups[tg];
+						auto now = std::chrono::steady_clock::now();
+
+						if (!ts.activeSpeaker.empty() && ts.lastAudio.time_since_epoch().count() != 0) {
+							long long idleMs =
+								std::chrono::duration_cast<std::chrono::milliseconds>(now - ts.lastAudio).count();
 							if (idleMs > 2000) {
 								ts.activeSpeaker.clear();
 							}
 						}
-					}
 
-					if (ts.activeSpeaker.empty()) {
-						ts.activeSpeaker = user;
-						ts.speakStart    = now;
-						ts.lastAudio     = now;
-						granted = true;
+						if (ts.activeSpeaker.empty()) {
+							ts.activeSpeaker = user;
+							ts.speakStart    = now;
+							ts.lastAudio     = now;
+							granted = true;
+						} else if (ts.activeSpeaker == user) {
+							ts.lastAudio = now;
+							granted = true;
+						} else {
+							prevSpeaker = ts.activeSpeaker;
+
+							int reqRank  = computeUserRank(user);
+							int curRank  = computeUserRank(baseCallsignFromSpeaker(prevSpeaker));
+
+							if (reqRank > curRank) {
+								ts.activeSpeaker = user;
+								ts.speakStart    = now;
+								ts.lastAudio     = now;
+								granted   = true;
+								preempted = true;
+							} else {
+								denyReason = "busy";
+							}
+						}
 					}
 				}
 			}
 
 			if (!granted) {
-				std::string resp = "SPEAK_DENIED busy_or_no_tg\n";
+				std::string resp = "SPEAK_DENIED " + (denyReason.empty() ? "busy_or_no_tg" : denyReason) + "\n";
 				sendAll(sock, resp.c_str(), resp.size());
 			} else {
 				std::ostringstream oss;
@@ -3167,7 +3401,7 @@ void handleClient(SOCKET sock) {
 
 				if (!tg.empty()) {
 					std::string sMsg = "SPEAKER " + user + "\n";
-					broadcastToTalkgroup(tg, sMsg);
+					broadcastToLinkedTalkgroups(tg, sMsg, INVALID_SOCKET);
 				}
 
 				if (!tg.empty()) {
@@ -3176,13 +3410,15 @@ void handleClient(SOCKET sock) {
 				}
 
 				if (preempted && !prevSpeaker.empty()) {
+					std::string prevBase = baseCallsignFromSpeaker(prevSpeaker);
+
 					SOCKET prevSock = INVALID_SOCKET;
 					{
 						std::lock_guard<std::mutex> lock(g_mutex);
 						for (const auto& kv : g_clients) {
 							const ClientInfo& ci2 = kv.second;
 							if (!ci2.authenticated) continue;
-							if (ci2.callsign == prevSpeaker && ci2.talkgroup == tg) {
+							if (ci2.callsign == prevBase && ci2.talkgroup == tg) {
 								prevSock = kv.first;
 								break;
 							}
@@ -3243,17 +3479,23 @@ void handleClient(SOCKET sock) {
 				std::cout << "[TG " << tg << "] Mic freed by " << user << "\n";
 			}
         }
-        else if (cmd == "AUDIO_ADPCM") {
-            uint32_t seq = 0;
-            uint16_t rate = 22050;
-            size_t size = 0;
-            iss >> seq >> rate >> size;
-            if (size == 0) continue;
+		else if (cmd == "AUDIO_ADPCM") {
+			uint32_t seq = 0;
+			uint16_t rate = 0;
+			size_t size = 0;
+			iss >> seq >> rate >> size;
 
-            std::vector<char> buf(size);
-            if (!recvAll(sock, buf.data(), size)) {
-                break;
-            }
+			if (size == 0) continue;
+
+			if (size > MAX_CLIENT_AUDIO_BYTES) {
+				LOG_WARN("Client sent oversized AUDIO_ADPCM frame: %zu bytes (disconnecting)\n", size);
+				break;
+			}
+
+			std::vector<char> buf(size);
+			if (!recvAll(sock, buf.data(), size)) {
+				break;
+			}
 
             std::string tg;
             std::string user;
@@ -3303,15 +3545,22 @@ void handleClient(SOCKET sock) {
                 LOG_INFO("[TG %s] Time limit reached for %s\n", tg.c_str(), user.c_str());
             }
         }
-        else if (cmd == "AUDIO" || cmd == "AUDIO_OPUS") {
-            size_t size;
-            iss >> size;
-            if (size == 0) continue;
+		else if (cmd == "AUDIO" || cmd == "AUDIO_OPUS") {
+			size_t size = 0;
+			iss >> size;
 
-            std::vector<char> buf(size);
-            if (!recvAll(sock, buf.data(), size)) {
-                break;
-            }
+			if (size == 0) continue;
+
+			if (size > MAX_CLIENT_AUDIO_BYTES) {
+				LOG_WARN("Client sent oversized %s frame: %zu bytes (disconnecting)\n",
+						 cmd.c_str(), size);
+				break;
+			}
+
+			std::vector<char> buf(size);
+			if (!recvAll(sock, buf.data(), size)) {
+				break;
+			}
 
             std::string tg;
             std::string user;

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
+#include <cstddef>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -55,10 +56,18 @@ std::atomic<int>  g_rxSquelchLevel(55);
 std::atomic<int>  g_rxSquelchVoicePct(55);
 std::atomic<int>  g_rxSquelchHangMs(450);
 
+static void stopAdpcmPlayoutThread();
+
 #ifdef GUI
 std::atomic<bool>  g_talkerActive(false);
 std::chrono::steady_clock::time_point g_talkerStart;
 #endif
+
+static const size_t ZFM_MAX_LINE_BYTES = 4096;
+static const size_t ZFM_MAX_RX_PAYLOAD = 256 * 1024;
+static const size_t ZFM_MAX_TX_PAYLOAD = 256 * 1024;
+
+static std::string g_sockStash;
 
 #define RESET       "\033[0m"
 #define RED         "\033[1;31m"
@@ -204,42 +213,106 @@ void closeSocket(SOCKET s) {
 #endif
 }
 
-bool sendAll(SOCKET sock, const void* data, size_t len) {
-    const char* buf = (const char*)data;
-    while (len > 0) {
-#if defined(__ANDROID__) || defined(__linux__)
-        int sent = send(sock, buf, (int)len, MSG_NOSIGNAL);
+static bool sendAll(SOCKET sock, const void* data, size_t len)
+{
+    const char* p = reinterpret_cast<const char*>(data);
+    size_t sent = 0;
+
+    while (sent < len) {
+        size_t want = len - sent;
+
+#ifdef _WIN32
+        int n = ::send(sock, p + sent, (int)want, 0);
+        if (n == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e == WSAEINTR) continue;
+            return false;
+        }
 #else
-        int sent = send(sock, buf, (int)len, 0);
+        ssize_t n = ::send(sock, p + sent, want, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
 #endif
-        if (sent <= 0) return false;
-        buf += sent;
-        len -= sent;
+        if (n == 0) return false;
+        sent += (size_t)n;
     }
     return true;
 }
 
-bool recvAll(SOCKET sock, void* data, size_t len) {
-    char* buf = static_cast<char*>(data);
-    while (len > 0) {
-        int r = recv(sock, buf, (int)len, 0);
-        if (r <= 0) return false;
-        buf += r;
-        len -= r;
+static bool recvSome(SOCKET sock, void* out, size_t outCap, size_t& got)
+{
+    got = 0;
+    if (outCap == 0) return true;
+
+#ifdef _WIN32
+    int n = ::recv(sock, (char*)out, (int)outCap, 0);
+    if (n == 0) return false;
+    if (n == SOCKET_ERROR) {
+        int e = WSAGetLastError();
+        if (e == WSAEINTR) return recvSome(sock, out, outCap, got);
+        return false;
+    }
+    got = (size_t)n;
+    return true;
+#else
+    ssize_t n = ::recv(sock, out, outCap, 0);
+    if (n == 0) return false;
+    if (n < 0) {
+        if (errno == EINTR) return recvSome(sock, out, outCap, got);
+        return false;
+    }
+    got = (size_t)n;
+    return true;
+#endif
+}
+
+static bool recvAll(SOCKET sock, void* out, size_t len)
+{
+    char* dst = reinterpret_cast<char*>(out);
+    size_t done = 0;
+
+    if (!g_sockStash.empty() && len > 0) {
+        size_t take = std::min(len, g_sockStash.size());
+        std::memcpy(dst, g_sockStash.data(), take);
+        g_sockStash.erase(0, take);
+        done += take;
+    }
+
+    while (done < len) {
+        size_t got = 0;
+        if (!recvSome(sock, dst + done, len - done, got)) return false;
+        if (got == 0) return false;
+        done += got;
     }
     return true;
 }
 
-bool recvLine(SOCKET sock, std::string& line) {
-    line.clear();
-    char c;
-    while (true) {
-        int r = recv(sock, &c, 1, 0);
-        if (r <= 0) return false;
-        if (c == '\n') break;
-        if (c != '\r') line.push_back(c);
+static bool recvLine(SOCKET sock, std::string& outLine)
+{
+    outLine.clear();
+
+    for (;;) {
+        size_t nl = g_sockStash.find('\n');
+        if (nl != std::string::npos) {
+            outLine = g_sockStash.substr(0, nl);
+            g_sockStash.erase(0, nl + 1);
+            if (!outLine.empty() && outLine.back() == '\r') outLine.pop_back();
+            return true;
+        }
+
+        if (g_sockStash.size() >= ZFM_MAX_LINE_BYTES) {
+            return false;
+        }
+
+        char tmp[1024];
+        size_t got = 0;
+        if (!recvSome(sock, tmp, sizeof(tmp), got)) return false;
+        if (got == 0) return false;
+
+        g_sockStash.append(tmp, tmp + got);
     }
-    return true;
 }
 
 bool connectToServerHost(const std::string& host, int port, SOCKET& outSock)
@@ -577,6 +650,10 @@ static std::mutex g_sdlAudioMutex;
 PaStream* g_inputStream = NULL;
 PaStream* g_outputStream = NULL;
 
+#if !defined(__ANDROID__)
+static std::mutex g_paOutMutex;
+#endif
+
 int g_sampleRate = 48000;
 unsigned long g_framesPerBuffer = 480;
 int g_channels = 1;
@@ -596,7 +673,27 @@ static inline void AndroidFlushMicQueue() {
 static bool audioOutWrite(const int16_t* samples, unsigned long frames) {
 #if !defined(__ANDROID__)
     if (!g_outputStream || !samples || frames == 0) return false;
-    PaError err = Pa_WriteStream(g_outputStream, samples, frames);
+
+    std::lock_guard<std::mutex> lk(g_paOutMutex);
+
+    long avail = Pa_GetStreamWriteAvailable(g_outputStream);
+    if (avail >= 0 && (unsigned long)avail < frames) {
+        static int dropCount = 0;
+        dropCount++;
+        if (dropCount <= 5 || (dropCount % 50) == 0) {
+            LOG_WARN("Audio overrun protection: dropping %lu frames (avail=%ld)\n",
+                     frames, avail);
+        }
+
+        if ((dropCount % 200) == 0) {
+            Pa_AbortStream(g_outputStream);
+            Pa_StartStream(g_outputStream);
+        }
+        return true;
+    }
+
+	PaError err = Pa_WriteStream(g_outputStream, samples, frames);
+
     static int underflowWarnCount = 0;
     if (err == paOutputUnderflowed) {
         if (underflowWarnCount < 5) {
@@ -612,15 +709,61 @@ static bool audioOutWrite(const int16_t* samples, unsigned long frames) {
     return true;
 #else
     if (!g_sdlOutDev || !samples || frames == 0) return false;
+
     const Uint32 bytes = (Uint32)(frames * (unsigned long)g_channels * sizeof(int16_t));
-    const Uint32 maxQueueBytes = (Uint32)((uint64_t)g_sampleRate * (uint64_t)g_channels * sizeof(int16_t) * (uint64_t)ZFM_ANDROID_MAX_QUEUE_MS / 1000ULL);
-    if (SDL_GetQueuedAudioSize(g_sdlOutDev) > maxQueueBytes) {
+
+    const Uint32 maxQueueBytes = (Uint32)(
+        (uint64_t)g_sampleRate * (uint64_t)g_channels * sizeof(int16_t) *
+        (uint64_t)ZFM_ANDROID_MAX_QUEUE_MS / 1000ULL
+    );
+
+    Uint32 q = SDL_GetQueuedAudioSize(g_sdlOutDev);
+    if (q > maxQueueBytes) {
         SDL_ClearQueuedAudio(g_sdlOutDev);
+        q = 0;
     }
+
     if (SDL_QueueAudio(g_sdlOutDev, samples, bytes) != 0) {
         LOG_WARN("SDL_QueueAudio failed: %s\n", SDL_GetError());
         return false;
     }
+    return true;
+#endif
+}
+
+static bool audioOutWriteBlockingChunked(const int16_t* samples, unsigned long frames)
+{
+#if defined(__ANDROID__)
+    return audioOutWrite(samples, frames);
+#else
+    if (!g_outputStream || !samples || frames == 0) return false;
+
+    std::lock_guard<std::mutex> lk(g_paOutMutex);
+
+    const unsigned long chunk = (g_framesPerBuffer > 0) ? (unsigned long)g_framesPerBuffer : 480;
+
+    unsigned long pos = 0;
+    while (pos < frames) {
+        unsigned long remain = frames - pos;
+        unsigned long toWrite = (remain < chunk) ? remain : chunk;
+
+        long avail = Pa_GetStreamWriteAvailable(g_outputStream);
+        if (avail >= 0 && avail < (long)toWrite) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+        PaError err = Pa_WriteStream(g_outputStream, samples + pos * g_channels, toWrite);
+        if (err == paOutputUnderflowed) {
+
+        } else if (err != paNoError) {
+            LOG_ERROR("Pa_WriteStream (UI sound) error: %s\n", Pa_GetErrorText(err));
+            return false;
+        }
+
+        pos += toWrite;
+    }
+
     return true;
 #endif
 }
@@ -1106,7 +1249,7 @@ void playMicFreeSound() {
             }
         }
         unsigned long frames = (unsigned long)(out.size() / g_channels);
-        audioOutWrite(out.data(), frames);
+        audioOutWriteBlockingChunked(out.data(), frames);
     } else {
         LOG_INFO("[SOUND] Mic is now free!\n");
     }
@@ -1257,7 +1400,7 @@ bool initPortAudio(const ClientConfig& cfg) {
         return false;
     }
 
-    unsigned long outFramesPerBuffer = g_framesPerBuffer * 3;
+    unsigned long outFramesPerBuffer = g_framesPerBuffer * 2;
 
     err = Pa_OpenStream(
         &g_outputStream,
@@ -1343,6 +1486,7 @@ bool initPortAudio(const ClientConfig& cfg) {
 
 #if !defined(__ANDROID__)
 void shutdownPortAudio() {
+	stopAdpcmPlayoutThread();
     if (g_inputStream) {
         Pa_StopStream(g_inputStream);
         Pa_CloseStream(g_inputStream);
@@ -1357,8 +1501,8 @@ void shutdownPortAudio() {
 }
 #else
 void shutdownPortAudio() {
+	stopAdpcmPlayoutThread();
     std::lock_guard<std::mutex> lk(g_sdlAudioMutex);
-
     if (g_sdlInDev)  {
         SDL_PauseAudioDevice(g_sdlInDev, 1);
         SDL_ClearQueuedAudio(g_sdlInDev);
@@ -1832,6 +1976,22 @@ static std::atomic<uint32_t> g_adpcmExpectedSeq(0);
 static std::vector<int16_t> g_adpcmLastGood;
 static std::chrono::steady_clock::time_point g_adpcmLastRx = std::chrono::steady_clock::now();
 
+static void stopAdpcmPlayoutThread()
+{
+    g_adpcmPlayoutRun = false;
+
+    if (g_adpcmPlayoutThread.joinable()) {
+        g_adpcmPlayoutThread.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_adpcmJitMutex);
+        g_adpcmReorder.clear();
+        g_adpcmExpectedSeq = 0;
+    }
+    g_adpcmLastGood.clear();
+}
+
 static inline std::vector<int16_t> plcFromLast(size_t n)
 {
     std::vector<int16_t> out(n, 0);
@@ -1852,7 +2012,6 @@ static void ensureAdpcmPlayoutThread()
 
     g_adpcmPlayoutRun = true;
     g_adpcmPlayoutThread = std::thread([]() {
-        const int baseRate = 22050;
         const int frameSamples = 220;
         const auto tick = std::chrono::milliseconds(10);
 
@@ -1865,7 +2024,6 @@ static void ensureAdpcmPlayoutThread()
             {
                 std::lock_guard<std::mutex> lock(g_adpcmJitMutex);
                 uint32_t want = g_adpcmExpectedSeq.load();
-
                 auto it = g_adpcmReorder.find(want);
                 if (it != g_adpcmReorder.end()) {
                     fr = std::move(it->second);
@@ -1879,15 +2037,11 @@ static void ensureAdpcmPlayoutThread()
             if (have) {
                 size_t outS = (fr.rate == 11025) ? 110 : 220;
                 pcm = imaAdpcmDecode(fr.payload.data(), fr.payload.size(), outS);
-
                 if (fr.rate == 11025) {
                     auto up = upsample2x_dup(pcm.data(), pcm.size());
                     pcm.swap(up);
                 }
-
-                if (!pcm.empty()) {
-                    g_adpcmLastGood = pcm;
-                }
+                if (!pcm.empty()) g_adpcmLastGood = pcm;
             } else {
                 pcm = plcFromLast(frameSamples);
             }
@@ -1898,12 +2052,11 @@ static void ensureAdpcmPlayoutThread()
                 playAudioFrame(bytes);
             }
 
-            auto t1 = std::chrono::steady_clock::now();
-            auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0);
+            auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0);
             if (dt < tick) std::this_thread::sleep_for(tick - dt);
         }
     });
-    g_adpcmPlayoutThread.detach();
 }
 
 static std::atomic<uint32_t> g_adpcmTxSeq(1);
@@ -1913,10 +2066,20 @@ static bool sendVoiceFrameToServer(SOCKET sock, const std::vector<char>& pcmByte
 {
     if (pcmBytes.empty()) return true;
 
+    if (pcmBytes.size() > ZFM_MAX_TX_PAYLOAD) {
+        LOG_WARN("Refusing to send huge PCM payload: %zu bytes\n", pcmBytes.size());
+        return false;
+    }
+
     if (g_cfg.use_opus) {
         std::vector<char> payload = encodeOpusFrame(pcmBytes);
         std::string cmd = payload.empty() ? "AUDIO" : "AUDIO_OPUS";
         if (payload.empty()) payload = pcmBytes;
+
+        if (payload.size() > ZFM_MAX_TX_PAYLOAD) {
+            LOG_WARN("Refusing to send huge OPUS payload: %zu bytes\n", payload.size());
+            return false;
+        }
 
         std::ostringstream oss;
         oss << cmd << " " << payload.size() << "\n";
@@ -2493,8 +2656,15 @@ void receiverLoop(SOCKET sock) {
         }
 		else if (cmd == "AUDIO_FROM" || cmd == "AUDIO_FROM_OPUS") {
 			std::string user;
-			size_t size;
+			size_t size = 0;
 			iss >> user >> size;
+
+			if (user.empty() || size == 0 || size > ZFM_MAX_RX_PAYLOAD) {
+				LOG_WARN("Bad AUDIO_FROM frame header (user='%s' size=%zu)\n", user.c_str(), size);
+				g_running = false;
+				break;
+			}
+
 			std::vector<char> buf(size);
 			if (!recvAll(sock, buf.data(), size)) {
 				LOG_ERROR("Failed to receive audio frame\n");
@@ -2527,19 +2697,25 @@ void receiverLoop(SOCKET sock) {
 			}
 		}
         else if (cmd == "AUDIO_ADPCM_FROM") {
-            std::string user;
-            uint32_t seq = 0;
-            uint16_t rate = 22050;
-            size_t size = 0;
-            iss >> user >> seq >> rate >> size;
-            if (size == 0) continue;
+			std::string user;
+			uint32_t seq = 0;
+			uint16_t rate = 22050;
+			size_t size = 0;
+			iss >> user >> seq >> rate >> size;
 
-            std::vector<char> buf(size);
-            if (!recvAll(sock, buf.data(), size)) {
-                LOG_ERROR("Failed to receive ADPCM frame");
-                g_running = false;
-                break;
-            }
+			if (user.empty() || size == 0 || size > ZFM_MAX_RX_PAYLOAD) {
+				LOG_WARN("Bad AUDIO_ADPCM_FROM header (user='%s' seq=%u rate=%u size=%zu)\n",
+						 user.c_str(), seq, (unsigned)rate, size);
+				g_running = false;
+				break;
+			}
+
+			std::vector<char> buf(size);
+			if (!recvAll(sock, buf.data(), size)) {
+				LOG_ERROR("Failed to receive ADPCM frame");
+				g_running = false;
+				break;
+			}
 
             {
                 std::lock_guard<std::mutex> lock(g_speakerMutex);
@@ -2721,6 +2897,45 @@ void doTalkSession(SOCKET sock) {
     std::cout << "Stopped talking.\n";
 }
 
+static inline void UpdateTxMicLevelFromFrame(const std::vector<char>& frame)
+{
+#ifdef GUI
+    if (frame.empty()) return;
+
+    const int16_t* samples = reinterpret_cast<const int16_t*>(frame.data());
+    const size_t sampleCount = frame.size() / sizeof(int16_t);
+    if (sampleCount == 0) return;
+
+    double sumSq = 0.0;
+    for (size_t i = 0; i < sampleCount; ++i) {
+        double v = samples[i] / 32768.0;
+        sumSq += v * v;
+    }
+    double rms = std::sqrt(sumSq / (double)sampleCount);
+
+    float level = (float)rms;
+    if (level < 0.0f) level = 0.0f;
+    if (level > 1.0f) level = 1.0f;
+
+    float old = g_audioLevel.load();
+    g_audioLevel = old * 0.7f + level * 0.3f;
+#else
+    (void)frame;
+#endif
+}
+
+static inline void FlushAudioOutput()
+{
+#if defined(__ANDROID__)
+    if (g_sdlOutDev) SDL_ClearQueuedAudio(g_sdlOutDev);
+#else
+    if (g_outputStream) {
+        Pa_AbortStream(g_outputStream);
+        Pa_StartStream(g_outputStream);
+    }
+#endif
+}
+
 void doParrotSession(bool usePtt) {
     const bool voxMode = g_cfg.vox_enabled;
 
@@ -2734,6 +2949,11 @@ void doParrotSession(bool usePtt) {
 
     if (usePtt) {
         setPtt(true);
+#ifdef GUI
+		g_currentSpeaker = g_cfg.callsign;
+		g_talkerStart = std::chrono::steady_clock::now();
+		g_talkerActive = true;
+#endif
     }
 
     const int silenceFramesNeeded = 50;
@@ -2748,6 +2968,7 @@ void doParrotSession(bool usePtt) {
             if (frame.empty()) {
                 continue;
             }
+			UpdateTxMicLevelFromFrame(frame);
 
             bool above = frameAboveVoxThreshold(frame, g_cfg.vox_threshold);
 
@@ -2778,6 +2999,7 @@ void doParrotSession(bool usePtt) {
             if (frame.empty()) {
                 continue;
             }
+			UpdateTxMicLevelFromFrame(frame);
             recordedFrames.push_back(std::move(frame));
         }
 
@@ -2796,12 +3018,25 @@ void doParrotSession(bool usePtt) {
         return;
     }
 
-    std::cout << "Parrot: playing back your recording (" << recordedFrames.size()
-              << " frames)...\n";
+	FlushAudioOutput();
+
+#ifdef GUI
+    g_currentSpeaker = "PARROT";
+    g_talkerStart = std::chrono::steady_clock::now();
+    g_talkerActive = true;
+#endif
 
     for (auto &f : recordedFrames) {
         playAudioFrame(f);
     }
+
+#ifdef GUI
+    g_talkerActive = false;
+    g_audioLevel = 0.0f;
+
+    if (g_currentSpeaker == "PARROT")
+        g_currentSpeaker.clear();
+#endif
 
     std::cout << "Parrot session ended.\n";
 }
@@ -2965,44 +3200,6 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 
-    sockaddr_in addr;
-    std::memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons(g_cfg.server_port);
-    if (inet_pton(AF_INET, g_cfg.server_ip.c_str(), &addr.sin_addr) <= 0) {
-        std::cerr << "Invalid server IP\n";
-        closeSocket(sock);
-        cleanupSockets();
-        shutdownPortAudio();
-		shutdownOpus();
-        shutdownGpioPtt();
-        return 1;
-    }
-
-	if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-#ifdef _WIN32
-		int err = WSAGetLastError();
-		if (err != WSAEISCONN) {
-			std::cerr << "Connect failed to " << g_cfg.server_ip << ":" << g_cfg.server_port
-					  << " (WSA error " << err << ")\n";
-			closeSocket(sock);
-			cleanupSockets();
-			shutdownPortAudio();
-			shutdownOpus();
-			shutdownGpioPtt();
-			return 1;
-		}
-#else
-		std::cerr << "Connect failed to " << g_cfg.server_ip << ":" << g_cfg.server_port << "\n";
-		closeSocket(sock);
-		cleanupSockets();
-		shutdownPortAudio();
-		shutdownOpus();
-		shutdownGpioPtt();
-		return 1;
-#endif
-	}
-
 	if (g_cfg.gpio_ptt_enabled && !g_cfg.vox_enabled) {
 		g_pttAutoEnabled = true;
 		g_lastRxAudioTime = std::chrono::steady_clock::now();
@@ -3116,9 +3313,14 @@ int main(int argc, char** argv) {
         }
     }
 
-    g_running = false;
-    closeSocket(sock);
-    if (recvThread.joinable()) recvThread.join();
+	g_running = false;
+#if defined(_WIN32) || defined(_WIN64)
+	if (sock != INVALID_SOCKET) shutdown(sock, SD_BOTH);
+#else
+	if (sock != INVALID_SOCKET) shutdown(sock, SHUT_RDWR);
+#endif
+	if (recvThread.joinable()) recvThread.join();
+	closeSocket(sock);
 
     shutdownPortAudio();
 	shutdownOpus();
