@@ -11,6 +11,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstddef>
+#include <cstdarg>
+#include <ctime>
+#include <cstdio>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -318,6 +321,7 @@ static bool recvLine(SOCKET sock, std::string& outLine)
 bool connectToServerHost(const std::string& host, int port, SOCKET& outSock)
 {
     outSock = INVALID_SOCKET;
+	g_sockStash.clear();
 
     char portStr[16];
 #ifdef _WIN32

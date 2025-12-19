@@ -18,6 +18,7 @@
 #include <cstdarg>
 #include <algorithm>
 #include <cstdio>
+#include <random>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -418,11 +419,16 @@ static inline Role roleFromStr(const std::string& s) {
     return Role::USER;
 }
 
+static bool hasAtLeast(Role a, Role need);
+static bool canOperatorActOn(Role actor, Role target);
+static Role getUserRoleUnsafeNoLock(const std::string& cs);
+
 struct User {
     std::string callsign;
     std::string password;
     std::unordered_set<std::string> talkgroups;
     Role role;
+    std::unordered_set<std::string> permissions;
     bool muted;
     bool banned;
     std::string remoteIp;
@@ -888,6 +894,7 @@ bool loadConfig(const std::string& path) {
 				currentUser.muted   = false;
 				currentUser.banned  = false;
 				currentUser.priority = 0;
+				currentUser.permissions.clear();
 				continue;
 			}
 			if (l.find('}') != std::string::npos) {
@@ -927,6 +934,14 @@ bool loadConfig(const std::string& path) {
 					currentUser.talkgroups.clear();
 					for (size_t k = 0; k < tgs.size(); ++k) {
 						currentUser.talkgroups.insert(tgs[k]);
+					}
+					continue;
+				}
+				std::vector<std::string> perms;
+				if (parseStringArray(l, "permissions", perms)) {
+					currentUser.permissions.clear();
+					for (size_t k = 0; k < perms.size(); ++k) {
+						currentUser.permissions.insert(perms[k]);
 					}
 					continue;
 				}
@@ -2143,6 +2158,8 @@ static bool saveConfig(const std::string& path)
     }
 
     f << "{\n";
+    f << "  \"server_name\": \"" << escapeJson(g_serverName) << "\",\n";
+    f << "  \"peer_secret\": \"" << escapeJson(g_peerSecret) << "\",\n";
     f << "  \"server_port\": " << g_server_port << ",\n";
     f << "  \"max_talk_ms\": " << g_max_talk_ms << ",\n";
     f << "  \"http_root\": \"" << escapeJson(g_http_root) << "\",\n";
@@ -2178,6 +2195,17 @@ static bool saveConfig(const std::string& path)
             f << "      \"banned\": " << (u.banned ? "true" : "false") << ",\n";
 			f << "      \"priority\": " << u.priority << ",\n";
 
+			if (!u.permissions.empty()) {
+				f << "      \"permissions\": [";
+				bool firstP = true;
+				for (const auto& p : u.permissions) {
+					if (!firstP) f << ", ";
+					firstP = false;
+					f << "\"" << escapeJson(p) << "\"";
+				}
+				f << "],\n";
+			}
+
             f << "      \"talkgroups\": [";
             bool firstTg = true;
             for (const auto& tg : u.talkgroups) {
@@ -2209,6 +2237,46 @@ static bool saveConfig(const std::string& path)
 
 			f << " }";
 		}
+        f << "\n  ],\n";
+    }
+
+    f << "  \"bridges\": {\n";
+    {
+        bool firstB = true;
+        for (const auto& kv : g_linkedTalkgroups) {
+            if (!firstB) f << ",\n";
+            firstB = false;
+            f << "    \"" << escapeJson(kv.first) << "\": [";
+            for (size_t i = 0; i < kv.second.size(); ++i) {
+                if (i) f << ", ";
+                f << "\"" << escapeJson(kv.second[i]) << "\"";
+            }
+            f << "]";
+        }
+        f << "\n  },\n";
+    }
+
+    f << "  \"peers\": [\n";
+    {
+        bool firstP = true;
+        std::lock_guard<std::mutex> plock(g_peerMutex);
+        for (const auto& pc : g_peerCfg) {
+            if (!firstP) f << ",\n";
+            firstP = false;
+            f << "    {\n";
+            f << "      \"name\": \"" << escapeJson(pc.name) << "\",\n";
+            f << "      \"host\": \"" << escapeJson(pc.host) << "\",\n";
+            f << "      \"port\": " << pc.port << ",\n";
+            if (!pc.secret.empty())
+                f << "      \"secret\": \"" << escapeJson(pc.secret) << "\",\n";
+            f << "      \"rules\": [";
+            for (size_t i = 0; i < pc.ruleStr.size(); ++i) {
+                if (i) f << ", ";
+                f << "\"" << escapeJson(pc.ruleStr[i]) << "\"";
+            }
+            f << "]\n";
+            f << "    }";
+        }
         f << "\n  ]\n";
     }
 
@@ -2582,6 +2650,30 @@ static void sendHttpResponse(SOCKET s,
     }
 }
 
+static void sendHttpResponseEx(SOCKET s,
+                               const std::string& statusLine,
+                               const std::string& contentType,
+                               const std::vector<std::pair<std::string,std::string>>& extraHeaders,
+                               const std::string& body)
+{
+    std::ostringstream oss;
+    oss << statusLine << "\r\n";
+    if (!contentType.empty()) {
+        oss << "Content-Type: " << contentType << "\r\n";
+    }
+    for (const auto& kv : extraHeaders) {
+        if (!kv.first.empty()) oss << kv.first << ": " << kv.second << "\r\n";
+    }
+    oss << "Content-Length: " << body.size() << "\r\n";
+    oss << "Connection: close\r\n";
+    oss << "Cache-Control: no-cache\r\n";
+    oss << "\r\n";
+
+    std::string header = oss.str();
+    sendAll(s, header.data(), header.size());
+    if (!body.empty()) sendAll(s, body.data(), body.size());
+}
+
 static const size_t MAX_HTTP_LINE = 4096;
 static const size_t MAX_HTTP_PATH = 512;
 
@@ -2616,6 +2708,258 @@ static bool isSafeRelPath(const std::string& rel) {
     return true;
 }
 
+struct HttpSession {
+    std::string token;
+    std::string callsign;
+    Role role;
+    std::unordered_set<std::string> permissions;
+    std::chrono::steady_clock::time_point expires;
+};
+
+static std::mutex g_httpSessMutex;
+static std::unordered_map<std::string, HttpSession> g_httpSessions;
+
+static std::string makeRandomToken(size_t nbytes = 24) {
+    static const char* hexd = "0123456789abcdef";
+    std::string out;
+    out.reserve(nbytes * 2);
+    std::random_device rd;
+    for (size_t i = 0; i < nbytes; ++i) {
+        unsigned char b = (unsigned char)(rd() & 0xFF);
+        out.push_back(hexd[(b >> 4) & 0xF]);
+        out.push_back(hexd[b & 0xF]);
+    }
+    return out;
+}
+
+static void purgeExpiredSessionsNoLock() {
+    auto now = std::chrono::steady_clock::now();
+    for (auto it = g_httpSessions.begin(); it != g_httpSessions.end(); ) {
+        if (it->second.expires <= now) it = g_httpSessions.erase(it);
+        else ++it;
+    }
+}
+
+static bool extractBearer(const std::unordered_map<std::string,std::string>& hdr,
+                          std::string& tokenOut)
+{
+    tokenOut.clear();
+    auto it = hdr.find("authorization");
+    if (it == hdr.end()) return false;
+    std::string v = it->second;
+    v = trim(v);
+    const std::string pfx = "Bearer ";
+    if (v.size() <= pfx.size()) return false;
+    if (v.compare(0, pfx.size(), pfx) != 0) return false;
+    tokenOut = trim(v.substr(pfx.size()));
+    return !tokenOut.empty();
+}
+
+static bool getSessionFromHeaders(const std::unordered_map<std::string,std::string>& hdr,
+                                  HttpSession& out)
+{
+    std::string tok;
+    if (!extractBearer(hdr, tok)) return false;
+    std::lock_guard<std::mutex> lk(g_httpSessMutex);
+    purgeExpiredSessionsNoLock();
+    auto it = g_httpSessions.find(tok);
+    if (it == g_httpSessions.end()) return false;
+    out = it->second;
+    it->second.expires = std::chrono::steady_clock::now() + std::chrono::minutes(30);
+    return true;
+}
+
+static bool sessionHasPerm(const HttpSession& s, const std::string& perm) {
+    if (s.role == Role::ADMIN) return true;
+    if (perm.empty()) return false;
+
+    if (s.role == Role::OPERATOR && s.permissions.empty() && perm == "config.read") return true;
+
+    if (s.permissions.find(perm) != s.permissions.end()) return true;
+
+    if (perm.size() > 6 && perm.compare(perm.size()-6, 6, ".write") == 0) {
+        if (s.permissions.find("config.write") != s.permissions.end()) return true;
+    }
+    if (s.permissions.find("config.*") != s.permissions.end()) return true;
+    return false;
+}
+
+static bool jsonFindString(const std::string& json, const std::string& key, std::string& out) {
+    out.clear();
+    std::string pat = "\"" + key + "\"";
+    size_t p = json.find(pat);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p + pat.size());
+    if (p == std::string::npos) return false;
+    p = json.find('"', p);
+    if (p == std::string::npos) return false;
+    size_t e = json.find('"', p + 1);
+    if (e == std::string::npos) return false;
+    out = json.substr(p + 1, e - (p + 1));
+    return true;
+}
+
+static bool jsonFindBool(const std::string& json, const std::string& key, bool& out) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = json.find(pat);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p + pat.size());
+    if (p == std::string::npos) return false;
+    size_t t = json.find_first_not_of(" \t\r\n", p + 1);
+    if (t == std::string::npos) return false;
+    if (json.compare(t, 4, "true") == 0) { out = true; return true; }
+    if (json.compare(t, 5, "false") == 0) { out = false; return true; }
+    return false;
+}
+
+static bool jsonFindInt(const std::string& json, const std::string& key, int& out) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = json.find(pat);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p + pat.size());
+    if (p == std::string::npos) return false;
+    size_t t = json.find_first_of("-0123456789", p + 1);
+    if (t == std::string::npos) return false;
+    size_t e = t;
+    while (e < json.size() && (json[e] == '-' || std::isdigit((unsigned char)json[e]))) ++e;
+    try {
+        out = std::stoi(json.substr(t, e - t));
+        return true;
+    } catch (...) { return false; }
+}
+
+static bool jsonFindStringArray(const std::string& json, const std::string& key, std::vector<std::string>& out) {
+    out.clear();
+    std::string pat = "\"" + key + "\"";
+    size_t p = json.find(pat);
+    if (p == std::string::npos) return false;
+    p = json.find('[', p + pat.size());
+    if (p == std::string::npos) return false;
+    size_t e = json.find(']', p);
+    if (e == std::string::npos) return false;
+    std::string inside = json.substr(p + 1, e - (p + 1));
+    size_t pos = 0;
+    while (true) {
+        size_t q1 = inside.find('"', pos);
+        if (q1 == std::string::npos) break;
+        size_t q2 = inside.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        out.push_back(inside.substr(q1 + 1, q2 - (q1 + 1)));
+        pos = q2 + 1;
+    }
+    return true;
+}
+
+static std::string buildAdminConfigJson()
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::ostringstream oss;
+    oss << "{\n";
+    oss << "  \"server_name\": \"" << escapeJson(g_serverName) << "\",\n";
+    oss << "  \"peer_secret\": \"" << escapeJson(g_peerSecret) << "\",\n";
+    oss << "  \"server_port\": " << g_server_port << ",\n";
+    oss << "  \"max_talk_ms\": " << g_max_talk_ms << ",\n";
+    oss << "  \"http_root\": \"" << escapeJson(g_http_root) << "\",\n";
+    oss << "  \"http_port\": " << g_http_port << ",\n";
+
+    oss << "  \"time_announcement\": {\n";
+    oss << "    \"enabled\": " << (g_timeCfg.enabled ? "true" : "false") << ",\n";
+    oss << "    \"folder\": \"" << escapeJson(g_timeCfg.folder) << "\",\n";
+    oss << "    \"volume_factor\": " << g_timeCfg.volumeFactor << "\n";
+    oss << "  },\n";
+
+    oss << "  \"weather\": {\n";
+    oss << "    \"enabled\": " << (g_weatherCfg.enabled ? "true" : "false") << ",\n";
+    oss << "    \"weather_host_ip\": \"" << escapeJson(g_weatherCfg.weatherHostIp) << "\",\n";
+    oss << "    \"talkgroup\": \"" << escapeJson(g_weatherCfg.talkgroup) << "\",\n";
+    oss << "    \"interval_sec\": " << g_weatherCfg.intervalSec << ",\n";
+    oss << "    \"api_key\": \"" << escapeJson(g_weatherCfg.apiKey) << "\",\n";
+    oss << "    \"lat\": \"" << escapeJson(g_weatherCfg.lat) << "\",\n";
+    oss << "    \"lon\": \"" << escapeJson(g_weatherCfg.lon) << "\",\n";
+    oss << "    \"city_key\": \"" << escapeJson(g_weatherCfg.cityKey) << "\"\n";
+    oss << "  },\n";
+
+    oss << "  \"users\": [\n";
+    bool firstU = true;
+    for (const auto& kv : g_users) {
+        const User& u = kv.second;
+        if (!firstU) oss << ",\n";
+        firstU = false;
+        oss << "    {\"callsign\":\"" << escapeJson(u.callsign) << "\",\"password\":\"" << escapeJson(u.password)
+            << "\",\"role\":\"" << roleToStr(u.role) << "\",\"banned\":" << (u.banned ? "true" : "false")
+            << ",\"priority\":" << u.priority;
+        if (!u.permissions.empty()) {
+            oss << ",\"permissions\":[";
+            bool fp = true;
+            for (const auto& p : u.permissions) {
+                if (!fp) oss << ",";
+                fp = false;
+                oss << "\"" << escapeJson(p) << "\"";
+            }
+            oss << "]";
+        }
+        oss << ",\"talkgroups\":[";
+        bool ft = true;
+        for (const auto& tg : u.talkgroups) {
+            if (!ft) oss << ",";
+            ft = false;
+            oss << "\"" << escapeJson(tg) << "\"";
+        }
+        oss << "]}";
+    }
+    oss << "\n  ],\n";
+
+    oss << "  \"talkgroups\": [\n";
+    bool firstTg = true;
+    for (const auto& kv : g_knownTalkgroups) {
+        const TalkgroupInfo& tg = kv.second;
+        if (!firstTg) oss << ",\n";
+        firstTg = false;
+        oss << "    {\"name\":\"" << escapeJson(tg.name) << "\",\"mode\":\"";
+        if (tg.mode == TalkgroupMode::HIDE) oss << "hide";
+        else if (tg.mode == TalkgroupMode::ADMIN) oss << "admin";
+        else oss << "public";
+        oss << "\"}";
+    }
+    oss << "\n  ],\n";
+
+    oss << "  \"bridges\": {\n";
+    bool firstB = true;
+    for (const auto& kv : g_linkedTalkgroups) {
+        if (!firstB) oss << ",\n";
+        firstB = false;
+        oss << "    \"" << escapeJson(kv.first) << "\":[";
+        for (size_t i = 0; i < kv.second.size(); ++i) {
+            if (i) oss << ",";
+            oss << "\"" << escapeJson(kv.second[i]) << "\"";
+        }
+        oss << "]";
+    }
+    oss << "\n  },\n";
+
+    oss << "  \"peers\": [\n";
+    {
+        std::lock_guard<std::mutex> plock(g_peerMutex);
+        bool firstP = true;
+        for (const auto& pc : g_peerCfg) {
+            if (!firstP) oss << ",\n";
+            firstP = false;
+            oss << "    {\"name\":\"" << escapeJson(pc.name) << "\",\"host\":\"" << escapeJson(pc.host)
+                << "\",\"port\":" << pc.port;
+            if (!pc.secret.empty()) oss << ",\"secret\":\"" << escapeJson(pc.secret) << "\"";
+            oss << ",\"rules\":[";
+            for (size_t i = 0; i < pc.ruleStr.size(); ++i) {
+                if (i) oss << ",";
+                oss << "\"" << escapeJson(pc.ruleStr[i]) << "\"";
+            }
+            oss << "]}";
+        }
+    }
+    oss << "\n  ]\n";
+    oss << "}\n";
+    return oss.str();
+}
+
 static void handleHttpClient(SOCKET s) {
     std::string line;
     if (!readHttpLine(s, line)) {
@@ -2623,17 +2967,46 @@ static void handleHttpClient(SOCKET s) {
         return;
     }
 
+    std::unordered_map<std::string,std::string> headers;
     for (;;) {
         std::string h;
         if (!readHttpLine(s, h)) break;
         if (h.empty()) break;
+
+        size_t c = h.find(':');
+        if (c == std::string::npos) continue;
+        std::string k = h.substr(0, c);
+        std::string v = h.substr(c + 1);
+        k = trim(k);
+        v = trim(v);
+        for (auto& ch : k) ch = (char)std::tolower((unsigned char)ch);
+        headers[k] = v;
     }
 
     std::istringstream iss(line);
     std::string method, url, ver;
     iss >> method >> url >> ver;
 
-    if (method != "GET") {
+    std::string bodyIn;
+    if (method == "POST") {
+        int contentLen = 0;
+        auto itCL = headers.find("content-length");
+        if (itCL != headers.end()) {
+            try { contentLen = std::stoi(itCL->second); } catch (...) { contentLen = 0; }
+        }
+        if (contentLen < 0 || contentLen > 1024*1024) {
+            sendHttpResponse(s, "HTTP/1.1 413 Payload Too Large", "text/plain", "Payload too large");
+            closeSocket(s);
+            return;
+        }
+        if (contentLen > 0) {
+            bodyIn.resize((size_t)contentLen);
+            if (!recvAll(s, &bodyIn[0], (size_t)contentLen)) {
+                closeSocket(s);
+                return;
+            }
+        }
+    } else if (method != "GET") {
         sendHttpResponse(s, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed");
         closeSocket(s);
         return;
@@ -2649,6 +3022,487 @@ static void handleHttpClient(SOCKET s) {
         std::string json = buildStatusJson();
         sendHttpResponse(s, "HTTP/1.1 200 OK",
                          "application/json; charset=utf-8", json);
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/login" && method == "POST") {
+        std::string cs, pw;
+        jsonFindString(bodyIn, "callsign", cs);
+        jsonFindString(bodyIn, "password", pw);
+        if (cs.empty() || pw.empty()) {
+            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"missing_credentials\"}");
+            closeSocket(s);
+            return;
+        }
+
+        Role r = Role::USER;
+        std::unordered_set<std::string> perms;
+        bool ok = false;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            auto it = g_users.find(cs);
+            if (it != g_users.end() && !it->second.banned && it->second.password == pw) {
+                ok = true;
+                r = it->second.role;
+                perms = it->second.permissions;
+            }
+        }
+
+        if (!ok) {
+            sendHttpResponse(s, "HTTP/1.1 401 Unauthorized", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"invalid_login\"}");
+            closeSocket(s);
+            return;
+        }
+
+        HttpSession sess;
+        sess.token = makeRandomToken();
+        sess.callsign = cs;
+        sess.role = r;
+        sess.permissions = perms;
+        sess.expires = std::chrono::steady_clock::now() + std::chrono::minutes(30);
+        {
+            std::lock_guard<std::mutex> lk(g_httpSessMutex);
+            purgeExpiredSessionsNoLock();
+            g_httpSessions[sess.token] = sess;
+        }
+
+        std::ostringstream out;
+        out << "{\"ok\":true,\"token\":\"" << escapeJson(sess.token)
+            << "\",\"callsign\":\"" << escapeJson(cs)
+            << "\",\"role\":\"" << roleToStr(r) << "\"";
+        if (!perms.empty()) {
+            out << ",\"permissions\":[";
+            bool first = true;
+            for (const auto& p : perms) {
+                if (!first) out << ",";
+                first = false;
+                out << "\"" << escapeJson(p) << "\"";
+            }
+            out << "]";
+        }
+        out << "}";
+
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", out.str());
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/logout" && method == "POST") {
+        std::string tok;
+        if (extractBearer(headers, tok)) {
+            std::lock_guard<std::mutex> lk(g_httpSessMutex);
+            g_httpSessions.erase(tok);
+        }
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/admin/config") {
+        HttpSession sess;
+        if (!getSessionFromHeaders(headers, sess) || !hasAtLeast(sess.role, Role::OPERATOR) || !sessionHasPerm(sess, "config.read")) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"forbidden\"}");
+            closeSocket(s);
+            return;
+        }
+
+        std::string json = buildAdminConfigJson();
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", json);
+        closeSocket(s);
+        return;
+    }
+
+    auto requireWrite = [&](const std::string& perm, HttpSession& sessOut) -> bool {
+        if (!getSessionFromHeaders(headers, sessOut)) return false;
+        if (!hasAtLeast(sessOut.role, Role::OPERATOR)) return false;
+        return sessionHasPerm(sessOut, perm);
+    };
+
+    if (pathOnly == "/api/admin/users" && method == "POST") {
+        HttpSession sess;
+        if (!requireWrite("users.write", sess)) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"forbidden\"}");
+            closeSocket(s);
+            return;
+        }
+
+        std::string op;
+        jsonFindString(bodyIn, "op", op);
+        for (auto& c : op) c = (char)std::tolower((unsigned char)c);
+
+        if (op == "delete") {
+            std::string target;
+            jsonFindString(bodyIn, "callsign", target);
+            if (target.empty()) {
+                sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                                 "{\"ok\":false,\"error\":\"missing_callsign\"}");
+                closeSocket(s);
+                return;
+            }
+
+            Role targetRole;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                targetRole = getUserRoleUnsafeNoLock(target);
+            }
+            if (!canOperatorActOn(sess.role, targetRole)) {
+                sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                                 "{\"ok\":false,\"error\":\"insufficient_privilege\"}");
+                closeSocket(s);
+                return;
+            }
+
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                auto it = g_users.find(target);
+                if (it != g_users.end()) {
+                    g_users.erase(it);
+                    ok = true;
+                }
+            }
+            if (ok) saveConfig("server.json");
+            sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8",
+                             ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"not_found\"}");
+            closeSocket(s);
+            return;
+        }
+
+        std::string cs, pw, roleS;
+        bool banned = false;
+        int pri = 0;
+        jsonFindString(bodyIn, "callsign", cs);
+        jsonFindString(bodyIn, "password", pw);
+        jsonFindString(bodyIn, "role", roleS);
+        jsonFindBool(bodyIn, "banned", banned);
+        jsonFindInt(bodyIn, "priority", pri);
+        std::vector<std::string> tgs;
+        jsonFindStringArray(bodyIn, "talkgroups", tgs);
+        std::vector<std::string> perms;
+        jsonFindStringArray(bodyIn, "permissions", perms);
+
+        if (cs.empty()) {
+            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"missing_callsign\"}");
+            closeSocket(s);
+            return;
+        }
+
+        Role newRole = roleFromStr(roleS);
+        if (newRole == Role::ADMIN && sess.role != Role::ADMIN) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"insufficient_privilege\"}");
+            closeSocket(s);
+            return;
+        }
+
+        Role targetRole;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            targetRole = getUserRoleUnsafeNoLock(cs);
+        }
+        if (!canOperatorActOn(sess.role, targetRole)) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"insufficient_privilege\"}");
+            closeSocket(s);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            User& u = g_users[cs];
+            u.callsign = cs;
+            if (!pw.empty()) u.password = pw;
+            u.role = newRole;
+            u.banned = banned;
+            u.priority = pri;
+            u.talkgroups.clear();
+            for (const auto& tg : tgs) u.talkgroups.insert(tg);
+            u.permissions.clear();
+            for (const auto& p : perms) u.permissions.insert(p);
+
+            for (const auto& tg : tgs) {
+                if (g_knownTalkgroups.find(tg) == g_knownTalkgroups.end()) {
+                    TalkgroupInfo info; info.name = tg; info.mode = TalkgroupMode::PUBLIC;
+                    g_knownTalkgroups[tg] = info;
+                }
+                if (g_talkgroups.find(tg) == g_talkgroups.end()) g_talkgroups[tg] = TalkgroupState();
+            }
+        }
+        saveConfig("server.json");
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/admin/talkgroups" && method == "POST") {
+        HttpSession sess;
+        if (!requireWrite("talkgroups.write", sess)) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"forbidden\"}");
+            closeSocket(s);
+            return;
+        }
+        std::string op;
+        jsonFindString(bodyIn, "op", op);
+        for (auto& c : op) c = (char)std::tolower((unsigned char)c);
+        if (op == "delete") {
+            std::string name;
+            jsonFindString(bodyIn, "name", name);
+            if (name.empty()) {
+                sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                                 "{\"ok\":false,\"error\":\"missing_name\"}");
+                closeSocket(s);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_knownTalkgroups.erase(name);
+                g_talkgroups.erase(name);
+                g_linkedTalkgroups.erase(name);
+            }
+            saveConfig("server.json");
+            sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+            closeSocket(s);
+            return;
+        }
+
+        std::string name, mode;
+        jsonFindString(bodyIn, "name", name);
+        jsonFindString(bodyIn, "mode", mode);
+        if (name.empty()) {
+            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"missing_name\"}");
+            closeSocket(s);
+            return;
+        }
+        TalkgroupMode m = TalkgroupMode::PUBLIC;
+        for (auto& c : mode) c = (char)std::tolower((unsigned char)c);
+        if (mode == "hide") m = TalkgroupMode::HIDE;
+        else if (mode == "admin") m = TalkgroupMode::ADMIN;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            TalkgroupInfo& t = g_knownTalkgroups[name];
+            t.name = name;
+            t.mode = m;
+            if (g_talkgroups.find(name) == g_talkgroups.end()) g_talkgroups[name] = TalkgroupState();
+        }
+        saveConfig("server.json");
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/admin/bridges" && method == "POST") {
+        HttpSession sess;
+        if (!requireWrite("bridges.write", sess)) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"forbidden\"}");
+            closeSocket(s);
+            return;
+        }
+        std::string tg;
+        jsonFindString(bodyIn, "talkgroup", tg);
+        std::vector<std::string> linked;
+        jsonFindStringArray(bodyIn, "linked", linked);
+        if (tg.empty()) {
+            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"missing_talkgroup\"}");
+            closeSocket(s);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_linkedTalkgroups[tg] = linked;
+        }
+        saveConfig("server.json");
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/admin/peers" && method == "POST") {
+        HttpSession sess;
+        if (!requireWrite("peers.write", sess)) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"forbidden\"}");
+            closeSocket(s);
+            return;
+        }
+
+        std::string op;
+        jsonFindString(bodyIn, "op", op);
+        for (auto& c : op) c = (char)std::tolower((unsigned char)c);
+        if (op == "delete") {
+            std::string name;
+            jsonFindString(bodyIn, "name", name);
+            if (name.empty()) {
+                sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                                 "{\"ok\":false,\"error\":\"missing_name\"}");
+                closeSocket(s);
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_peerMutex);
+                for (auto it = g_peerCfg.begin(); it != g_peerCfg.end(); ++it) {
+                    if (it->name == name) { g_peerCfg.erase(it); break; }
+                }
+            }
+            saveConfig("server.json");
+            compilePeerRules();
+            sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+            closeSocket(s);
+            return;
+        }
+
+        std::string name, host, secret;
+        int port = 0;
+        jsonFindString(bodyIn, "name", name);
+        jsonFindString(bodyIn, "host", host);
+        jsonFindString(bodyIn, "secret", secret);
+        jsonFindInt(bodyIn, "port", port);
+        std::vector<std::string> rules;
+        jsonFindStringArray(bodyIn, "rules", rules);
+        if (name.empty() || host.empty() || port <= 0) {
+            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"missing_fields\"}");
+            closeSocket(s);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_peerMutex);
+            bool found = false;
+            for (auto& pc : g_peerCfg) {
+                if (pc.name == name) {
+                    pc.host = host;
+                    pc.port = port;
+                    pc.secret = secret;
+                    pc.ruleStr = rules;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                PeerConfig pc;
+                pc.name = name;
+                pc.host = host;
+                pc.port = port;
+                pc.secret = secret;
+                pc.ruleStr = rules;
+                g_peerCfg.push_back(pc);
+            }
+        }
+        saveConfig("server.json");
+        compilePeerRules();
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/admin/time_announcement" && method == "POST") {
+        HttpSession sess;
+        if (!requireWrite("time_announcement.write", sess)) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"forbidden\"}");
+            closeSocket(s);
+            return;
+        }
+        bool enabled = g_timeCfg.enabled;
+        std::string folder = g_timeCfg.folder;
+        int volPermil = (int)(g_timeCfg.volumeFactor * 1000.0f);
+        jsonFindBool(bodyIn, "enabled", enabled);
+        jsonFindString(bodyIn, "folder", folder);
+        jsonFindInt(bodyIn, "volume_factor_permil", volPermil);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_timeCfg.enabled = enabled;
+            g_timeCfg.folder = folder;
+            g_timeCfg.volumeFactor = (float)volPermil / 1000.0f;
+        }
+        saveConfig("server.json");
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/admin/weather" && method == "POST") {
+        HttpSession sess;
+        if (!requireWrite("weather.write", sess)) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"forbidden\"}");
+            closeSocket(s);
+            return;
+        }
+        bool enabled = g_weatherCfg.enabled;
+        std::string hostIp = g_weatherCfg.weatherHostIp;
+        std::string tg = g_weatherCfg.talkgroup;
+        int interval = g_weatherCfg.intervalSec;
+        std::string apiKey = g_weatherCfg.apiKey;
+        std::string lat = g_weatherCfg.lat;
+        std::string lon = g_weatherCfg.lon;
+        std::string cityKey = g_weatherCfg.cityKey;
+
+        jsonFindBool(bodyIn, "enabled", enabled);
+        jsonFindString(bodyIn, "weather_host_ip", hostIp);
+        jsonFindString(bodyIn, "talkgroup", tg);
+        jsonFindInt(bodyIn, "interval_sec", interval);
+        jsonFindString(bodyIn, "api_key", apiKey);
+        jsonFindString(bodyIn, "lat", lat);
+        jsonFindString(bodyIn, "lon", lon);
+        jsonFindString(bodyIn, "city_key", cityKey);
+
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_weatherCfg.enabled = enabled;
+            g_weatherCfg.weatherHostIp = hostIp;
+            g_weatherCfg.talkgroup = tg;
+            g_weatherCfg.intervalSec = interval;
+            g_weatherCfg.apiKey = apiKey;
+            g_weatherCfg.lat = lat;
+            g_weatherCfg.lon = lon;
+            g_weatherCfg.cityKey = cityKey;
+        }
+        saveConfig("server.json");
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        closeSocket(s);
+        return;
+    }
+
+    if (pathOnly == "/api/admin/server" && method == "POST") {
+        HttpSession sess;
+        if (!requireWrite("server.write", sess)) {
+            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                             "{\"ok\":false,\"error\":\"forbidden\"}");
+            closeSocket(s);
+            return;
+        }
+        std::string sname = g_serverName;
+        std::string psec  = g_peerSecret;
+        int port = g_server_port;
+        int maxms = g_max_talk_ms;
+        std::string hroot = g_http_root;
+        int hport = g_http_port;
+        jsonFindString(bodyIn, "server_name", sname);
+        jsonFindString(bodyIn, "peer_secret", psec);
+        jsonFindInt(bodyIn, "server_port", port);
+        jsonFindInt(bodyIn, "max_talk_ms", maxms);
+        jsonFindString(bodyIn, "http_root", hroot);
+        jsonFindInt(bodyIn, "http_port", hport);
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_serverName = sname;
+            g_peerSecret = psec;
+            g_server_port = port;
+            g_max_talk_ms = maxms;
+            g_http_root = hroot;
+            g_http_port = hport;
+        }
+        saveConfig("server.json");
+        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true,\"note\":\"server needs restart for port/http changes\"}");
         closeSocket(s);
         return;
     }
@@ -3660,7 +4514,7 @@ void handleClient(SOCKET sock) {
 				continue;
 			}
 
-			if (sub == "set_admin" || sub == "set_pass" || sub == "add_tg" || sub == "drop_tg" || sub == "list_tgs" /* etc */) {
+			if (sub == "set_admin" || sub == "set_pass" || sub == "add_tg" || sub == "drop_tg" || sub == "list_tgs") {
 				if (myRole != Role::ADMIN) {
 					std::string resp = "ADMIN_FAIL admin_only\n";
 					sendAll(sock, resp.c_str(), resp.size());

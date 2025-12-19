@@ -1705,6 +1705,7 @@ static bool      g_comboOpen      = false;
 static int       g_comboWidget    = -1;
 static SDL_Rect  g_comboPopupRect = {0,0,0,0};
 static int       g_comboHoverItem = -1;
+static int 		 g_rowConnectY = 0;
 
 #if defined(__ANDROID__)
 int SDL_main(int argc, char* argv[]) {
@@ -1831,25 +1832,29 @@ int main(int argc, char** argv) {
 
     auto RebuildUI = [&](int newW, int newH) {
 #ifdef __ANDROID__
-		w = BASE_W;
-		h = BASE_H;
+	w = BASE_W;
+	h = BASE_H;
 #else
-		if (newW < 460) newW = 460;
-		if (newH < 700) newH = 700;
-		SDL_SetWindowSize(window, newW, newH);
-		SDL_GetWindowSize(window, &w, &h);
+	if (newW < 460) newW = 460;
+	if (newH < 700) newH = 700;
+	SDL_SetWindowSize(window, newW, newH);
+	SDL_GetWindowSize(window, &w, &h);
 #endif
 
-        g_comboOpen = false;
-        g_comboWidget = -1;
-        g_comboHoverItem = -1;
-        g_focusWidget = -1;
-        g_activeSlider = -1;
-        g_mouseDown = false;
+	int left  = 160;
+	int right = 24;
+	int fullW = w - left - right;
 
-        id_btnLoad1 = id_btnSave1 = id_btnLoad2 = id_btnSave2 = id_btnLoad3 = id_btnSave3 = -1;
-        id_txButton = id_btnConnect = id_cmdEdit = id_sendBtn = -1;
-        id_btnClearLog = id_btnSaveLog = -1;
+	g_comboOpen = false;
+	g_comboWidget = -1;
+	g_comboHoverItem = -1;
+	g_focusWidget = -1;
+	g_activeSlider = -1;
+	g_mouseDown = false;
+
+	id_btnLoad1 = id_btnSave1 = id_btnLoad2 = id_btnSave2 = id_btnLoad3 = id_btnSave3 = -1;
+	id_txButton = id_btnConnect = id_cmdEdit = id_sendBtn = -1;
+	id_btnClearLog = id_btnSaveLog = -1;
 
     g_widgets.clear();
 
@@ -1930,13 +1935,13 @@ int main(int argc, char** argv) {
 		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_in_dev_text, &ui_in_dev_index, &g_inputDeviceNames); y += 34;
 
 		AddLabel(1, xLabel, y, "Input Gain");
-		AddSlider(1, xCtrl, y, 290, &ui_in_gain, 0, 200, ""); y += 40;
+		AddSlider(1, xCtrl, y, fullW, &ui_in_gain, 0, 200, ""); y += 40;
 
 		AddLabel(1, xLabel, y, "Output Device");
 		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_out_dev_text, &ui_out_dev_index, &g_outputDeviceNames); y += 34;
 
 		AddLabel(1, xLabel, y, "Output Gain");
-		AddSlider(1, xCtrl, y, 290, &ui_out_gain, 0, 200, ""); y += 40;
+		AddSlider(1, xCtrl, y, fullW, &ui_out_gain, 0, 200, ""); y += 40;
 
 		id_btnLoad1 = AddButton(1, w - 190, y + 8, 80, 30, "Load");
 		id_btnSave1 = AddButton(1, w - 100, y + 8, 80, 30, "Save");
@@ -1985,13 +1990,13 @@ int main(int argc, char** argv) {
 		AddCheck(3, xCtrl, y, "Auto", &ui_rx_squelch_auto); y += 30;
 
 		AddLabel(3, xLabel, y, "Level");
-		AddSlider(3, xCtrl, y, 290, &ui_rx_squelch_level, 0, 100, ""); y += 34;
+		AddSlider(3, xCtrl, y, fullW, &ui_rx_squelch_level, 0, 100, ""); y += 34;
 
 		AddLabel(3, xLabel, y, "Discriminator");
-		AddSlider(3, xCtrl, y, 290, &ui_rx_squelch_voice, 0, 100, ""); y += 34;
+		AddSlider(3, xCtrl, y, fullW, &ui_rx_squelch_voice, 0, 100, ""); y += 34;
 
 		AddLabel(3, xLabel, y, "Hang (ms)");
-		AddSlider(3, xCtrl, y, 290, &ui_rx_squelch_hang, 0, 2000, ""); y += 44;
+		AddSlider(3, xCtrl, y, fullW, &ui_rx_squelch_hang, 0, 2000, ""); y += 44;
 
 		id_btnLoad3 = AddButton(3, w - 190, y + 8, 80, 30, "Load");
 		id_btnSave3 = AddButton(3, w - 100, y + 8, 80, 30, "Save");
@@ -2005,6 +2010,7 @@ int main(int argc, char** argv) {
 
 	int cmdY = h - bottomPadding - cmdHeight;
 	int row2Y = cmdY - gap - rowHeight;
+	g_rowConnectY = row2Y;
 	int txBtnY = row2Y - gap - txHeight;
 
 	bottomTop = txBtnY;
@@ -2462,18 +2468,18 @@ int main(int argc, char** argv) {
         g_inputGain  = ui_in_gain  / 100.0f;
         g_outputGain = ui_out_gain / 100.0f;
 
-	if (ui_rx_squelch_level < 0) ui_rx_squelch_level = 0;
-	if (ui_rx_squelch_level > 100) ui_rx_squelch_level = 100;
-	if (ui_rx_squelch_voice < 0) ui_rx_squelch_voice = 0;
-	if (ui_rx_squelch_voice > 100) ui_rx_squelch_voice = 100;
-	if (ui_rx_squelch_hang < 0) ui_rx_squelch_hang = 0;
-	if (ui_rx_squelch_hang > 5000) ui_rx_squelch_hang = 5000;
+		if (ui_rx_squelch_level < 0) ui_rx_squelch_level = 0;
+		if (ui_rx_squelch_level > 100) ui_rx_squelch_level = 100;
+		if (ui_rx_squelch_voice < 0) ui_rx_squelch_voice = 0;
+		if (ui_rx_squelch_voice > 100) ui_rx_squelch_voice = 100;
+		if (ui_rx_squelch_hang < 0) ui_rx_squelch_hang = 0;
+		if (ui_rx_squelch_hang > 5000) ui_rx_squelch_hang = 5000;
 
-	g_rxSquelchEnabled  = ui_rx_squelch_en;
-	g_rxSquelchAuto     = ui_rx_squelch_auto;
-	g_rxSquelchLevel    = ui_rx_squelch_level;
-	g_rxSquelchVoicePct = ui_rx_squelch_voice;
-	g_rxSquelchHangMs   = ui_rx_squelch_hang;
+		g_rxSquelchEnabled  = ui_rx_squelch_en;
+		g_rxSquelchAuto     = ui_rx_squelch_auto;
+		g_rxSquelchLevel    = ui_rx_squelch_level;
+		g_rxSquelchVoicePct = ui_rx_squelch_voice;
+		g_rxSquelchHangMs   = ui_rx_squelch_hang;
 
 		if (id_txButton >= 0 && id_txButton < (int)g_widgets.size()) {
 			bool enabled = g_connected && !g_isTalking.load();
@@ -2555,23 +2561,18 @@ int main(int argc, char** argv) {
 			status += " / Mode: " + g_cfg.mode;
 			DrawText(renderer, font, status, 130, statusY, COL_TEXT_MUT);
 
-			int talkerTop    = statusY + 84;
-			int talkerBottom = bottomTop - 10;
-			int talkerHeight = 140;
+			const int talkerGapAboveConnect = 12;
+			const int talkerHeight = 140;
 
-			if (talkerTop + talkerHeight > talkerBottom) {
-				talkerHeight = talkerBottom - talkerTop;
-				if (talkerHeight < 40)
-					talkerHeight = 40;
-			}
+			int talkerBottom = g_rowConnectY - talkerGapAboveConnect - (talkerHeight / 2);
+			int talkerTop    = talkerBottom - talkerHeight;
 
-			SDL_Rect rcTalkerCard = { 20, talkerTop, w - 40, talkerHeight };
-			SDL_Rect rcTalkerInner = {
-				rcTalkerCard.x + 8,
-				rcTalkerCard.y + 24,
-				rcTalkerCard.w - 16,
-				rcTalkerCard.h - 32
-			};
+			int minTop = contentTop + 10;
+			if (talkerTop < minTop) talkerTop = minTop;
+
+			SDL_Rect rcTalkerCard  = { 20, talkerTop, w - 40, talkerBottom - talkerTop };
+			SDL_Rect rcTalkerInner = { rcTalkerCard.x + 8, rcTalkerCard.y + 24,
+									   rcTalkerCard.w - 16, rcTalkerCard.h - 32 };
 
 			DrawRect(renderer, rcTalkerCard, COL_PANEL);
 			DrawRectBorder(renderer, rcTalkerCard, COL_PANEL_BD, 1);
