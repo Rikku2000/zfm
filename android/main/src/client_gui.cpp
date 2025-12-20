@@ -1775,8 +1775,8 @@ int main(int argc, char** argv) {
     }
 
 #if defined(__ANDROID__)
-	constexpr int BASE_W = 460;
-	constexpr int BASE_H = 818;
+	const int BASE_W = 460;
+	const int BASE_H = 818;
 
 	SDL_RenderSetLogicalSize(renderer, BASE_W, BASE_H);
 	SDL_RenderSetIntegerScale(renderer, SDL_FALSE);

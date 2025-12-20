@@ -1,6 +1,9 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -35,6 +38,7 @@
   #include <unistd.h>
   #include <netdb.h>
   #include <netinet/tcp.h>
+  #include <sys/time.h>
   #define INVALID_SOCKET -1
   #define SOCKET_ERROR -1
   typedef int SOCKET;
@@ -191,13 +195,39 @@ void closeSocket(SOCKET s) {
 #endif
 }
 
+static void shutdownSocket(SOCKET s) {
+#ifdef _WIN32
+    ::shutdown(s, SD_BOTH);
+#else
+    ::shutdown(s, SHUT_RDWR);
+#endif
+}
+
 bool sendAll(SOCKET sock, const void* data, size_t len) {
-    const char* buf = static_cast<const char*>(data);
-    while (len > 0) {
-        int sent = send(sock, buf, static_cast<int>(len), 0);
-        if (sent <= 0) return false;
-        buf += sent;
-        len -= sent;
+    const char* p = static_cast<const char*>(data);
+    size_t off = 0;
+
+    while (off < len) {
+        size_t want = len - off;
+
+#ifdef _WIN32
+        int n = ::send(sock, p + off, (int)want, 0);
+        if (n == SOCKET_ERROR) {
+            int e = WSAGetLastError();
+            if (e == WSAEINTR) continue;
+            if (e == WSAETIMEDOUT || e == WSAEWOULDBLOCK) return false;
+            return false;
+        }
+#else
+        ssize_t n = ::send(sock, p + off, want, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return false;
+            return false;
+        }
+#endif
+        if (n == 0) return false;
+        off += (size_t)n;
     }
     return true;
 }
@@ -435,6 +465,118 @@ struct User {
     int priority;
 };
 
+extern std::atomic<bool> g_running;
+
+static const size_t ZFM_MAX_TX_QUEUE_BYTES = 512 * 1024;
+static const size_t ZFM_DROP_AUDIO_AFTER = 256 * 1024;
+
+struct TxChunk {
+    std::vector<char> data;
+    size_t off;
+    bool isAudio;
+};
+
+struct ClientTxState {
+    std::mutex m;
+    std::condition_variable cv;
+    std::deque<TxChunk> q;
+    size_t queuedBytes;
+    std::atomic<bool> alive;
+
+    ClientTxState() : queuedBytes(0), alive(true) {}
+};
+
+static bool enqueueToTx(const std::shared_ptr<ClientTxState>& tx,
+                        const void* data,
+                        size_t len,
+                        bool isAudio)
+{
+    if (!tx || len == 0) return true;
+
+    if (isAudio && tx->queuedBytes > ZFM_DROP_AUDIO_AFTER) {
+        return true;
+    }
+
+    std::unique_lock<std::mutex> lk(tx->m);
+    if (!tx->alive.load()) return false;
+
+    if (tx->queuedBytes + len > ZFM_MAX_TX_QUEUE_BYTES) {
+        return false;
+    }
+
+    TxChunk ch;
+    ch.data.assign((const char*)data, (const char*)data + len);
+    ch.off = 0;
+    ch.isAudio = isAudio;
+
+    tx->queuedBytes += len;
+    tx->q.push_back(std::move(ch));
+    lk.unlock();
+    tx->cv.notify_one();
+    return true;
+}
+
+static bool enqueueStrToTx(const std::shared_ptr<ClientTxState>& tx,
+                           const std::string& s,
+                           bool isAudio)
+{
+    return enqueueToTx(tx, s.data(), s.size(), isAudio);
+}
+
+static void clientSenderThreadFunc(SOCKET sock, std::shared_ptr<ClientTxState> tx)
+{
+    while (g_running) {
+        TxChunk cur;
+
+        {
+            std::unique_lock<std::mutex> lk(tx->m);
+            tx->cv.wait(lk, [&]{
+                return !g_running || !tx->alive.load() || !tx->q.empty();
+            });
+
+            if (!g_running || !tx->alive.load()) break;
+
+            cur = std::move(tx->q.front());
+            tx->q.pop_front();
+        }
+
+        while (tx->alive.load() && cur.off < cur.data.size()) {
+            const char* p = cur.data.data() + cur.off;
+            size_t want = cur.data.size() - cur.off;
+
+#ifdef _WIN32
+            int n = ::send(sock, p, (int)want, 0);
+            if (n == SOCKET_ERROR) {
+                int e = WSAGetLastError();
+                if (e == WSAEINTR) continue;
+                break;
+            }
+#else
+            ssize_t n = ::send(sock, p, want, MSG_NOSIGNAL);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                break;
+            }
+#endif
+            if (n <= 0) break;
+            cur.off += (size_t)n;
+
+            {
+                std::lock_guard<std::mutex> lk(tx->m);
+                tx->queuedBytes = (tx->queuedBytes >= (size_t)n) ? (tx->queuedBytes - (size_t)n) : 0;
+            }
+        }
+
+        if (cur.off < cur.data.size()) {
+            tx->alive.store(false);
+            shutdownSocket(sock);
+            break;
+        }
+    }
+}
+
+
 struct ClientInfo {
     SOCKET sock;
     std::string callsign;
@@ -442,6 +584,7 @@ struct ClientInfo {
     bool authenticated;
     std::string remoteAddr;
 	OpusDecoder* opusDec;
+    std::shared_ptr<ClientTxState> tx;
 };
 
 struct TalkgroupState {
@@ -2046,7 +2189,7 @@ void broadcastToTalkgroup(const std::string& tg,
                           const std::string& message,
                           SOCKET exceptSock = INVALID_SOCKET)
 {
-    std::vector<SOCKET> targets;
+    std::vector<std::pair<SOCKET, std::shared_ptr<ClientTxState>>> targets;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         targets.reserve(g_clients.size());
@@ -2059,12 +2202,16 @@ void broadcastToTalkgroup(const std::string& tg,
             if (!ci.authenticated) continue;
             if (ci.talkgroup != tg) continue;
 
-            targets.push_back(cs);
+            targets.emplace_back(cs, ci.tx);
         }
     }
 
-    for (SOCKET cs : targets) {
-        sendAll(cs, message.c_str(), message.size());
+    for (auto& t : targets) {
+        SOCKET cs = t.first;
+        auto& tx = t.second;
+        if (!enqueueStrToTx(tx, message, false)) {
+            shutdownSocket(cs);
+        }
     }
 }
 
@@ -3662,12 +3809,25 @@ static void flushAudioJitterForTalkgroup(const std::string& tg,const std::string
     oss << "AUDIO_FROM " << fromUser << " " << remaining.size() << "\n";
     std::string header = oss.str();
 
-    std::vector<SOCKET> targets;
-    collectTalkgroupSockets(tg, exceptSock, targets);
+    std::vector<std::pair<SOCKET, std::shared_ptr<ClientTxState>>> targets;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        targets.reserve(g_clients.size());
+        for (const auto& kv : g_clients) {
+            SOCKET cs = kv.first;
+            if (cs == exceptSock) continue;
+            const ClientInfo& ci = kv.second;
+            if (!ci.authenticated) continue;
+            if (ci.talkgroup != tg) continue;
+            targets.emplace_back(cs, ci.tx);
+        }
+    }
 
-    for (SOCKET cs : targets) {
-        if (!sendAll(cs, header.data(), header.size())) continue;
-        sendAll(cs, remaining.data(), remaining.size());
+    for (auto& t : targets) {
+        SOCKET cs = t.first;
+        auto& tx = t.second;
+        if (!enqueueStrToTx(tx, header, /*isAudio=*/false)) { shutdownSocket(cs); continue; }
+        if (!enqueueToTx(tx, remaining.data(), remaining.size(), /*isAudio=*/true)) { shutdownSocket(cs); continue; }
     }
 }
 
@@ -3696,8 +3856,14 @@ void broadcastAudioToTalkgroup(const std::string& tg,
         }
 
         for (SOCKET cs : targets) {
-            if (!sendAll(cs, header.data(), header.size())) continue;
-            sendAll(cs, pcm.data(), pcm.size());
+            std::shared_ptr<ClientTxState> tx;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                auto it = g_clients.find(cs);
+                if (it != g_clients.end()) tx = it->second.tx;
+            }
+            if (!enqueueStrToTx(tx, header, /*isAudio=*/false)) { shutdownSocket(cs); continue; }
+            if (!enqueueToTx(tx, pcm.data(), pcm.size(), /*isAudio=*/true)) { shutdownSocket(cs); continue; }
         }
     };
 
@@ -3873,6 +4039,7 @@ void cleanupClient(SOCKET sock) {
     bool speakerCleared = false;
 
     OpusDecoder* decToDestroy = nullptr;
+    std::shared_ptr<ClientTxState> tx;
 
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -3894,7 +4061,16 @@ void cleanupClient(SOCKET sock) {
         decToDestroy = it->second.opusDec;
         it->second.opusDec = nullptr;
 
+        tx = it->second.tx;
         g_clients.erase(it);
+    }
+
+    if (tx) {
+        {
+            std::lock_guard<std::mutex> lk(tx->m);
+            tx->alive.store(false);
+        }
+        tx->cv.notify_all();
     }
 
     if (decToDestroy) {
@@ -4010,6 +4186,7 @@ static Role getUserRoleUnsafeNoLock(const std::string& cs) {
 }
 
 void handleClient(SOCKET sock) {
+    auto tx = std::make_shared<ClientTxState>();
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         ClientInfo ci;
@@ -4019,6 +4196,7 @@ void handleClient(SOCKET sock) {
         ci.authenticated = false;
         ci.remoteAddr = "unknown";
 		ci.opusDec = nullptr;
+        ci.tx = tx;
 
         sockaddr_in addr;
         socklen_t len = sizeof(addr);
@@ -4031,6 +4209,8 @@ void handleClient(SOCKET sock) {
 
         g_clients[sock] = ci;
     }
+
+    std::thread(clientSenderThreadFunc, sock, tx).detach();
 
     std::string line;
 

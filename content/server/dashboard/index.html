@@ -32,10 +32,18 @@
 	  </section>
 
 	  <section class="table-wrapper waveform-card">
-		<h2 style="text-align: center;">Live Waveform</h2>
-		<canvas id="waveCanvas" width="800" height="120"></canvas>
+		<h2 style="text-align: center;">Spectrum / Waterfall - <strong><span id="waveTgLabel">gateway</span></strong></h2>
+		<div class="waterfall-wrap" id="waterfallWrap" aria-label="Spectrum / Waterfall">
+			<canvas id="wfCanvas" width="800" height="260"></canvas>
+			<canvas id="wfOverlay" width="800" height="260"></canvas>
+		</div>
 		<div class="status-msg status-msg-small" style="text-align: center;">
-		  Showing audio from: <strong><span id="waveTgLabel">gateway</span></strong>
+		  <div class="waterfall-controls">
+		    <label class="toggle">
+			  <input type="checkbox" id="autoFollowTg" checked>
+			  <span>Auto-follow active talkgroup</span>
+		    </label>
+		  </div>
 		</div>
 	  </section>
 	</div>
