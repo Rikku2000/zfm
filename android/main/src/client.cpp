@@ -471,7 +471,7 @@ struct ClientConfig {
 };
 
 bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
-    cfg.mode = "server";
+    cfg.mode = "Server";
     cfg.server_ip = "127.0.0.1";
     cfg.server_port = 26613;
     cfg.callsign = "guest";

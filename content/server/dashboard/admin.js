@@ -722,10 +722,10 @@ function renderPeers() {
     return `
       <tr>
         <td>${esc(p.name)}</td>
-        <td><input data-k="host" data-name="${esc(p.name)}" value="${esc(p.host)}" /></td>
-        <td><input data-k="port" data-name="${esc(p.name)}" value="${esc(p.port)}" /></td>
-        <td><input data-k="secret" data-name="${esc(p.name)}" value="${esc(p.secret || "")}" /></td>
-        <td><input data-k="rules" data-name="${esc(p.name)}" value="${esc(rules)}" placeholder="local=remote:tx,..." /></td>
+        <td>${esc(p.host)}</td>
+        <td>${esc(p.port)}</td>
+        <td>${esc(p.secret || "")}</td>
+        <td>${esc(rules)}</td>
         <td class="action-row">
 		  <button class="btn btn-primary" data-act="edit-peer" data-name="${esc(p.name)}">Edit</button>
           <button class="btn btn-danger" data-act="del-peer" data-name="${esc(p.name)}">Delete</button>

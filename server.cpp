@@ -576,7 +576,6 @@ static void clientSenderThreadFunc(SOCKET sock, std::shared_ptr<ClientTxState> t
     }
 }
 
-
 struct ClientInfo {
     SOCKET sock;
     std::string callsign;
@@ -782,7 +781,7 @@ struct PeerConn {
     PeerConn() : sock(INVALID_SOCKET), running(false) {}
 };
 
-static std::string g_serverName = "server";
+static std::string g_serverName = "Server";
 static std::string g_peerSecret;
 static std::vector<PeerConfig> g_peerCfg;
 static std::mutex g_peerMutex;
@@ -3826,7 +3825,7 @@ static void flushAudioJitterForTalkgroup(const std::string& tg,const std::string
     for (auto& t : targets) {
         SOCKET cs = t.first;
         auto& tx = t.second;
-        if (!enqueueStrToTx(tx, header, /*isAudio=*/false)) { shutdownSocket(cs); continue; }
+        if (!enqueueStrToTx(tx, header, false)) { shutdownSocket(cs); continue; }
         if (!enqueueToTx(tx, remaining.data(), remaining.size(), /*isAudio=*/true)) { shutdownSocket(cs); continue; }
     }
 }
@@ -4306,61 +4305,105 @@ void handleClient(SOCKET sock) {
                 break;
             }
 		}
-        else if (cmd == "JOIN") {
-            std::string tg;
-            iss >> tg;
+		else if (cmd == "JOIN") {
+			std::string requestedTg;
+			iss >> requestedTg;
 
-            bool ok = false;
-            std::string err;
-            std::string prevTg;
-            std::string callsign;
+			static const std::string SCANNER_TG = "SCANNER";
 
-            {
-                std::lock_guard<std::mutex> lock(g_mutex);
-                std::unordered_map<SOCKET, ClientInfo>::iterator it = g_clients.find(sock);
-                if (it == g_clients.end()) {
-                    err = "unknown_client";
-                } else {
-                    ClientInfo &ci = it->second;
-                    callsign = ci.callsign;
-                    prevTg   = ci.talkgroup;
+			bool ok = false;
+			std::string err;
+			std::string prevTg;
+			std::string callsign;
 
-                    if (!ci.authenticated) {
-                        err = "not_authenticated";
-                    } else {
-                        std::unordered_map<std::string, User>::iterator uit = g_users.find(ci.callsign);
-                        if (uit == g_users.end()) {
-                            err = "unknown_user";
-                        } else if (g_knownTalkgroups.find(tg) == g_knownTalkgroups.end()) {
-                            err = "unknown_talkgroup";
-                        } else if (uit->second.talkgroups.find(tg) == uit->second.talkgroups.end()) {
-                            err = "not_in_talkgroup";
-                        } else {
-                            ci.talkgroup = tg;
-                            if (g_talkgroups.find(tg) == g_talkgroups.end()) {
-                                g_talkgroups[tg];
-                            }
-                            ok = true;
-                        }
-                    }
-                }
-            }
+			std::string effectiveTg = requestedTg;
 
-            if (ok) {
-                std::string resp = "JOIN_OK " + tg + "\n";
-                sendAll(sock, resp.c_str(), resp.size());
+			bool redirected = false;
+
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+				auto it = g_clients.find(sock);
+				if (it == g_clients.end()) {
+					err = "unknown_client";
+				} else {
+					ClientInfo &ci = it->second;
+					callsign = ci.callsign;
+					prevTg   = ci.talkgroup;
+
+					if (!ci.authenticated) {
+						err = "not_authenticated";
+					} else {
+						auto uit = g_users.find(ci.callsign);
+						if (uit == g_users.end()) {
+							err = "unknown_user";
+						} else {
+							User &user = uit->second;
+
+							auto pickFallback = [&]() -> std::string {
+								std::string best;
+								for (const auto &tg : user.talkgroups) {
+									if (g_knownTalkgroups.find(tg) == g_knownTalkgroups.end())
+										continue;
+									if (best.empty() || tg < best)
+										best = tg;
+								}
+								return best;
+							};
+
+							const bool requestedIsScanner = (requestedTg == SCANNER_TG);
+
+							bool requestedKnown = (g_knownTalkgroups.find(requestedTg) != g_knownTalkgroups.end());
+							bool requestedAllowed = (user.talkgroups.find(requestedTg) != user.talkgroups.end());
+
+							if (requestedIsScanner || !requestedKnown || !requestedAllowed) {
+								std::string fallback = pickFallback();
+								if (!fallback.empty()) {
+									effectiveTg = fallback;
+									redirected = true;
+								} else {
+									err = "no_allowed_talkgroup";
+								}
+							}
+
+							if (err.empty()) {
+								ci.talkgroup = effectiveTg;
+								if (g_talkgroups.find(effectiveTg) == g_talkgroups.end()) {
+									g_talkgroups[effectiveTg];
+								}
+								ok = true;
+							} else {
+								ok = false;
+							}
+						}
+					}
+				}
+			}
+
+			if (ok) {
+				std::string resp = "JOIN_OK " + effectiveTg + "\n";
+				sendAll(sock, resp.c_str(), resp.size());
+
+				if (redirected) {
+					if (requestedTg == SCANNER_TG) {
+						std::string info = "INFO join_scanner " + effectiveTg + "\n";
+						sendAll(sock, info.c_str(), info.size());
+					} else if (requestedTg != effectiveTg) {
+						std::string info = "INFO join_redirect " + requestedTg + " " + effectiveTg + "\n";
+						sendAll(sock, info.c_str(), info.size());
+					}
+				}
 
 				sendTalkgroupListForUser(sock, callsign);
 
-                if (!prevTg.empty() && prevTg != tg) {
-                    triggerAnnouncementForTalkgroup(prevTg, "tg_leave");
-                }
-                triggerAnnouncementForTalkgroup(tg, "tg_join");
-            } else {
-                std::string resp = "JOIN_FAIL " + err + "\n";
-                sendAll(sock, resp.c_str(), resp.size());
-            }
-        }
+				if (!prevTg.empty() && prevTg != effectiveTg) {
+					triggerAnnouncementForTalkgroup(prevTg, "tg_leave");
+				}
+				triggerAnnouncementForTalkgroup(effectiveTg, "tg_join");
+			} else {
+				std::string resp = "JOIN_FAIL " + err + "\n";
+				sendAll(sock, resp.c_str(), resp.size());
+			}
+		}
 		else if (cmd == "REQ_SPEAK") {
 			std::string tg;
 			std::string user;

@@ -562,7 +562,6 @@ static void GuiPushToTalkLoop() {
     if (g_cfg.gpio_ptt_enabled) {
         setPtt(false);
     }
-    playMicFreeSound();
 
     g_guiPttThreadRunning = false;
 	g_talkerActive = false;
@@ -1166,6 +1165,8 @@ std::vector<std::string> g_tgComboItems;
 int ui_tg_index = 0;
 
 static std::string ui_sample_rate;
+static std::vector<std::string> g_sampleRateItems;
+static int ui_sample_rate_index = 0;
 static std::string ui_frames_per_buffer;
 static std::string ui_channels;
 
@@ -1215,12 +1216,12 @@ static std::string ui_roger_text;
 static std::string ui_cmd;
 
 static void CfgToUi() {
-    ui_mode       = (g_cfg.mode == "parrot") ? "parrot" : "server";
-    ui_mode_index = (g_cfg.mode == "parrot") ? 1 : 0;
+    ui_mode       = (g_cfg.mode == "Parrot") ? "Parrot" : "Server";
+    ui_mode_index = (g_cfg.mode == "Parrot") ? 1 : 0;
     if (ui_mode_index >= 0 && ui_mode_index < (int)g_modeItems.size())
         ui_mode = g_modeItems[ui_mode_index];
     else
-        ui_mode = "server";
+        ui_mode = "Server";
 
     ui_server_ip   = g_cfg.server_ip;
     ui_server_port = std::to_string(g_cfg.server_port);
@@ -1250,7 +1251,21 @@ static void CfgToUi() {
         ui_talkgroup = g_tgComboItems[ui_tg_index];
     }
 
-    ui_sample_rate       = std::to_string(g_cfg.sample_rate);
+    if (g_sampleRateItems.empty()) {
+        g_sampleRateItems.push_back("8000");
+        g_sampleRateItems.push_back("11025");
+        g_sampleRateItems.push_back("16000");
+        g_sampleRateItems.push_back("22050");
+        g_sampleRateItems.push_back("44100");
+        g_sampleRateItems.push_back("48000");
+    }
+
+    ui_sample_rate = std::to_string(g_cfg.sample_rate);
+    ui_sample_rate_index = 0;
+    for (size_t i = 0; i < g_sampleRateItems.size(); ++i) {
+        if (g_sampleRateItems[i] == ui_sample_rate) { ui_sample_rate_index = (int)i; break; }
+    }
+    if (!g_sampleRateItems.empty()) ui_sample_rate = g_sampleRateItems[ui_sample_rate_index];
     ui_frames_per_buffer = std::to_string(g_cfg.frames_per_buffer);
     ui_channels          = std::to_string(g_cfg.channels);
 
@@ -1433,9 +1448,9 @@ static void CfgToUi() {
 
 static void UiToCfg() {
     if (ui_mode_index == 1)
-        g_cfg.mode = "parrot";
+        g_cfg.mode = "Parrot";
     else
-        g_cfg.mode = "server";
+        g_cfg.mode = "Server";
 
     g_cfg.server_ip   = ui_server_ip;
     g_cfg.server_port = std::atoi(ui_server_port.c_str());
@@ -1443,6 +1458,9 @@ static void UiToCfg() {
     g_cfg.password    = ui_password;
     g_cfg.talkgroup   = ui_talkgroup;
 
+    if (ui_sample_rate_index < 0) ui_sample_rate_index = 0;
+    if (ui_sample_rate_index >= (int)g_sampleRateItems.size()) ui_sample_rate_index = (int)g_sampleRateItems.size() - 1;
+    if (!g_sampleRateItems.empty()) ui_sample_rate = g_sampleRateItems[ui_sample_rate_index];
     g_cfg.sample_rate       = std::atoi(ui_sample_rate.c_str());
     g_cfg.frames_per_buffer = (unsigned long)std::atoi(ui_frames_per_buffer.c_str());
     g_cfg.channels          = std::atoi(ui_channels.c_str());
@@ -1472,6 +1490,11 @@ static void UiToCfg() {
         g_cfg.sample_rate       = 48000;
         g_cfg.frames_per_buffer = 480;
         g_cfg.channels          = 1;
+    }
+
+    ui_sample_rate = std::to_string(g_cfg.sample_rate);
+    for (size_t i = 0; i < g_sampleRateItems.size(); ++i) {
+        if (g_sampleRateItems[i] == ui_sample_rate) { ui_sample_rate_index = (int)i; break; }
     }
 
     g_cfg.vox_enabled          = ui_vox_en;
@@ -1721,8 +1744,8 @@ int main(int argc, char** argv) {
     BuildPaDeviceLists();
 
 	if (g_modeItems.empty()) {
-		g_modeItems.push_back("server");
-		g_modeItems.push_back("parrot");
+		g_modeItems.push_back("Server");
+		g_modeItems.push_back("Parrot");
 	}
 
     CfgToUi();
@@ -1915,7 +1938,7 @@ int main(int argc, char** argv) {
         AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_codec_text, &ui_codec_index, &g_codecItems); y += 34;
 
 		AddLabel(1, xLabel, y, "Sample Rate");
-		AddEdit(1, xCtrl, y - 2, w - xCtrl - 20, &ui_sample_rate); y += 34;
+		AddCombo(1, xCtrl, y - 2, w - xCtrl - 20, &ui_sample_rate, &ui_sample_rate_index, &g_sampleRateItems); y += 34;
 
 		AddLabel(1, xLabel, y, "Frames / Buffer");
 		AddEdit(1, xCtrl, y - 2, w - xCtrl - 20, &ui_frames_per_buffer); y += 34;
