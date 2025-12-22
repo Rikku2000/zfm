@@ -8,6 +8,7 @@
 #include <chrono>
 #include <limits>
 #include <fstream>
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <cstddef>
@@ -196,6 +197,17 @@ void logmsg(enum LogColorLevel level, int timed, const char *fmt, ...)
 #define LOG_OK(...)     logmsg(LOG_GREEN, 1, __VA_ARGS__)
 #define LOG_EVENT(...)  logmsg(LOG_CYAN,  1, __VA_ARGS__)
 
+std::mutex g_speakerMutex;
+std::string g_currentSpeaker;
+
+std::atomic<bool> g_pttAutoEnabled(false);
+std::atomic<bool> g_pttState(false);
+std::atomic<std::chrono::steady_clock::time_point> g_lastRxAudioTime;
+std::atomic<std::chrono::steady_clock::time_point> g_lastRxVoiceTime;
+std::atomic<int> g_pttHoldMs(250);
+
+static std::vector<int16_t> resampleMono16Linear(const std::vector<int16_t>& in, uint32_t inRate, uint32_t outRate);
+
 void initSockets() {
 #ifdef _WIN32
     WSADATA wsaData;
@@ -323,6 +335,19 @@ bool connectToServerHost(const std::string& host, int port, SOCKET& outSock)
 {
     outSock = INVALID_SOCKET;
 	g_sockStash.clear();
+	{
+		std::lock_guard<std::mutex> lock(g_speakerMutex);
+		g_currentSpeaker.clear();
+	}
+
+#ifdef GUI
+	g_talkerActive = false;
+	g_rxAudioLevel = 0.0f;
+	g_audioLevel   = 0.0f;
+#endif
+
+	g_lastRxAudioTime = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+	g_lastRxVoiceTime = std::chrono::steady_clock::now() - std::chrono::seconds(10);
 
     char portStr[16];
 #ifdef _WIN32
@@ -779,11 +804,6 @@ extern std::atomic<float> g_outputGain;
 #define PTT_HAL_IMPLEMENTATION
 #include "ptt_hal.h"
 
-std::atomic<bool> g_pttAutoEnabled(false);
-std::atomic<bool> g_pttState(false);
-std::atomic<std::chrono::steady_clock::time_point> g_lastRxAudioTime;
-std::atomic<int> g_pttHoldMs(250);
-
 void pttManagerThreadFunc() {
     while (true) {
         auto now  = std::chrono::steady_clock::now();
@@ -972,24 +992,31 @@ void loadRogerFromConfig()
 
 void playMicFreeSound() {
     if (!g_rogerSamples.empty()) {
+        std::vector<int16_t> mono;
+        if (g_rogerSampleRate != 0 && (uint32_t)g_sampleRate != g_rogerSampleRate) {
+            mono = resampleMono16Linear(g_rogerSamples, g_rogerSampleRate, (uint32_t)g_sampleRate);
+        } else {
+            mono = g_rogerSamples;
+        }
+
         std::vector<int16_t> out;
         if (g_channels == 1) {
-            out = g_rogerSamples;
+            out = mono;
         } else {
-            out.resize(g_rogerSamples.size() * g_channels);
-            for (size_t i = 0; i < g_rogerSamples.size(); ++i) {
+            out.resize(mono.size() * (size_t)g_channels);
+            for (size_t i = 0; i < mono.size(); ++i) {
                 for (int ch = 0; ch < g_channels; ++ch) {
-                    out[i * g_channels + ch] = g_rogerSamples[i];
+                    out[i * (size_t)g_channels + (size_t)ch] = mono[i];
                 }
             }
         }
+
         unsigned long frames = (unsigned long)(out.size() / g_channels);
         audioOutWriteBlockingChunked(out.data(), frames);
     } else {
         LOG_INFO("[SOUND] Mic is now free!\n");
     }
 }
-
 
 void logPaDevices() {
     int devCount = Pa_GetDeviceCount();
@@ -1434,6 +1461,37 @@ static int16_t zfm_sample_at(const int16_t* in,
     return in[srcFrame * (size_t)channels + (size_t)ch];
 }
 
+
+static std::vector<int16_t> resampleMono16Linear(const std::vector<int16_t>& in,
+                                                 uint32_t inRate,
+                                                 uint32_t outRate)
+{
+    std::vector<int16_t> out;
+    if (in.empty() || inRate == 0 || outRate == 0) return out;
+    if (inRate == outRate) return in;
+
+    const double ratio = (double)outRate / (double)inRate;
+    const size_t outCount = (size_t)std::max<double>(1.0, std::floor((double)in.size() * ratio));
+    out.resize(outCount);
+
+    for (size_t i = 0; i < outCount; ++i) {
+        const double srcPos = (double)i / ratio;
+        const size_t idx = (size_t)srcPos;
+        const double frac = srcPos - (double)idx;
+
+        const int16_t s0 = in[std::min(idx, in.size() - 1)];
+        const int16_t s1 = in[std::min(idx + 1, in.size() - 1)];
+
+        const double v = (1.0 - frac) * (double)s0 + frac * (double)s1;
+		long vv = (long)zfm_round_to_int(v);
+        if (vv > 32767) vv = 32767;
+        if (vv < -32768) vv = -32768;
+        out[i] = (int16_t)vv;
+    }
+
+    return out;
+}
+
 static std::vector<int16_t> resampleLinearInterleaved(const int16_t* in,
                                                       size_t inFrames,
                                                       int channels,
@@ -1585,6 +1643,16 @@ void playAudioFrame(const std::vector<char>& frame) {
 		g_lastRxAudioTime = std::chrono::steady_clock::now();
 	}
 
+	{
+		bool nonZero = false;
+		for (size_t i = 0; i < sampleCount; ++i) {
+			if (outSamples[i] != 0) { nonZero = true; break; }
+		}
+		if (nonZero) {
+			g_lastRxVoiceTime = std::chrono::steady_clock::now();
+		}
+	}
+
 	audioOutWrite(outSamples.data(), inFrames);
 
 #ifdef GUI
@@ -1612,9 +1680,6 @@ ClientConfig g_cfg;
 
 std::atomic<float> g_inputGain(1.0f);
 std::atomic<float> g_outputGain(1.0f);
-
-std::mutex g_speakerMutex;
-std::string g_currentSpeaker;
 
 std::mutex g_tgListMutex;
 std::vector<std::string> g_serverTalkgroups;
@@ -1668,8 +1733,6 @@ static const int g_imaStepTable[89] = {
 static inline int clamp16(int v) {
     return (v > 32767) ? 32767 : (v < -32768 ? -32768 : v);
 }
-
-
 
 static std::vector<char> imaAdpcmEncode(const int16_t* pcm, size_t n)
 {
@@ -2353,6 +2416,16 @@ void receiverLoop(SOCKET sock) {
         std::string line;
         if (!recvLine(sock, line)) {
             LOG_WARN("Disconnected from server.\n");
+
+            {
+                std::lock_guard<std::mutex> lock(g_speakerMutex);
+                g_currentSpeaker.clear();
+            }
+#ifdef GUI
+            g_talkerActive = false;
+            g_rxAudioLevel = 0.0f;
+#endif
+
             g_running = false;
             break;
         }
@@ -2498,7 +2571,9 @@ void receiverLoop(SOCKET sock) {
 					std::cout << "[TG] Now talking: " << user << "\n";
 				}
 			}
-			g_lastRxAudioTime = std::chrono::steady_clock::now();
+			auto tNow = std::chrono::steady_clock::now();
+			g_lastRxAudioTime = tNow;
+			g_lastRxVoiceTime = tNow;
 
 			std::vector<char> pcm;
 			pcm = std::move(buf);
@@ -2539,7 +2614,9 @@ void receiverLoop(SOCKET sock) {
                     std::cout << "[TG] Now talking: " << user << "";
                 }
             }
-            g_lastRxAudioTime = std::chrono::steady_clock::now();
+			auto tNow = std::chrono::steady_clock::now();
+			g_lastRxAudioTime = tNow;
+			g_lastRxVoiceTime = tNow;
 
             ensureAdpcmPlayoutThread();
             {

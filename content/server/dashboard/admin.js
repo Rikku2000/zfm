@@ -861,6 +861,9 @@ function renderServer() {
       <div class="form-row"><label>Max talk ms</label><input id="sMax" value="${esc(cfg.max_talk_ms)}" /></div>
       <div class="form-row"><label>HTTP root</label><input id="sHttpRoot" value="${esc(cfg.http_root)}" /></div>
       <div class="form-row"><label>HTTP port</label><input id="sHttpPort" value="${esc(cfg.http_port)}" /></div>
+      <div class="form-row"><label>HTTPS port</label><input id="sHttpsPort" value="${esc(cfg.https_port ?? 0)}" placeholder="8443 (0 = off)" /></div>
+      <div class="form-row"><label>HTTPS cert file</label><input id="sHttpsCert" value="${esc(cfg.https_cert_file || "")}" placeholder="cert.pem" /></div>
+      <div class="form-row"><label>HTTPS key file</label><input id="sHttpsKey" value="${esc(cfg.https_key_file || "")}" placeholder="key.pem" /></div>
       <div class="form-row"><label></label><button class="btn btn-primary" id="sSaveBtn">Save</button></div>
     </div>
   `;
@@ -872,8 +875,14 @@ function renderServer() {
     const max_talk_ms = parseInt(document.getElementById("sMax").value || "0", 10);
     const http_root = document.getElementById("sHttpRoot").value.trim();
     const http_port = parseInt(document.getElementById("sHttpPort").value || "0", 10);
+    const https_port = parseInt(document.getElementById("sHttpsPort").value || "0", 10);
+    const https_cert_file = document.getElementById("sHttpsCert").value.trim();
+    const https_key_file = document.getElementById("sHttpsKey").value.trim();
     try {
-      const r = await api("/api/admin/server", { method: "POST", body: { server_name, peer_secret, server_port, max_talk_ms, http_root, http_port } });
+      const r = await api("/api/admin/server", {
+        method: "POST",
+        body: { server_name, peer_secret, server_port, max_talk_ms, http_root, http_port, https_port, https_cert_file, https_key_file }
+      });
       setMsg(adminMsg, r.note || "Saved.");
       await refreshAll();
     } catch (e) { setMsg(adminMsg, "Error: " + e.message, false); }

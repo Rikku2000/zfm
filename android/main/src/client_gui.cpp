@@ -300,6 +300,14 @@ static bool GuiStartCore() {
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(g_speakerMutex);
+        g_currentSpeaker.clear();
+    }
+    g_talkerActive = false;
+    g_rxAudioLevel = 0.0f;
+    g_audioLevel   = 0.0f;
+
     if (g_cfg.gpio_ptt_enabled && !g_cfg.vox_enabled) {
         g_pttAutoEnabled = true;
         g_lastRxAudioTime = std::chrono::steady_clock::now();
@@ -470,6 +478,7 @@ static void GuiPushToTalkLoop() {
     auto start = std::chrono::steady_clock::now();
 
     GuiAppendLog("[PTT] You may talk now (hold Talk button)");
+	g_isTalking = true;
 #if defined(__ANDROID__)
 	AndroidFlushMicQueue();
 #endif
@@ -554,6 +563,9 @@ static void GuiPushToTalkLoop() {
     if (g_cfg.gpio_ptt_enabled) {
         setPtt(false);
     }
+
+	g_isTalking = false;
+	if (g_currentSpeaker == g_cfg.callsign) g_currentSpeaker.clear();
 
     g_guiPttThreadRunning = false;
 	g_talkerActive = false;
@@ -819,71 +831,73 @@ static void PushRow(std::vector<std::string>& dst, const char* const* items, int
 static void BuildOnScreenKeyboard(int winW, int winH) {
     g_kbKeys.clear();
 
-    const int kbH = 240;
+    const int kbH = 300;
     const int pad = 8;
     const int rowGap = 8;
     const int keyGap = 6;
 
-    g_kbRect.x = 0;
-    g_kbRect.y = winH - kbH;
-    g_kbRect.w = winW;
-    g_kbRect.h = kbH;
+    g_kbRect = { 0, winH - kbH, winW, kbH };
 
     struct AddKeyHelper {
-        static void add(std::vector<OsKey>& keys, const std::string& label, const std::string& out,
-                        OsKey::Kind kind, int x, int y, int w, int h) {
+        static void add(std::vector<OsKey>& keys, const std::string& label, const std::string& out, OsKey::Kind kind, int x, int y, int w, int h) {
             OsKey k;
             k.label = label;
             k.out   = out;
             k.kind  = kind;
-            k.rect.x = x; k.rect.y = y; k.rect.w = w; k.rect.h = h;
+            k.rect  = { x, y, w, h };
             keys.push_back(k);
         }
     };
 
-	static const char* const R1A[] = {"q","w","e","r","t","y","u","i","o","p"};
-	static const char* const R2A[] = {"a","s","d","f","g","h","j","k","l"};
-	static const char* const R3A[] = {"z","x","c","v","b","n","m",".","_"};
+    static const char* const R0N[] = { "1","2","3","4","5","6","7","8","9","0" };
 
-	static const char* const R1AShift[] = {"Q","W","E","R","T","Y","U","I","O","P"};
-	static const char* const R2AShift[] = {"A","S","D","F","G","H","J","K","L"};
-	static const char* const R3AShift[] = {"Z","X","C","V","B","N","M"};
+    static const char* const R1A[] = { "q","w","e","r","t","y","u","i","o","p" };
+    static const char* const R2A[] = { "a","s","d","f","g","h","j","k","l" };
+    static const char* const R3A[] = { "z","x","c","v","b","n","m" };
 
-    static const char* const R1S[] = {"1","2","3","4","5","6","7","8","9","0"};
-    static const char* const R2S[] = {"-","/",":",";","(",")","$","&","@","\""};
-    static const char* const R3S[] = {".",",","?","!","'"};
+    static const char* const R1AShift[] = { "Q","W","E","R","T","Y","U","I","O","P" };
+    static const char* const R2AShift[] = { "A","S","D","F","G","H","J","K","L" };
+    static const char* const R3AShift[] = { "Z","X","C","V","B","N","M" };
+
+    static const char* const R1S[] = { "-","/",":",";","(",")","$","&","@","\"" };
+    static const char* const R2S[] = { ".",",","?","!","'" };
 
     std::vector<std::string> r0, r1, r2, r3;
+
+    PushRow(r0, R0N, (int)(sizeof(R0N) / sizeof(R0N[0])));
+
     if (!g_kbSymbols) {
-		if (g_kbShift) {
-			PushRow(r1, R1AShift, (int)(sizeof(R1AShift)/sizeof(R1AShift[0])));
-			PushRow(r2, R2AShift, (int)(sizeof(R2AShift)/sizeof(R2AShift[0])));
-			PushRow(r3, R3AShift, (int)(sizeof(R3AShift)/sizeof(R3AShift[0])));
-		} else {
-			PushRow(r1, R1A, (int)(sizeof(R1A)/sizeof(R1A[0])));
-			PushRow(r2, R2A, (int)(sizeof(R2A)/sizeof(R2A[0])));
-			PushRow(r3, R3A, (int)(sizeof(R3A)/sizeof(R3A[0])));
-		}
+        if (g_kbShift) {
+            PushRow(r1, R1AShift, (int)(sizeof(R1AShift) / sizeof(R1AShift[0])));
+            PushRow(r2, R2AShift, (int)(sizeof(R2AShift) / sizeof(R2AShift[0])));
+            PushRow(r3, R3AShift, (int)(sizeof(R3AShift) / sizeof(R3AShift[0])));
+        } else {
+            PushRow(r1, R1A, (int)(sizeof(R1A) / sizeof(R1A[0])));
+            PushRow(r2, R2A, (int)(sizeof(R2A) / sizeof(R2A[0])));
+            PushRow(r3, R3A, (int)(sizeof(R3A) / sizeof(R3A[0])));
+        }
     } else {
-        PushRow(r1, R1S, (int)(sizeof(R1S)/sizeof(R1S[0])));
-        PushRow(r2, R2S, (int)(sizeof(R2S)/sizeof(R2S[0])));
-        PushRow(r3, R3S, (int)(sizeof(R3S)/sizeof(R3S[0])));
+        PushRow(r1, R1S, (int)(sizeof(R1S) / sizeof(R1S[0])));
+        PushRow(r2, R2S, (int)(sizeof(R2S) / sizeof(R2S[0])));
+        r3.clear();
     }
 
     int y = g_kbRect.y + pad;
 
     struct RowBuilder {
-        static void make(std::vector<OsKey>& keys, const std::vector<std::string>& row,
-                         int winW, int yRow, int pad, int keyGap, int leftIndent, int rightIndent) {
+        static void make(std::vector<OsKey>& keys, const std::vector<std::string>& row, int winW, int yRow, int pad, int keyGap, int leftIndent, int rightIndent) {
             int usableW = winW - (pad * 2) - leftIndent - rightIndent;
             int keyW = (int)((usableW - (int)(row.size() - 1) * keyGap) / (int)row.size());
             int x = pad + leftIndent;
-            for (size_t i = 0; i < row.size(); ++i) {
-                AddKeyHelper::add(keys, row[i], row[i], OsKey::Normal, x, yRow, keyW, 44);
+            for (const auto& k : row) {
+                AddKeyHelper::add(keys, k, k, OsKey::Normal, x, yRow, keyW, 44);
                 x += keyW + keyGap;
             }
         }
     };
+
+    RowBuilder::make(g_kbKeys, r0, winW, y, pad, keyGap, 0, 0);
+    y += 44 + rowGap;
 
     RowBuilder::make(g_kbKeys, r1, winW, y, pad, keyGap, 0, 0);
     y += 44 + rowGap;
@@ -895,20 +909,24 @@ static void BuildOnScreenKeyboard(int winW, int winH) {
         int rowH = 44;
         int leftW = 70;
         int rightW = 90;
-
         int x = pad;
-        AddKeyHelper::add(g_kbKeys, g_kbShift ? "SHIFT" : "Shift", "", OsKey::Shift, x, y, leftW, rowH);
+
+        AddKeyHelper::add(g_kbKeys,
+            g_kbShift ? "SHIFT" : "Shift",
+            "", OsKey::Shift,
+            x, y, leftW, rowH);
         x += leftW + keyGap;
 
         int usableW = winW - (pad * 2) - leftW - rightW - (keyGap * 2);
         int keyW = (int)((usableW - (int)(r3.size() - 1) * keyGap) / (int)r3.size());
 
-        for (size_t i = 0; i < r3.size(); ++i) {
-            AddKeyHelper::add(g_kbKeys, r3[i], r3[i], OsKey::Normal, x, y, keyW, rowH);
+        for (const auto& k : r3) {
+            AddKeyHelper::add(g_kbKeys, k, k, OsKey::Normal, x, y, keyW, rowH);
             x += keyW + keyGap;
         }
 
         AddKeyHelper::add(g_kbKeys, "Backspace", "", OsKey::Backspace, winW - pad - rightW, y, rightW, rowH);
+
         y += rowH + rowGap;
     }
 
@@ -916,22 +934,19 @@ static void BuildOnScreenKeyboard(int winW, int winH) {
         int rowH = 46;
         int x = pad;
 
-        int wToggle = 90;
-        int wHide = 60;
-        int wEnter = 90;
+        AddKeyHelper::add(g_kbKeys, g_kbSymbols ? "ABC" : "123", "", OsKey::ToggleSym, x, y, 90, rowH);
+        x += 90 + keyGap;
 
-        AddKeyHelper::add(g_kbKeys, g_kbSymbols ? "ABC" : "123", "", OsKey::ToggleSym, x, y, wToggle, rowH);
-        x += wToggle + keyGap;
+        AddKeyHelper::add(g_kbKeys, "Hide", "", OsKey::Hide, x, y, 60, rowH);
+        x += 60 + keyGap;
 
-        AddKeyHelper::add(g_kbKeys, "Hide", "", OsKey::Hide, x, y, wHide, rowH);
-        x += wHide + keyGap;
-
-        int spaceW = (winW - (pad * 2)) - (wToggle + wHide + wEnter) - (keyGap * 3);
+        int spaceW = (winW - (pad * 2)) - (90 + 60 + 90) - (keyGap * 3);
         if (spaceW < 80) spaceW = 80;
+
         AddKeyHelper::add(g_kbKeys, "Space", " ", OsKey::Space, x, y, spaceW, rowH);
         x += spaceW + keyGap;
 
-        AddKeyHelper::add(g_kbKeys, "Enter", "", OsKey::Enter, x, y, wEnter, rowH);
+        AddKeyHelper::add(g_kbKeys, "Enter", "", OsKey::Enter, x, y, 90, rowH);
     }
 }
 
@@ -1786,7 +1801,7 @@ int main(int argc, char** argv) {
 	SDL_RenderSetIntegerScale(renderer, SDL_FALSE);
 #endif
 
-    const char* fontPath = "opensans-regular.ttf";
+    const char* fontPath = "raleway-regular.ttf";
 	TTF_Font* fontTiny = TTF_OpenFont(fontPath, 12);
 	TTF_Font* font = TTF_OpenFont(fontPath, 16);
 	TTF_Font* fontBig = TTF_OpenFont(fontPath, 26);
@@ -2593,6 +2608,24 @@ int main(int argc, char** argv) {
 
 			DrawRect(renderer, rcTalkerInner, COL_INPUT_BG);
 			DrawRectBorder(renderer, rcTalkerInner, COL_INPUT_BD, 1);
+
+			{
+				if (!g_isTalking.load()) {
+					auto now  = std::chrono::steady_clock::now();
+					auto last = g_lastRxVoiceTime.load();
+					long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count();
+					int hangMs = g_rxSquelchHangMs.load();
+					if (hangMs < 150) hangMs = 150;
+					if (ms > (long long)hangMs + 250) {
+						std::lock_guard<std::mutex> lock(g_speakerMutex);
+						if (!g_currentSpeaker.empty()) {
+							g_currentSpeaker.clear();
+							g_talkerActive = false;
+							g_rxAudioLevel = 0.0f;
+						}
+					}
+				}
+			}
 
 			std::string talker = g_currentSpeaker.empty() ? "" : g_currentSpeaker;
 			if (!talker.empty()) {

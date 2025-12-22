@@ -69,7 +69,7 @@ The client GUI automatically updates its talkgroup selector.
 
 ```
 sudo apt install build-essential
-sudo apt install libportaudio2 portaudio19-dev libopus-dev
+sudo apt install libportaudio2 portaudio19-dev
 sudo apt install libsdl2-dev libsdl2-ttf-dev libudev-dev
 sudo make
 sudo chmod +x client client_gui server
@@ -118,7 +118,6 @@ Commands include:
 - `REQ_SPEAK`
 - `END_SPEAK`
 - `AUDIO <bytes>`
-- `AUDIO_OPUS <bytes>` (if OPUS enabled)
 
 ## ✔ SDL2 GUI Client
 - Audio meter

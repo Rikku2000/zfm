@@ -23,6 +23,11 @@
 #include <cstdio>
 #include <random>
 
+#if USE_OPENSSL
+  #include <openssl/ssl.h>
+  #include <openssl/err.h>
+#endif
+
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
   #define NOMINMAX
@@ -586,6 +591,10 @@ int g_max_talk_ms = 600000;
 std::string g_http_root = "dashboard";
 int g_http_port = 8080;
 
+int g_https_port = 8443;
+std::string g_https_cert_file = "cert.pem";
+std::string g_https_key_file  = "key.pem";
+
 TimeAnnounceConfig g_timeCfg;
 
 std::mutex g_announceMutex;
@@ -863,6 +872,19 @@ bool loadConfig(const std::string& path) {
         }
         if (parseIntField(l, "http_port", val)) {
             g_http_port = val;
+            continue;
+        }
+
+        if (parseIntField(l, "https_port", val)) {
+            g_https_port = val;
+            continue;
+        }
+        if (parseStringField(l, "https_cert_file", sval)) {
+            g_https_cert_file = sval;
+            continue;
+        }
+        if (parseStringField(l, "https_key_file", sval)) {
+            g_https_key_file = sval;
             continue;
         }
 
@@ -2139,10 +2161,10 @@ void mixTimeAnnouncementIntoBuffer(const std::string& tg, std::vector<char>& buf
 
     if (finished) {
         std::string msg1 = "MIC_FREE\n";
-        broadcastToTalkgroup(tg, msg1);
+		broadcastToLinkedTalkgroups(tg, msg1, INVALID_SOCKET);
 
         std::string msg2 = "SPEAKER_NONE\n";
-        broadcastToTalkgroup(tg, msg2);
+		broadcastToLinkedTalkgroups(tg, msg2, INVALID_SOCKET);
     }
 }
 
@@ -2179,6 +2201,10 @@ static bool saveConfig(const std::string& path)
     f << "  \"max_talk_ms\": " << g_max_talk_ms << ",\n";
     f << "  \"http_root\": \"" << escapeJson(g_http_root) << "\",\n";
     f << "  \"http_port\": " << g_http_port << ",\n";
+
+    f << "  \"https_port\": " << g_https_port << ",\n";
+    f << "  \"https_cert_file\": \"" << escapeJson(g_https_cert_file) << "\",\n";
+    f << "  \"https_key_file\": \"" << escapeJson(g_https_key_file) << "\",\n";
 
     f << "  \"time_announcement\": {\n";
     f << "    \"enabled\": " << (g_timeCfg.enabled ? "true" : "false") << ",\n";
@@ -2876,6 +2902,9 @@ static std::string buildAdminConfigJson()
     oss << "  \"max_talk_ms\": " << g_max_talk_ms << ",\n";
     oss << "  \"http_root\": \"" << escapeJson(g_http_root) << "\",\n";
     oss << "  \"http_port\": " << g_http_port << ",\n";
+    oss << "  \"https_port\": " << g_https_port << ",\n";
+    oss << "  \"https_cert_file\": \"" << escapeJson(g_https_cert_file) << "\",\n";
+    oss << "  \"https_key_file\": \"" << escapeJson(g_https_key_file) << "\",\n";
 
     oss << "  \"time_announcement\": {\n";
     oss << "    \"enabled\": " << (g_timeCfg.enabled ? "true" : "false") << ",\n";
@@ -2975,23 +3004,189 @@ static std::string buildAdminConfigJson()
     return oss.str();
 }
 
-static void handleHttpClient(SOCKET s) {
+struct HttpConn {
+    SOCKET sock;
+#if USE_OPENSSL
+    SSL* ssl;
+#endif
+    bool tls;
+};
+
+static void httpConnClose(HttpConn& c) {
+#if USE_OPENSSL
+    if (c.tls && c.ssl) {
+        SSL_shutdown(c.ssl);
+        SSL_free(c.ssl);
+        c.ssl = nullptr;
+    }
+#endif
+    if (c.sock != INVALID_SOCKET) {
+        closeSocket(c.sock);
+        c.sock = INVALID_SOCKET;
+    }
+}
+
+static int httpConnRecv(HttpConn& c, char* buf, int len) {
+#if USE_OPENSSL
+    if (c.tls && c.ssl) {
+        return SSL_read(c.ssl, buf, len);
+    }
+#endif
+    return (int)recv(c.sock, buf, len, 0);
+}
+
+static int httpConnSend(HttpConn& c, const char* buf, int len) {
+#if USE_OPENSSL
+    if (c.tls && c.ssl) {
+        return SSL_write(c.ssl, buf, len);
+    }
+#endif
+    return (int)send(c.sock, buf, len, 0);
+}
+
+static bool httpConnSendAll(HttpConn& c, const void* data, size_t len) {
+    const char* p = (const char*)data;
+    size_t sent = 0;
+    while (sent < len) {
+        int n = httpConnSend(c, p + sent, (int)std::min<size_t>(len - sent, 1u << 20));
+        if (n <= 0) return false;
+        sent += (size_t)n;
+    }
+    return true;
+}
+
+static bool httpConnRecvAll(HttpConn& c, void* data, size_t len) {
+    char* p = (char*)data;
+    size_t got = 0;
+    while (got < len) {
+        int n = httpConnRecv(c, p + got, (int)std::min<size_t>(len - got, 1u << 20));
+        if (n <= 0) return false;
+        got += (size_t)n;
+    }
+    return true;
+}
+
+static bool readHttpLine(HttpConn& c, std::string& out) {
+    out.clear();
+    out.reserve(256);
+    char ch = 0;
+    bool gotCR = false;
+    while (true) {
+        int n = httpConnRecv(c, &ch, 1);
+        if (n <= 0) return false;
+
+        if (ch == '\r') {
+            gotCR = true;
+            continue;
+        }
+        if (ch == '\n') {
+            break;
+        }
+        if (gotCR) {
+            gotCR = false;
+        }
+        out.push_back(ch);
+        if (out.size() > MAX_HTTP_LINE) return false;
+    }
+    return true;
+}
+
+static void sendHttpResponse(HttpConn& c, const std::string& statusLine,
+                             const std::string& contentType,
+                             const std::string& body)
+{
+    std::ostringstream oss;
+    oss << statusLine << "\r\n";
+    oss << "Server: zFM\r\n";
+    oss << "Connection: close\r\n";
+    oss << "Content-Type: " << contentType << "\r\n";
+    oss << "Content-Length: " << body.size() << "\r\n";
+    oss << "Cache-Control: no-cache\r\n";
+    oss << "\r\n";
+
+    const std::string hdr = oss.str();
+    httpConnSendAll(c, hdr.data(), hdr.size());
+    if (!body.empty()) httpConnSendAll(c, body.data(), body.size());
+}
+
+#if USE_OPENSSL
+static SSL_CTX* g_https_ctx = nullptr;
+
+static void sslLogLastError(const char* where) {
+    unsigned long e = ERR_get_error();
+    if (!e) return;
+    char buf[256];
+    ERR_error_string_n(e, buf, sizeof(buf));
+    LOG_WARN("HTTPS: %s: %s\n", where, buf);
+}
+
+static bool initHttpsContextIfEnabled() {
+    if (g_https_port <= 0) return false;
+
+    {
+        std::ifstream fc(g_https_cert_file.c_str());
+        std::ifstream fk(g_https_key_file.c_str());
+        if (!fc.good() || !fk.good()) {
+            LOG_WARN("HTTPS disabled: missing cert/key (cert=%s, key=%s)\n",
+                     g_https_cert_file.c_str(), g_https_key_file.c_str());
+            return false;
+        }
+    }
+
+    SSL_library_init();
+    SSL_load_error_strings();
+    OpenSSL_add_all_algorithms();
+
+    const SSL_METHOD* method = TLS_server_method();
+    g_https_ctx = SSL_CTX_new(method);
+    if (!g_https_ctx) {
+        sslLogLastError("SSL_CTX_new");
+        return false;
+    }
+
+    SSL_CTX_set_min_proto_version(g_https_ctx, TLS1_2_VERSION);
+    SSL_CTX_set_options(g_https_ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3);
+
+    if (SSL_CTX_use_certificate_chain_file(g_https_ctx, g_https_cert_file.c_str()) != 1) {
+        sslLogLastError("use_certificate_chain_file");
+        SSL_CTX_free(g_https_ctx);
+        g_https_ctx = nullptr;
+        return false;
+    }
+    if (SSL_CTX_use_PrivateKey_file(g_https_ctx, g_https_key_file.c_str(), SSL_FILETYPE_PEM) != 1) {
+        sslLogLastError("use_PrivateKey_file");
+        SSL_CTX_free(g_https_ctx);
+        g_https_ctx = nullptr;
+        return false;
+    }
+    if (SSL_CTX_check_private_key(g_https_ctx) != 1) {
+        sslLogLastError("check_private_key");
+        SSL_CTX_free(g_https_ctx);
+        g_https_ctx = nullptr;
+        return false;
+    }
+
+    return true;
+}
+#endif
+
+static void handleHttpClientConn(HttpConn& c) {
     std::string line;
-    if (!readHttpLine(s, line)) {
-        closeSocket(s);
+    if (!readHttpLine(c, line)) {
+        httpConnClose(c);
         return;
     }
 
     std::unordered_map<std::string,std::string> headers;
     for (;;) {
         std::string h;
-        if (!readHttpLine(s, h)) break;
+        if (!readHttpLine(c, h)) break;
         if (h.empty()) break;
 
-        size_t c = h.find(':');
-        if (c == std::string::npos) continue;
-        std::string k = h.substr(0, c);
-        std::string v = h.substr(c + 1);
+        size_t colon = h.find(':');
+        if (colon == std::string::npos) continue;
+        std::string k = h.substr(0, colon);
+        std::string v = h.substr(colon + 1);
         k = trim(k);
         v = trim(v);
         for (auto& ch : k) ch = (char)std::tolower((unsigned char)ch);
@@ -3010,20 +3205,20 @@ static void handleHttpClient(SOCKET s) {
             try { contentLen = std::stoi(itCL->second); } catch (...) { contentLen = 0; }
         }
         if (contentLen < 0 || contentLen > 1024*1024) {
-            sendHttpResponse(s, "HTTP/1.1 413 Payload Too Large", "text/plain", "Payload too large");
-            closeSocket(s);
+            sendHttpResponse(c, "HTTP/1.1 413 Payload Too Large", "text/plain", "Payload too large");
+            httpConnClose(c);
             return;
         }
         if (contentLen > 0) {
             bodyIn.resize((size_t)contentLen);
-            if (!recvAll(s, &bodyIn[0], (size_t)contentLen)) {
-                closeSocket(s);
+            if (!httpConnRecvAll(c, &bodyIn[0], (size_t)contentLen)) {
+                httpConnClose(c);
                 return;
             }
         }
     } else if (method != "GET") {
-        sendHttpResponse(s, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 405 Method Not Allowed", "text/plain", "Method Not Allowed");
+        httpConnClose(c);
         return;
     }
 
@@ -3035,9 +3230,9 @@ static void handleHttpClient(SOCKET s) {
 
     if (pathOnly == "/api/status") {
         std::string json = buildStatusJson();
-        sendHttpResponse(s, "HTTP/1.1 200 OK",
+        sendHttpResponse(c, "HTTP/1.1 200 OK",
                          "application/json; charset=utf-8", json);
-        closeSocket(s);
+        httpConnClose(c);
         return;
     }
 
@@ -3046,9 +3241,9 @@ static void handleHttpClient(SOCKET s) {
         jsonFindString(bodyIn, "callsign", cs);
         jsonFindString(bodyIn, "password", pw);
         if (cs.empty() || pw.empty()) {
-            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"missing_credentials\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
 
@@ -3066,9 +3261,9 @@ static void handleHttpClient(SOCKET s) {
         }
 
         if (!ok) {
-            sendHttpResponse(s, "HTTP/1.1 401 Unauthorized", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 401 Unauthorized", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"invalid_login\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
 
@@ -3100,8 +3295,8 @@ static void handleHttpClient(SOCKET s) {
         }
         out << "}";
 
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", out.str());
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", out.str());
+        httpConnClose(c);
         return;
     }
 
@@ -3111,22 +3306,22 @@ static void handleHttpClient(SOCKET s) {
             std::lock_guard<std::mutex> lk(g_httpSessMutex);
             g_httpSessions.erase(tok);
         }
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        httpConnClose(c);
         return;
     }
 
     if (pathOnly == "/api/admin/config") {
         HttpSession sess;
         if (!getSessionFromHeaders(headers, sess) || !hasAtLeast(sess.role, Role::OPERATOR) || !sessionHasPerm(sess, "config.read")) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"forbidden\"}");
-            closeSocket(s);
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"forbidden\"}");
+            httpConnClose(c);
             return;
         }
 
         std::string json = buildAdminConfigJson();
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", json);
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", json);
+        httpConnClose(c);
         return;
     }
 
@@ -3139,9 +3334,9 @@ static void handleHttpClient(SOCKET s) {
     if (pathOnly == "/api/admin/users" && method == "POST") {
         HttpSession sess;
         if (!requireWrite("users.write", sess)) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"forbidden\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
 
@@ -3153,9 +3348,9 @@ static void handleHttpClient(SOCKET s) {
             std::string target;
             jsonFindString(bodyIn, "callsign", target);
             if (target.empty()) {
-                sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                sendHttpResponse(c, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
                                  "{\"ok\":false,\"error\":\"missing_callsign\"}");
-                closeSocket(s);
+                httpConnClose(c);
                 return;
             }
 
@@ -3165,9 +3360,9 @@ static void handleHttpClient(SOCKET s) {
                 targetRole = getUserRoleUnsafeNoLock(target);
             }
             if (!canOperatorActOn(sess.role, targetRole)) {
-                sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+                sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                                  "{\"ok\":false,\"error\":\"insufficient_privilege\"}");
-                closeSocket(s);
+                httpConnClose(c);
                 return;
             }
 
@@ -3181,9 +3376,9 @@ static void handleHttpClient(SOCKET s) {
                 }
             }
             if (ok) saveConfig("server.json");
-            sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8",
                              ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"not_found\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
 
@@ -3201,17 +3396,17 @@ static void handleHttpClient(SOCKET s) {
         jsonFindStringArray(bodyIn, "permissions", perms);
 
         if (cs.empty()) {
-            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"missing_callsign\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
 
         Role newRole = roleFromStr(roleS);
         if (newRole == Role::ADMIN && sess.role != Role::ADMIN) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"insufficient_privilege\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
 
@@ -3221,9 +3416,9 @@ static void handleHttpClient(SOCKET s) {
             targetRole = getUserRoleUnsafeNoLock(cs);
         }
         if (!canOperatorActOn(sess.role, targetRole)) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"insufficient_privilege\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
 
@@ -3249,17 +3444,17 @@ static void handleHttpClient(SOCKET s) {
             }
         }
         saveConfig("server.json");
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        httpConnClose(c);
         return;
     }
 
     if (pathOnly == "/api/admin/talkgroups" && method == "POST") {
         HttpSession sess;
         if (!requireWrite("talkgroups.write", sess)) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"forbidden\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
         std::string op;
@@ -3269,9 +3464,9 @@ static void handleHttpClient(SOCKET s) {
             std::string name;
             jsonFindString(bodyIn, "name", name);
             if (name.empty()) {
-                sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                sendHttpResponse(c, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
                                  "{\"ok\":false,\"error\":\"missing_name\"}");
-                closeSocket(s);
+                httpConnClose(c);
                 return;
             }
             {
@@ -3281,8 +3476,8 @@ static void handleHttpClient(SOCKET s) {
                 g_linkedTalkgroups.erase(name);
             }
             saveConfig("server.json");
-            sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-            closeSocket(s);
+            sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+            httpConnClose(c);
             return;
         }
 
@@ -3290,9 +3485,9 @@ static void handleHttpClient(SOCKET s) {
         jsonFindString(bodyIn, "name", name);
         jsonFindString(bodyIn, "mode", mode);
         if (name.empty()) {
-            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"missing_name\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
         TalkgroupMode m = TalkgroupMode::PUBLIC;
@@ -3307,17 +3502,17 @@ static void handleHttpClient(SOCKET s) {
             if (g_talkgroups.find(name) == g_talkgroups.end()) g_talkgroups[name] = TalkgroupState();
         }
         saveConfig("server.json");
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        httpConnClose(c);
         return;
     }
 
     if (pathOnly == "/api/admin/bridges" && method == "POST") {
         HttpSession sess;
         if (!requireWrite("bridges.write", sess)) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"forbidden\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
         std::string tg;
@@ -3325,9 +3520,9 @@ static void handleHttpClient(SOCKET s) {
         std::vector<std::string> linked;
         jsonFindStringArray(bodyIn, "linked", linked);
         if (tg.empty()) {
-            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"missing_talkgroup\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
         {
@@ -3335,17 +3530,17 @@ static void handleHttpClient(SOCKET s) {
             g_linkedTalkgroups[tg] = linked;
         }
         saveConfig("server.json");
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        httpConnClose(c);
         return;
     }
 
     if (pathOnly == "/api/admin/peers" && method == "POST") {
         HttpSession sess;
         if (!requireWrite("peers.write", sess)) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"forbidden\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
 
@@ -3356,9 +3551,9 @@ static void handleHttpClient(SOCKET s) {
             std::string name;
             jsonFindString(bodyIn, "name", name);
             if (name.empty()) {
-                sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+                sendHttpResponse(c, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
                                  "{\"ok\":false,\"error\":\"missing_name\"}");
-                closeSocket(s);
+                httpConnClose(c);
                 return;
             }
             {
@@ -3369,8 +3564,8 @@ static void handleHttpClient(SOCKET s) {
             }
             saveConfig("server.json");
             compilePeerRules();
-            sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-            closeSocket(s);
+            sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+            httpConnClose(c);
             return;
         }
 
@@ -3383,9 +3578,9 @@ static void handleHttpClient(SOCKET s) {
         std::vector<std::string> rules;
         jsonFindStringArray(bodyIn, "rules", rules);
         if (name.empty() || host.empty() || port <= 0) {
-            sendHttpResponse(s, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 400 Bad Request", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"missing_fields\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
         {
@@ -3413,17 +3608,17 @@ static void handleHttpClient(SOCKET s) {
         }
         saveConfig("server.json");
         compilePeerRules();
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        httpConnClose(c);
         return;
     }
 
     if (pathOnly == "/api/admin/time_announcement" && method == "POST") {
         HttpSession sess;
         if (!requireWrite("time_announcement.write", sess)) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"forbidden\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
         bool enabled = g_timeCfg.enabled;
@@ -3439,17 +3634,17 @@ static void handleHttpClient(SOCKET s) {
             g_timeCfg.volumeFactor = (float)volPermil / 1000.0f;
         }
         saveConfig("server.json");
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        httpConnClose(c);
         return;
     }
 
     if (pathOnly == "/api/admin/weather" && method == "POST") {
         HttpSession sess;
         if (!requireWrite("weather.write", sess)) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"forbidden\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
         bool enabled = g_weatherCfg.enabled;
@@ -3482,17 +3677,17 @@ static void handleHttpClient(SOCKET s) {
             g_weatherCfg.cityKey = cityKey;
         }
         saveConfig("server.json");
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true}");
+        httpConnClose(c);
         return;
     }
 
     if (pathOnly == "/api/admin/server" && method == "POST") {
         HttpSession sess;
         if (!requireWrite("server.write", sess)) {
-            sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
+            sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "application/json; charset=utf-8",
                              "{\"ok\":false,\"error\":\"forbidden\"}");
-            closeSocket(s);
+            httpConnClose(c);
             return;
         }
         std::string sname = g_serverName;
@@ -3501,12 +3696,18 @@ static void handleHttpClient(SOCKET s) {
         int maxms = g_max_talk_ms;
         std::string hroot = g_http_root;
         int hport = g_http_port;
+        int hsport = g_https_port;
+        std::string hcert = g_https_cert_file;
+        std::string hkey  = g_https_key_file;
         jsonFindString(bodyIn, "server_name", sname);
         jsonFindString(bodyIn, "peer_secret", psec);
         jsonFindInt(bodyIn, "server_port", port);
         jsonFindInt(bodyIn, "max_talk_ms", maxms);
         jsonFindString(bodyIn, "http_root", hroot);
         jsonFindInt(bodyIn, "http_port", hport);
+        jsonFindInt(bodyIn, "https_port", hsport);
+        jsonFindString(bodyIn, "https_cert_file", hcert);
+        jsonFindString(bodyIn, "https_key_file", hkey);
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             g_serverName = sname;
@@ -3515,10 +3716,13 @@ static void handleHttpClient(SOCKET s) {
             g_max_talk_ms = maxms;
             g_http_root = hroot;
             g_http_port = hport;
+            g_https_port = hsport;
+            g_https_cert_file = hcert;
+            g_https_key_file  = hkey;
         }
         saveConfig("server.json");
-        sendHttpResponse(s, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true,\"note\":\"server needs restart for port/http changes\"}");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 200 OK", "application/json; charset=utf-8", "{\"ok\":true,\"note\":\"server needs restart for port/http/https changes\"}");
+        httpConnClose(c);
         return;
     }
 
@@ -3570,11 +3774,11 @@ static void handleHttpClient(SOCKET s) {
 		tg = urlDecode(tg);
 
 		if (tg.empty()) {
-			sendHttpResponse(s,
+			sendHttpResponse(c,
 							 "HTTP/1.1 400 Bad Request",
 							 "application/json; charset=utf-8",
 							 "{\"error\":\"missing tg param\"}");
-			closeSocket(s);
+			httpConnClose(c);
 			return;
 		}
 
@@ -3632,11 +3836,11 @@ static void handleHttpClient(SOCKET s) {
 		}
 		body << "] }";
 
-		sendHttpResponse(s,
+		sendHttpResponse(c,
 						 "HTTP/1.1 200 OK",
 						 "application/json; charset=utf-8",
 						 body.str());
-		closeSocket(s);
+		httpConnClose(c);
 		return;
 	}
 
@@ -3645,8 +3849,8 @@ static void handleHttpClient(SOCKET s) {
     if (rel.empty()) rel = "index.html";
 
     if (!isSafeRelPath(rel)) {
-        sendHttpResponse(s, "HTTP/1.1 403 Forbidden", "text/plain", "Forbidden");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 403 Forbidden", "text/plain", "Forbidden");
+        httpConnClose(c);
         return;
     }
 
@@ -3658,15 +3862,95 @@ static void handleHttpClient(SOCKET s) {
 
     std::string body;
     if (!loadFileToString(full, body)) {
-        sendHttpResponse(s, "HTTP/1.1 404 Not Found", "text/plain", "404 Not Found");
-        closeSocket(s);
+        sendHttpResponse(c, "HTTP/1.1 404 Not Found", "text/plain", "404 Not Found");
+        httpConnClose(c);
         return;
     }
 
     std::string mime = getMimeType(rel);
-    sendHttpResponse(s, "HTTP/1.1 200 OK", mime, body);
-    closeSocket(s);
+    sendHttpResponse(c, "HTTP/1.1 200 OK", mime, body);
+    httpConnClose(c);
 }
+
+static void handleHttpClient(SOCKET s) {
+    HttpConn c;
+    c.sock = s;
+    c.tls = false;
+    handleHttpClientConn(c);
+}
+
+#if USE_OPENSSL
+static void httpsServerThread() {
+    if (!g_https_ctx || g_https_port <= 0) {
+        return;
+    }
+
+    SOCKET ls = socket(AF_INET, SOCK_STREAM, 0);
+    if (ls == INVALID_SOCKET) {
+        LOG_ERROR("HTTPS: socket() failed\n");
+        return;
+    }
+
+    int opt = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    int flag = 1;
+    setsockopt(ls, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+
+    sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)g_https_port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(ls, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        LOG_ERROR("HTTPS: bind() failed\n");
+        closeSocket(ls);
+        return;
+    }
+    if (listen(ls, 16) == SOCKET_ERROR) {
+        LOG_ERROR("HTTPS: listen() failed\n");
+        closeSocket(ls);
+        return;
+    }
+
+    LOG_OK("HTTPS dashboard listening on port %d (root: %s)\n", g_https_port, g_http_root.c_str());
+
+    while (g_running) {
+        sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        SOCKET cs = accept(ls, (sockaddr*)&caddr, &clen);
+        if (cs == INVALID_SOCKET) {
+            if (!g_running) break;
+            continue;
+        }
+
+        int flag2 = 1;
+        setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (char*)&flag2, sizeof(flag2));
+
+        std::thread([cs]() {
+            HttpConn conn;
+            conn.sock = cs;
+            conn.tls = true;
+
+            SSL* ssl = SSL_new(g_https_ctx);
+            if (!ssl) {
+                closeSocket(cs);
+                return;
+            }
+            SSL_set_fd(ssl, (int)cs);
+            if (SSL_accept(ssl) != 1) {
+                SSL_free(ssl);
+                closeSocket(cs);
+                return;
+            }
+            conn.ssl = ssl;
+            handleHttpClientConn(conn);
+        }).detach();
+    }
+
+    closeSocket(ls);
+}
+#endif
 
 static void httpServerThread() {
     SOCKET ls = socket(AF_INET, SOCK_STREAM, 0);
@@ -3952,7 +4236,7 @@ void announcePumpThreadFunc() {
                 talker = "Weather";
             }
 
-            broadcastAudioToTalkgroup(tg, talker, buf, INVALID_SOCKET);
+			broadcastAudioToLinkedTalkgroups(tg, talker, buf, INVALID_SOCKET);
         }
 
         nextTick += std::chrono::milliseconds(frameMs);
@@ -5086,6 +5370,10 @@ int main() {
 
     initSockets();
 
+#if USE_OPENSSL
+	initHttpsContextIfEnabled();
+#endif
+
     SOCKET serverSock = socket(AF_INET, SOCK_STREAM, 0);
     if (serverSock == INVALID_SOCKET) {
         LOG_ERROR("Failed to create socket\n");
@@ -5147,6 +5435,13 @@ int main() {
     std::thread httpThread(httpServerThread);
     httpThread.detach();
 
+#if USE_OPENSSL
+	if (g_https_ctx && g_https_port > 0) {
+		std::thread httpsThread(httpsServerThread);
+		httpsThread.detach();
+	}
+#endif
+
 	while (g_running) {
 		sockaddr_in clientAddr;
 		socklen_t clen = sizeof(clientAddr);
@@ -5175,6 +5470,14 @@ int main() {
 	if (announceThread.joinable()) announceThread.join();
 
     closeSocket(serverSock);
+
+#if USE_OPENSSL
+	if (g_https_ctx) {
+		SSL_CTX_free(g_https_ctx);
+		g_https_ctx = nullptr;
+	}
+#endif
+
     cleanupSockets();
     return 0;
 }
