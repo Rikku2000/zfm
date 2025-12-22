@@ -911,19 +911,20 @@ static void BuildOnScreenKeyboard(int winW, int winH) {
         int rightW = 90;
         int x = pad;
 
-        AddKeyHelper::add(g_kbKeys,
-            g_kbShift ? "SHIFT" : "Shift",
-            "", OsKey::Shift,
-            x, y, leftW, rowH);
+        AddKeyHelper::add(g_kbKeys, g_kbShift ? "SHIFT" : "Shift", "", OsKey::Shift, x, y, leftW, rowH);
         x += leftW + keyGap;
 
-        int usableW = winW - (pad * 2) - leftW - rightW - (keyGap * 2);
-        int keyW = (int)((usableW - (int)(r3.size() - 1) * keyGap) / (int)r3.size());
+		int usableW = winW - (pad * 2) - leftW - rightW - (keyGap * 2);
 
-        for (const auto& k : r3) {
-            AddKeyHelper::add(g_kbKeys, k, k, OsKey::Normal, x, y, keyW, rowH);
-            x += keyW + keyGap;
-        }
+		if (!r3.empty()) {
+			int keyW = (usableW - (int)(r3.size() - 1) * keyGap) / (int)r3.size();
+			int xKeys = x;
+
+			for (const auto& k : r3) {
+				AddKeyHelper::add(g_kbKeys, k, k, OsKey::Normal, xKeys, y, keyW, rowH);
+				xKeys += keyW + keyGap;
+			}
+		}
 
         AddKeyHelper::add(g_kbKeys, "Backspace", "", OsKey::Backspace, winW - pad - rightW, y, rightW, rowH);
 
@@ -2569,9 +2570,6 @@ int main(int argc, char** argv) {
         }
 
         RenderWidgets(renderer, font);
-#if defined(__ANDROID__)
-		DrawOnScreenKeyboard(renderer, font, w, h);
-#endif
 
 		if (g_activeTab == 0) {
 			int statusY = contentTop + 10 + 34 * 6 + 6;
@@ -2734,6 +2732,10 @@ int main(int argc, char** argv) {
 				}
 			}
 		}
+
+#if defined(__ANDROID__)
+		DrawOnScreenKeyboard(renderer, font, w, h);
+#endif
 
         if (g_comboOpen && g_comboWidget >= 0 &&
             g_comboWidget < (int)g_widgets.size()) {
