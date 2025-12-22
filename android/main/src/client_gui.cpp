@@ -517,16 +517,8 @@ static void GuiPushToTalkLoop() {
 		std::vector<char> payload;
 		std::string audioCmd;
 
-		if (g_cfg.use_opus) {
-			payload = encodeOpusFrame(frame);
-			if (payload.empty()) {
-				continue;
-			}
-			audioCmd = "AUDIO_OPUS";
-		} else {
-			payload = std::move(frame);
-			audioCmd = "AUDIO";
-		}
+		payload = std::move(frame);
+		audioCmd = "AUDIO";
 
         if (payload.size() > ZFM_MAX_TX_PAYLOAD) {
             GuiAppendLog("[ERROR] Refusing to send huge audio payload: " + std::to_string(payload.size()));
@@ -1289,15 +1281,9 @@ static void CfgToUi() {
     if (g_codecItems.empty()) {
         g_codecItems.push_back("PCM (raw)");
         g_codecItems.push_back("ADPCM (22.05 kHz)");
-#if !defined(__ANDROID__)
-        g_codecItems.push_back("Opus (48 kHz)");
-#endif
     }
 
     if (g_cfg.use_adpcm)      ui_codec_index = 1;
-#if !defined(__ANDROID__)
-    else if (g_cfg.use_opus)  ui_codec_index = 2;
-#endif
     else                      ui_codec_index = 0;
 
     if (ui_codec_index < 0 || ui_codec_index >= (int)g_codecItems.size())
@@ -1480,15 +1466,10 @@ static void UiToCfg() {
 	g_cfg.rx_squelch_hang_ms   = ui_rx_squelch_hang;
 
     g_cfg.use_adpcm = (ui_codec_index == 1);
-    g_cfg.use_opus  = (ui_codec_index == 2);
 
     if (g_cfg.use_adpcm) {
         g_cfg.sample_rate       = 22050;
-        g_cfg.frames_per_buffer = 220;
-        g_cfg.channels          = 1;
-    } else if (g_cfg.use_opus) {
-        g_cfg.sample_rate       = 48000;
-        g_cfg.frames_per_buffer = 480;
+        g_cfg.frames_per_buffer = 960;
         g_cfg.channels          = 1;
     }
 

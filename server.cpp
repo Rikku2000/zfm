@@ -358,75 +358,6 @@ static bool httpGet(const std::string& host, const std::string& path, std::strin
     return !outResponse.empty();
 }
 
-#ifdef _WIN32
-#include <opus.h>
-
-static HMODULE g_opusModule = NULL;
-
-typedef OpusDecoder* (*opus_decoder_create_t)(opus_int32 Fs, int channels, int *error);
-typedef void (*opus_decoder_destroy_t)(OpusDecoder *st);
-typedef int (*opus_decode_t)(OpusDecoder *st,
-                             const unsigned char *data,
-                             opus_int32 len,
-                             opus_int16 *pcm,
-                             int frame_size,
-                             int decode_fec);
-typedef const char* (*opus_strerror_t)(int error);
-
-static opus_decoder_create_t  p_opus_decoder_create  = nullptr;
-static opus_decoder_destroy_t p_opus_decoder_destroy = nullptr;
-static opus_decode_t          p_opus_decode          = nullptr;
-static opus_strerror_t        p_opus_strerror        = nullptr;
-
-static const int g_opusSampleRate = 48000;
-static const int g_opusChannels   = 1;
-static const int g_opusFrameSize  = 960;
-
-static bool loadOpusDllServer()
-{
-    if (g_opusModule)
-        return true;
-
-    g_opusModule = LoadLibraryA("opus.dll");
-    if (!g_opusModule) {
-        LOG_WARN("Failed to load opus.dll on server\n");
-        return false;
-    }
-
-    auto loadSym = [](HMODULE mod, const char* name) -> FARPROC {
-        FARPROC p = GetProcAddress(mod, name);
-        if (!p) {
-            LOG_WARN("opus.dll missing symbol: %s\n", name);
-        }
-        return p;
-    };
-
-    p_opus_decoder_create  = (opus_decoder_create_t)  loadSym(g_opusModule, "opus_decoder_create");
-    p_opus_decoder_destroy = (opus_decoder_destroy_t) loadSym(g_opusModule, "opus_decoder_destroy");
-    p_opus_decode          = (opus_decode_t)         loadSym(g_opusModule, "opus_decode");
-    p_opus_strerror        = (opus_strerror_t)       loadSym(g_opusModule, "opus_strerror");
-
-    if (!p_opus_decoder_create || !p_opus_decoder_destroy || !p_opus_decode || !p_opus_strerror) {
-        LOG_WARN("opus.dll missing required decoder functions\n");
-        FreeLibrary(g_opusModule);
-        g_opusModule = NULL;
-        return false;
-    }
-
-    return true;
-}
-
-static void unloadOpusDllServer()
-{
-    if (g_opusModule) {
-        FreeLibrary(g_opusModule);
-        g_opusModule = NULL;
-    }
-}
-#else
-#include <opus/opus.h>
-#endif
-
 enum class Role {
     USER = 0,
     OPERATOR = 1,
@@ -466,6 +397,8 @@ struct User {
 };
 
 extern std::atomic<bool> g_running;
+
+static std::map<std::string, std::chrono::steady_clock::time_point> g_tgWaveLastUpdate;
 
 static const size_t ZFM_MAX_TX_QUEUE_BYTES = 512 * 1024;
 static const size_t ZFM_DROP_AUDIO_AFTER = 256 * 1024;
@@ -582,7 +515,6 @@ struct ClientInfo {
     std::string talkgroup;
     bool authenticated;
     std::string remoteAddr;
-	OpusDecoder* opusDec;
     std::shared_ptr<ClientTxState> tx;
 };
 
@@ -795,69 +727,6 @@ static std::mutex g_bridgeIdMutex;
 static std::unordered_map<std::string, std::string> g_activeBridgeIdByTg;
 static std::atomic<uint64_t> g_bridgeSeq(0);
 
-static bool decodeClientOpus(ClientInfo& ci,
-                             const std::vector<char>& inPkt,
-                             std::vector<char>& outPcm)
-{
-    outPcm.clear();
-
-    if (inPkt.empty()) {
-        return false;
-    }
-    if (inPkt.size() < 3) {
-        return false;
-    }
-
-    if (!loadOpusDllServer()) {
-        return false;
-    }
-    if (!p_opus_decoder_create || !p_opus_decode) {
-        return false;
-    }
-
-    if (!ci.opusDec) {
-        int err = 0;
-        ci.opusDec = p_opus_decoder_create(g_opusSampleRate,
-                                           g_opusChannels,
-                                           &err);
-        if (!ci.opusDec || err != OPUS_OK) {
-            LOG_WARN("Opus decoder create failed for client %s (err=%d)\n",
-                     ci.callsign.c_str(), err);
-            ci.opusDec = nullptr;
-            return false;
-        }
-    }
-
-    std::vector<opus_int16> pcm((size_t)g_opusFrameSize * g_opusChannels * 2);
-
-    int nsamples = p_opus_decode(ci.opusDec,
-                                 (const unsigned char*)inPkt.data(),
-                                 (opus_int32)inPkt.size(),
-                                 pcm.data(),
-                                 g_opusFrameSize,
-                                 0);
-
-    if (nsamples < 0) {
-        static int badCount = 0;
-        if (badCount < 10) {
-            ++badCount;
-            LOG_WARN("Opus decode failed for client %s: %s (len=%d)\n",
-                     ci.callsign.c_str(),
-                     p_opus_strerror ? p_opus_strerror(nsamples) : "error",
-                     (int)inPkt.size());
-        }
-        return false;
-    }
-
-    if (nsamples == 0) {
-        return false;
-    }
-
-    size_t totalSamples = (size_t)nsamples * g_opusChannels;
-    outPcm.resize(totalSamples * sizeof(opus_int16));
-    std::memcpy(outPcm.data(), pcm.data(), outPcm.size());
-    return true;
-}
 
 static inline std::string trim(const std::string& s) {
     size_t a = 0;
@@ -3653,61 +3522,123 @@ static void handleHttpClient(SOCKET s) {
         return;
     }
 
-    if (pathOnly.rfind("/api/waveform", 0) == 0) {
-        std::string tg;
+	if (pathOnly.rfind("/api/waveform", 0) == 0) {
+		auto urlDecode = [](const std::string& in) -> std::string {
+			std::string out;
+			out.reserve(in.size());
+			for (size_t i = 0; i < in.size(); ++i) {
+				char c = in[i];
+				if (c == '+') {
+					out.push_back(' ');
+				} else if (c == '%' && i + 2 < in.size()) {
+					auto hex = [](char h) -> int {
+						if (h >= '0' && h <= '9') return h - '0';
+						if (h >= 'a' && h <= 'f') return 10 + (h - 'a');
+						if (h >= 'A' && h <= 'F') return 10 + (h - 'A');
+						return -1;
+					};
+					int hi = hex(in[i + 1]);
+					int lo = hex(in[i + 2]);
+					if (hi >= 0 && lo >= 0) {
+						out.push_back(static_cast<char>((hi << 4) | lo));
+						i += 2;
+					} else {
+						out.push_back(c);
+					}
+				} else {
+					out.push_back(c);
+				}
+			}
+			return out;
+		};
 
-        size_t q = url.find('?');
-        if (q != std::string::npos) {
-            std::string qs = url.substr(q + 1);
-            const std::string key = "tg=";
-            size_t kpos = qs.find(key);
-            if (kpos != std::string::npos) {
-                tg = qs.substr(kpos + key.size());
-            }
-        }
+		std::string tg;
 
-        if (tg.empty()) {
-            sendHttpResponse(s,
-                             "HTTP/1.1 400 Bad Request",
-                             "application/json; charset=utf-8",
-                             "{\"error\":\"missing tg param\"}");
-            closeSocket(s);
-            return;
-        }
+		size_t q = url.find('?');
+		if (q != std::string::npos) {
+			std::string qs = url.substr(q + 1);
+			std::string key = "tg=";
+			size_t kpos = qs.find(key);
+			if (kpos != std::string::npos) {
+				size_t vpos = kpos + key.size();
+				size_t amp  = qs.find('&', vpos);
+				if (amp == std::string::npos) tg = qs.substr(vpos);
+				else tg = qs.substr(vpos, amp - vpos);
+			}
+		}
 
-        std::vector<int16_t> samples;
-        {
-            std::lock_guard<std::mutex> lock(g_audioBufMutex);
-            auto it = g_tgAudioBuf.find(tg);
-            if (it != g_tgAudioBuf.end()) {
-                const std::vector<char>& bufPcm = it->second;
-                size_t sampleCount = bufPcm.size() / sizeof(int16_t);
-                const int16_t* pcm = reinterpret_cast<const int16_t*>(bufPcm.data());
+		tg = urlDecode(tg);
 
-                const size_t maxSamples = 256;
-                if (sampleCount > maxSamples) {
-                    pcm += (sampleCount - maxSamples);
-                    sampleCount = maxSamples;
-                }
-                samples.assign(pcm, pcm + sampleCount);
-            }
-        }
+		if (tg.empty()) {
+			sendHttpResponse(s,
+							 "HTTP/1.1 400 Bad Request",
+							 "application/json; charset=utf-8",
+							 "{\"error\":\"missing tg param\"}");
+			closeSocket(s);
+			return;
+		}
 
-        std::ostringstream body;
-        body << "{ \"talkgroup\": \"" << escapeJson(tg) << "\", \"samples\": [";
-        for (size_t i = 0; i < samples.size(); ++i) {
-            if (i) body << ",";
-            body << samples[i];
-        }
-        body << "] }";
+		std::string tgUsed = tg;
+		std::vector<int16_t> samples;
 
-        sendHttpResponse(s,
-                         "HTTP/1.1 200 OK",
-                         "application/json; charset=utf-8",
-                         body.str());
-        closeSocket(s);
-        return;
-    }
+		{
+			std::lock_guard<std::mutex> lock(g_audioBufMutex);
+
+			auto it = g_tgWaveHistory.find(tg);
+			if (it == g_tgWaveHistory.end() || it->second.empty()) {
+				for (auto it2 = g_tgWaveHistory.begin(); it2 != g_tgWaveHistory.end(); ++it2) {
+					if (!it2->second.empty()) {
+						it = it2;
+						tgUsed = it2->first;
+						break;
+					}
+				}
+			}
+
+			if (it == g_tgWaveHistory.end() || it->second.empty()) {
+				const size_t ZERO_SAMPLES = 1024;
+				samples.assign(ZERO_SAMPLES, 0);
+			} else {
+				auto now = std::chrono::steady_clock::now();
+				const int STALE_MS = 400;
+
+				bool stale = true;
+				auto itT = g_tgWaveLastUpdate.find(tgUsed);
+				if (itT != g_tgWaveLastUpdate.end()) {
+					int age = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - itT->second).count();
+					stale = (age > STALE_MS);
+				}
+
+				if (stale) {
+					const size_t ZERO_SAMPLES = 1024;
+					samples.assign(ZERO_SAMPLES, 0);
+				} else {
+					const std::vector<int16_t>& wave = it->second;
+					const size_t maxSamples = 1024;
+					if (wave.size() <= maxSamples) {
+						samples = wave;
+					} else {
+						samples.assign(wave.end() - maxSamples, wave.end());
+					}
+				}
+			}
+		}
+
+		std::ostringstream body;
+		body << "{ \"talkgroup\": \"" << escapeJson(tgUsed) << "\", \"samples\": [";
+		for (size_t i = 0; i < samples.size(); ++i) {
+			if (i) body << ",";
+			body << samples[i];
+		}
+		body << "] }";
+
+		sendHttpResponse(s,
+						 "HTTP/1.1 200 OK",
+						 "application/json; charset=utf-8",
+						 body.str());
+		closeSocket(s);
+		return;
+	}
 
     std::string rel = pathOnly;
     if (!rel.empty() && rel[0] == '/') rel.erase(0, 1);
@@ -3883,9 +3814,10 @@ void broadcastAudioToTalkgroup(const std::string& tg,
             std::vector<int16_t>& wave = g_tgWaveHistory[tg];
             const int16_t* pcm = reinterpret_cast<const int16_t*>(audio.data());
             size_t sampleCount = audio.size() / sizeof(int16_t);
-            wave.insert(wave.end(), pcm, pcm + sampleCount);
+			wave.insert(wave.end(), pcm, pcm + sampleCount);
+			g_tgWaveLastUpdate[tg] = std::chrono::steady_clock::now();
 
-            const size_t maxWaveSamples = 256;
+            const size_t maxWaveSamples = 2048;
             if (wave.size() > maxWaveSamples) {
                 wave.erase(wave.begin(), wave.end() - maxWaveSamples);
             }
@@ -3968,6 +3900,10 @@ void broadcastAudioToLinkedTalkgroups(const std::string& tg,const std::string& f
 }
 
 void announcePumpThreadFunc() {
+    const int frameMs = 20;
+
+    auto nextTick = std::chrono::steady_clock::now();
+
     while (g_announcePumpRunning && g_running) {
         std::vector<std::pair<std::string, std::string> > active;
         {
@@ -3990,7 +3926,8 @@ void announcePumpThreadFunc() {
                 continue;
             }
 
-            uint32_t samplesPerFrame = wav.sampleRate / 100;
+            uint32_t samplesPerFrame =
+                (uint32_t)((uint64_t)wav.sampleRate * (uint64_t)frameMs / 1000ULL);
             if (samplesPerFrame == 0) samplesPerFrame = wav.sampleRate;
 
             std::vector<char> buf(samplesPerFrame * sizeof(int16_t));
@@ -4010,17 +3947,19 @@ void announcePumpThreadFunc() {
                 continue;
             }
 
-			std::string talker = "SERVER";
-			if (key == "weather_auto") {
-				talker = "Weather";
-			}
+            std::string talker = "SERVER";
+            if (key == "weather_auto") {
+                talker = "Weather";
+            }
 
-			broadcastAudioToTalkgroup(tg, talker, buf, INVALID_SOCKET);
+            broadcastAudioToTalkgroup(tg, talker, buf, INVALID_SOCKET);
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        nextTick += std::chrono::milliseconds(frameMs);
+        std::this_thread::sleep_until(nextTick);
     }
 }
+
 
 SOCKET findClientByCallsign(const std::string& callsign) {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -4037,7 +3976,6 @@ void cleanupClient(SOCKET sock) {
 
     bool speakerCleared = false;
 
-    OpusDecoder* decToDestroy = nullptr;
     std::shared_ptr<ClientTxState> tx;
 
     {
@@ -4057,9 +3995,6 @@ void cleanupClient(SOCKET sock) {
             }
         }
 
-        decToDestroy = it->second.opusDec;
-        it->second.opusDec = nullptr;
-
         tx = it->second.tx;
         g_clients.erase(it);
     }
@@ -4070,17 +4005,6 @@ void cleanupClient(SOCKET sock) {
             tx->alive.store(false);
         }
         tx->cv.notify_all();
-    }
-
-    if (decToDestroy) {
-#ifdef _WIN32
-        if (p_opus_decoder_destroy) {
-            p_opus_decoder_destroy(decToDestroy);
-        }
-#else
-        opus_decoder_destroy(decToDestroy);
-#endif
-        decToDestroy = nullptr;
     }
 
     if (!tg.empty()) {
@@ -4194,7 +4118,6 @@ void handleClient(SOCKET sock) {
         ci.talkgroup.clear();
         ci.authenticated = false;
         ci.remoteAddr = "unknown";
-		ci.opusDec = nullptr;
         ci.tx = tx;
 
         sockaddr_in addr;
@@ -4622,7 +4545,7 @@ void handleClient(SOCKET sock) {
                 LOG_INFO("[TG %s] Time limit reached for %s\n", tg.c_str(), user.c_str());
             }
         }
-		else if (cmd == "AUDIO" || cmd == "AUDIO_OPUS") {
+		else if (cmd == "AUDIO") {
 			size_t size = 0;
 			iss >> size;
 
@@ -4643,7 +4566,6 @@ void handleClient(SOCKET sock) {
             std::string user;
             bool allowed = false;
             bool timeOut = false;
-            bool isOpus  = (cmd == "AUDIO_OPUS");
             std::vector<char> decodedPcm;
 
             {
@@ -4670,27 +4592,13 @@ void handleClient(SOCKET sock) {
                         }
                     }
                 }
-
-                if (allowed && isOpus) {
-                    if (!decodeClientOpus(it->second, buf, decodedPcm)) {
-                        allowed = false;
-                    }
-                }
             }
 
 			if (allowed) {
-				if (isOpus && !decodedPcm.empty()) {
-					broadcastAudioToLinkedTalkgroups(tg, user, decodedPcm, sock);
-					{
-						std::string bridgeId = ensureBridgeIdForLocalTx(tg);
-						peerForwardAudio(tg, decodedPcm, bridgeId, 0);
-					}
-				} else {
-					broadcastAudioToLinkedTalkgroups(tg, user, buf, sock);
-					{
-						std::string bridgeId = ensureBridgeIdForLocalTx(tg);
-						peerForwardAudio(tg, buf, bridgeId, 0);
-					}
+				broadcastAudioToLinkedTalkgroups(tg, user, buf, sock);
+				{
+					std::string bridgeId = ensureBridgeIdForLocalTx(tg);
+					peerForwardAudio(tg, buf, bridgeId, 0);
 				}
             } else if (timeOut) {
                 flushAudioJitterForTalkgroup(tg, user, sock);

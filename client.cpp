@@ -14,6 +14,7 @@
 #include <cstdarg>
 #include <ctime>
 #include <cstdio>
+#include <cmath>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -456,8 +457,6 @@ struct ClientConfig {
 
 	int roger_sound;
 
-	bool use_opus;
-
 	bool use_adpcm;
 	bool adpcm_adaptive;
 	int  adpcm_jitter_frames;
@@ -478,7 +477,7 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
     cfg.password = "passw0rd";
     cfg.talkgroup = "gateway";
 
-    cfg.sample_rate = 48000;
+    cfg.sample_rate = 22050;
     cfg.frames_per_buffer = 960;
     cfg.channels = 1;
     cfg.input_device_index = 0;
@@ -503,8 +502,6 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
     cfg.ptt_serial_line = "RTS";
     cfg.ptt_serial_invert = false;
 	cfg.roger_sound = 1;
-
-	cfg.use_opus = false;
 
 	cfg.use_adpcm = false;
 	cfg.adpcm_adaptive = true;
@@ -561,7 +558,6 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
         else if (parseIntField(l, "input_gain", ival))    cfg.input_gain  = ival;
         else if (parseIntField(l, "output_gain", ival))   cfg.output_gain = ival;
 		else if (parseIntField(l, "roger_sound", ival)) cfg.roger_sound = ival;
-		else if (parseBoolField(l, "use_opus", bval)) cfg.use_opus = bval;
 		else if (parseBoolField(l, "use_adpcm", bval)) cfg.use_adpcm = bval;
 		else if (parseBoolField(l, "adpcm_adaptive", bval)) cfg.adpcm_adaptive = bval;
 		else if (parseIntField(l, "adpcm_jitter_frames", ival)) cfg.adpcm_jitter_frames = ival;
@@ -573,15 +569,9 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
 		else if (parseIntField(l,  "rx_squelch_hang_ms", ival)) cfg.rx_squelch_hang_ms = ival;
     }
 
-	if (cfg.use_opus) {
-		cfg.sample_rate       = 48000;
-		cfg.frames_per_buffer = 480;
-		cfg.channels          = 1;
-	}
-
 	if (cfg.use_adpcm) {
 		cfg.sample_rate       = 22050;
-		cfg.frames_per_buffer = 220;
+		cfg.frames_per_buffer = 960;
 		cfg.channels          = 1;
 	}
 
@@ -626,7 +616,6 @@ static bool saveClientConfigFile(const std::string& path, const ClientConfig& cf
 	f << "  \"rx_squelch_level\": " << cfg.rx_squelch_level << ",\n";
 	f << "  \"rx_squelch_voice_pct\": " << cfg.rx_squelch_voice_pct << ",\n";
 	f << "  \"rx_squelch_hang_ms\": " << cfg.rx_squelch_hang_ms << ",\n";
-	f << "  \"use_opus\": " << (cfg.use_opus ? "true" : "false") << ",\n";
 	f << "  \"use_adpcm\": " << (cfg.use_adpcm ? "true" : "false") << ",\n";
 	f << "  \"adpcm_adaptive\": " << (cfg.adpcm_adaptive ? "true" : "false") << ",\n";
 	f << "  \"adpcm_jitter_frames\": " << cfg.adpcm_jitter_frames << ",\n";
@@ -658,8 +647,8 @@ PaStream* g_outputStream = NULL;
 static std::mutex g_paOutMutex;
 #endif
 
-int g_sampleRate = 48000;
-unsigned long g_framesPerBuffer = 480;
+int g_sampleRate = 22050;
+unsigned long g_framesPerBuffer = 960;
 int g_channels = 1;
 
 #if defined(__ANDROID__)
@@ -787,256 +776,6 @@ std::atomic<bool> g_running(true);
 extern std::atomic<float> g_inputGain;
 extern std::atomic<float> g_outputGain;
 
-#if !defined(__ANDROID__)
-#ifdef _WIN32
-#include <opus.h>
-#else
-#include <opus/opus.h>
-#endif
-
-static OpusEncoder* g_opusEnc = nullptr;
-static OpusDecoder* g_opusDec = nullptr;
-static int          g_opusFrameSize = 0;
-static const int    OPUS_MAX_PACKET_BYTES = 1500;
-
-#ifdef _WIN32
-static HMODULE g_opusModule = NULL;
-
-typedef OpusEncoder* (*opus_encoder_create_t)(opus_int32 Fs, int channels,
-                                              int application, int *error);
-typedef void (*opus_encoder_destroy_t)(OpusEncoder *st);
-typedef OpusDecoder* (*opus_decoder_create_t)(opus_int32 Fs, int channels,
-                                              int *error);
-typedef void (*opus_decoder_destroy_t)(OpusDecoder *st);
-typedef int (*opus_encode_t)(OpusEncoder *st, const opus_int16 *pcm,
-                             int frame_size, unsigned char *data,
-                             opus_int32 max_data_bytes);
-typedef int (*opus_decode_t)(OpusDecoder *st, const unsigned char *data,
-                             opus_int32 len, opus_int16 *pcm,
-                             int frame_size, int decode_fec);
-typedef const char* (*opus_strerror_t)(int error);
-
-static opus_encoder_create_t  p_opus_encoder_create  = nullptr;
-static opus_encoder_destroy_t p_opus_encoder_destroy = nullptr;
-static opus_decoder_create_t  p_opus_decoder_create  = nullptr;
-static opus_decoder_destroy_t p_opus_decoder_destroy = nullptr;
-static opus_encode_t          p_opus_encode          = nullptr;
-static opus_decode_t          p_opus_decode          = nullptr;
-static opus_strerror_t        p_opus_strerror        = nullptr;
-
-static bool loadOpusDll()
-{
-    if (g_opusModule)
-        return true;
-
-    g_opusModule = LoadLibraryA("opus.dll");
-    if (!g_opusModule) {
-        std::cerr << "Failed to load opus.dll\n";
-        return false;
-    }
-
-    auto loadSym = [](HMODULE mod, const char* name) -> FARPROC {
-        FARPROC p = GetProcAddress(mod, name);
-        if (!p)
-            std::cerr << "Missing symbol in opus.dll: " << name << "\n";
-        return p;
-    };
-
-    p_opus_encoder_create  = (opus_encoder_create_t)  loadSym(g_opusModule, "opus_encoder_create");
-    p_opus_encoder_destroy = (opus_encoder_destroy_t) loadSym(g_opusModule, "opus_encoder_destroy");
-    p_opus_decoder_create  = (opus_decoder_create_t)  loadSym(g_opusModule, "opus_decoder_create");
-    p_opus_decoder_destroy = (opus_decoder_destroy_t) loadSym(g_opusModule, "opus_decoder_destroy");
-    p_opus_encode          = (opus_encode_t)          loadSym(g_opusModule, "opus_encode");
-    p_opus_decode          = (opus_decode_t)          loadSym(g_opusModule, "opus_decode");
-    p_opus_strerror        = (opus_strerror_t)        loadSym(g_opusModule, "opus_strerror");
-
-    if (!p_opus_encoder_create || !p_opus_encoder_destroy ||
-        !p_opus_decoder_create || !p_opus_decoder_destroy ||
-        !p_opus_encode || !p_opus_decode || !p_opus_strerror)
-    {
-        std::cerr << "opus.dll missing required functions\n";
-        FreeLibrary(g_opusModule);
-        g_opusModule = NULL;
-        return false;
-    }
-
-    return true;
-}
-
-static void unloadOpusDll()
-{
-    if (g_opusModule) {
-        FreeLibrary(g_opusModule);
-        g_opusModule = NULL;
-    }
-}
-#else
-static bool loadOpusDll()     { return true; }
-static void unloadOpusDll()   {}
-#endif
-
-static bool initOpus(const ClientConfig& cfg)
-{
-    if (!cfg.use_opus)
-        return true;
-
-    if (!loadOpusDll()) {
-        std::cerr << "Opus DLL load failed\n";
-        return false;
-    }
-
-    int err = 0;
-    int sampleRate = cfg.sample_rate;
-    int channels   = cfg.channels;
-
-    g_opusFrameSize = (int)cfg.frames_per_buffer;
-
-    g_opusEnc = p_opus_encoder_create(sampleRate, channels,
-                                      OPUS_APPLICATION_VOIP, &err);
-    if (err != OPUS_OK || !g_opusEnc) {
-        std::cerr << "Opus encoder create failed: "
-                  << (p_opus_strerror ? p_opus_strerror(err) : "unknown") << "\n";
-        g_opusEnc = nullptr;
-        return false;
-    }
-
-    g_opusDec = p_opus_decoder_create(sampleRate, channels, &err);
-    if (err != OPUS_OK || !g_opusDec) {
-        std::cerr << "Opus decoder create failed: "
-                  << (p_opus_strerror ? p_opus_strerror(err) : "unknown") << "\n";
-        if (g_opusEnc) {
-            p_opus_encoder_destroy(g_opusEnc);
-            g_opusEnc = nullptr;
-        }
-        g_opusDec = nullptr;
-        return false;
-    }
-
-    return true;
-}
-
-static void shutdownOpus()
-{
-    if (g_opusEnc) {
-        if (p_opus_encoder_destroy)
-            p_opus_encoder_destroy(g_opusEnc);
-        g_opusEnc = nullptr;
-    }
-    if (g_opusDec) {
-        if (p_opus_decoder_destroy)
-            p_opus_decoder_destroy(g_opusDec);
-        g_opusDec = nullptr;
-    }
-    unloadOpusDll();
-}
-
-std::vector<char> encodeOpusFrame(const std::vector<char>& pcmBytes)
-{
-	if (!g_cfg.use_opus || !g_opusEnc || !p_opus_encode) {
-		std::cerr << "encodeOpusFrame: Opus not initialized, cannot encode.\n";
-		return std::vector<char>();
-	}
-
-    if (pcmBytes.empty()) {
-        return std::vector<char>();
-    }
-
-    size_t samplesTotal    = pcmBytes.size() / sizeof(opus_int16);
-    size_t samplesPerFrame = (size_t)g_opusFrameSize * g_channels;
-
-    if (samplesTotal != samplesPerFrame) {
-        std::cerr << "encodeOpusFrame: unexpected frame size: "
-                  << samplesTotal << " samples, expected "
-                  << samplesPerFrame << "\n";
-        return std::vector<char>();
-    }
-
-    const opus_int16* pcm = reinterpret_cast<const opus_int16*>(pcmBytes.data());
-    std::vector<unsigned char> pkt(OPUS_MAX_PACKET_BYTES);
-
-    int nbytes = p_opus_encode(g_opusEnc,
-                               pcm,
-                               g_opusFrameSize,
-                               pkt.data(),
-                               (opus_int32)pkt.size());
-
-    if (nbytes < 0) {
-        std::cerr << "Opus encode failed: "
-                  << (p_opus_strerror ? p_opus_strerror(nbytes) : "error") << "\n";
-        return std::vector<char>();
-    }
-
-    return std::vector<char>((char*)pkt.data(), (char*)pkt.data() + nbytes);
-}
-
-static std::vector<char> decodeOpusFrame(const std::vector<char>& pktBytes)
-{
-    if (!g_cfg.use_opus || !g_opusDec || !p_opus_decode) {
-        return pktBytes;
-    }
-
-    if (pktBytes.empty()) {
-        return std::vector<char>();
-    }
-
-    std::vector<opus_int16> pcm((size_t)g_opusFrameSize * g_channels);
-
-    int nsamples = p_opus_decode(g_opusDec,
-                                 (const unsigned char*)pktBytes.data(),
-                                 (opus_int32)pktBytes.size(),
-                                 pcm.data(),
-                                 g_opusFrameSize,
-                                 0 /* no FEC */);
-
-    if (nsamples < 0) {
-        std::cerr << "Opus decode failed: "
-                  << (p_opus_strerror ? p_opus_strerror(nsamples) : "error") << "\n";
-        return std::vector<char>();
-    }
-
-    if (nsamples == 0) {
-        return std::vector<char>();
-    }
-
-    size_t totalSamples = (size_t)nsamples * g_channels;
-    std::vector<char> out(totalSamples * sizeof(opus_int16));
-    std::memcpy(out.data(), pcm.data(), out.size());
-
-    return out;
-}
-
-static void ParseCm108Command(const std::string& cmd, std::string& hiddev, int& pinOut)
-{
-    hiddev.clear();
-    pinOut = 0;
-
-    std::istringstream iss(cmd);
-    std::string tok;
-    while (iss >> tok) {
-        if (tok == "-H") {
-            iss >> hiddev;
-        } else if (tok == "-P") {
-            std::string sval;
-            if (iss >> sval) {
-                pinOut = std::atoi(sval.c_str());
-            }
-        }
-    }
-
-#ifdef __linux__
-    if (hiddev.empty()) {
-        hiddev = "/dev/hidraw0";
-    }
-#else
-    (void)hiddev;
-#endif
-
-    if (pinOut <= 0 || pinOut > 8) {
-        pinOut = 3;
-    }
-}
-#endif
-
 #define PTT_HAL_IMPLEMENTATION
 #include "ptt_hal.h"
 
@@ -1074,14 +813,6 @@ void pttManagerThreadFunc() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
-
-#if defined(__ANDROID__)
-struct OpusEncoder{}; struct OpusDecoder{};
-static bool initOpus(const ClientConfig&) { return false; }
-static void shutdownOpus() {}
-std::vector<char> encodeOpusFrame(const std::vector<char>&) { return {}; }
-static std::vector<char> decodeOpusFrame(const std::vector<char>&) { return {}; }
-#endif
 
 #pragma pack(push, 1)
 struct WavHeader {
@@ -1675,13 +1406,112 @@ static RxVoiceMetrics analyzeRxVoice(const int16_t* samples, size_t sampleCount,
 	return m;
 }
 
+static const int ZFM_NET_AUDIO_RATE = 22050;
+
+struct LinearResamplerState {
+    double pos;
+    std::vector<int16_t> lastFrame;
+    bool hasLast;
+
+    LinearResamplerState() : pos(0.0), lastFrame(), hasLast(false) {}
+};
+
+static int zfm_round_to_int(double v) {
+    if (v >= 0.0) return (int)floor(v + 0.5);
+    return (int)ceil(v - 0.5);
+}
+
+static int16_t zfm_sample_at(const int16_t* in,
+                             size_t inFrames,
+                             int channels,
+                             const LinearResamplerState& st,
+                             size_t frameIndex,
+                             int ch)
+{
+    if (frameIndex == 0) return st.lastFrame[(size_t)ch];
+    size_t srcFrame = frameIndex - 1;
+    if (srcFrame >= inFrames) srcFrame = inFrames ? (inFrames - 1) : 0;
+    return in[srcFrame * (size_t)channels + (size_t)ch];
+}
+
+static std::vector<int16_t> resampleLinearInterleaved(const int16_t* in,
+                                                      size_t inFrames,
+                                                      int channels,
+                                                      int inRate,
+                                                      int outRate,
+                                                      LinearResamplerState& st)
+{
+    std::vector<int16_t> out;
+    if (!in || inFrames == 0 || channels <= 0 || inRate <= 0 || outRate <= 0) return out;
+
+    if (!st.hasLast) {
+        st.lastFrame.assign((size_t)channels, 0);
+        for (int c = 0; c < channels; ++c) {
+            st.lastFrame[(size_t)c] = in[(size_t)c];
+        }
+        st.hasLast = true;
+        st.pos = 1.0;
+    }
+
+    const size_t totalFrames = inFrames + 1;
+    const double step = (double)inRate / (double)outRate;
+
+    const size_t estOutFrames = (size_t)ceil(((double)inFrames) * ((double)outRate / (double)inRate)) + 4;
+    out.reserve(estOutFrames * (size_t)channels);
+
+    while (st.pos < (double)(totalFrames - 1)) {
+        const size_t i0 = (size_t)st.pos;
+        const double frac = st.pos - (double)i0;
+        const size_t i1 = i0 + 1;
+
+        for (int c = 0; c < channels; ++c) {
+            const int16_t s0 = zfm_sample_at(in, inFrames, channels, st, i0, c);
+            const int16_t s1 = zfm_sample_at(in, inFrames, channels, st, i1, c);
+            const double v = (1.0 - frac) * (double)s0 + frac * (double)s1;
+            int iv = zfm_round_to_int(v);
+            if (iv > 32767) iv = 32767;
+            if (iv < -32768) iv = -32768;
+            out.push_back((int16_t)iv);
+        }
+
+        st.pos += step;
+    }
+
+    st.pos -= (double)inFrames;
+
+    st.lastFrame.resize((size_t)channels);
+    const size_t lastOff = (inFrames - 1) * (size_t)channels;
+    for (int c = 0; c < channels; ++c) {
+        st.lastFrame[(size_t)c] = in[lastOff + (size_t)c];
+    }
+
+    return out;
+}
+
 void playAudioFrame(const std::vector<char>& frame) {
     if (frame.empty()) return;
+
     size_t sampleCount = frame.size() / sizeof(int16_t);
-    unsigned long frames = (unsigned long)(sampleCount / g_channels);
-    if (frames == 0) return;
+    unsigned long inFrames = (unsigned long)(sampleCount / g_channels);
+    if (inFrames == 0) return;
 
     const int16_t* inSamples = reinterpret_cast<const int16_t*>(frame.data());
+
+    static LinearResamplerState s_rxResampler;
+    std::vector<int16_t> resampled;
+    if (g_sampleRate != ZFM_NET_AUDIO_RATE) {
+        resampled = resampleLinearInterleaved(inSamples,
+                                              (size_t)inFrames,
+                                              g_channels,
+                                              ZFM_NET_AUDIO_RATE,
+                                              g_sampleRate,
+                                              s_rxResampler);
+        if (resampled.empty()) return;
+        inSamples = resampled.data();
+        sampleCount = resampled.size();
+        inFrames = (unsigned long)(sampleCount / (size_t)g_channels);
+        if (inFrames == 0) return;
+    }
 
     float gain = g_outputGain.load();
     std::vector<int16_t> outSamples(sampleCount);
@@ -1755,7 +1585,7 @@ void playAudioFrame(const std::vector<char>& frame) {
 		g_lastRxAudioTime = std::chrono::steady_clock::now();
 	}
 
-	audioOutWrite(outSamples.data(), frames);
+	audioOutWrite(outSamples.data(), inFrames);
 
 #ifdef GUI
     const int16_t* samples = outSamples.data();
@@ -1808,7 +1638,6 @@ static const int VOX_MAX_THRESHOLD_PEAK  = 25000;
 
 std::vector<char> captureAudioFrame();
 void playAudioFrame(const std::vector<char>& pcm);
-std::vector<char> encodeOpusFrame(const std::vector<char>& pcm);
 
 static std::mutex g_adpcmJbMutex;
 static std::atomic<bool> g_adpcmPlayoutRun(false);
@@ -2073,24 +1902,6 @@ static bool sendVoiceFrameToServer(SOCKET sock, const std::vector<char>& pcmByte
     if (pcmBytes.size() > ZFM_MAX_TX_PAYLOAD) {
         LOG_WARN("Refusing to send huge PCM payload: %zu bytes\n", pcmBytes.size());
         return false;
-    }
-
-    if (g_cfg.use_opus) {
-        std::vector<char> payload = encodeOpusFrame(pcmBytes);
-        std::string cmd = payload.empty() ? "AUDIO" : "AUDIO_OPUS";
-        if (payload.empty()) payload = pcmBytes;
-
-        if (payload.size() > ZFM_MAX_TX_PAYLOAD) {
-            LOG_WARN("Refusing to send huge OPUS payload: %zu bytes\n", payload.size());
-            return false;
-        }
-
-        std::ostringstream oss;
-        oss << cmd << " " << payload.size() << "\n";
-        std::string header = oss.str();
-        if (!sendAll(sock, header.data(), header.size())) return false;
-        if (!sendAll(sock, payload.data(), payload.size())) return false;
-        return true;
     }
 
     if (!g_cfg.use_adpcm) {
@@ -2658,7 +2469,7 @@ void receiverLoop(SOCKET sock) {
             }
 #endif
         }
-		else if (cmd == "AUDIO_FROM" || cmd == "AUDIO_FROM_OPUS") {
+		else if (cmd == "AUDIO_FROM") {
 			std::string user;
 			size_t size = 0;
 			iss >> user >> size;
@@ -2690,11 +2501,7 @@ void receiverLoop(SOCKET sock) {
 			g_lastRxAudioTime = std::chrono::steady_clock::now();
 
 			std::vector<char> pcm;
-			if (cmd == "AUDIO_FROM_OPUS" && g_cfg.use_opus) {
-				pcm = decodeOpusFrame(buf);
-			} else {
-				pcm = std::move(buf);
-			}
+			pcm = std::move(buf);
 
 			if (!pcm.empty()) {
 				playAudioFrame(pcm);
@@ -3174,12 +2981,6 @@ int main(int argc, char** argv) {
         std::cerr << "PortAudio init failed.\n";
         return 1;
     }
-	if (g_cfg.use_opus) {
-		if (!initOpus(g_cfg)) {
-			std::cerr << "Opus init failed, falling back to PCM.\n";
-			g_cfg.use_opus = false;
-		}
-	}
 	loadRogerFromConfig();
     if (!initGpioPtt(g_cfg)) {
         std::cerr << "GPIO PTT init failed.\n";
@@ -3192,7 +2993,6 @@ int main(int argc, char** argv) {
     if (g_cfg.mode == "parrot") {
         parrotLoop(g_cfg);
         shutdownPortAudio();
-		shutdownOpus();
         shutdownGpioPtt();
         return 0;
     }
@@ -3203,7 +3003,6 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to create socket\n";
         cleanupSockets();
         shutdownPortAudio();
-		shutdownOpus();
         shutdownGpioPtt();
         return 1;
     }
@@ -3228,7 +3027,6 @@ int main(int argc, char** argv) {
 		closeSocket(sock);
 		cleanupSockets();
 		shutdownPortAudio();
-		shutdownOpus();
 		shutdownGpioPtt();
 		return 1;
 	}
@@ -3248,7 +3046,6 @@ int main(int argc, char** argv) {
 		closeSocket(sock);
 		cleanupSockets();
 		shutdownPortAudio();
-		shutdownOpus();
 		shutdownGpioPtt();
 		return 1;
 	}
@@ -3269,7 +3066,6 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-			shutdownOpus();
             shutdownGpioPtt();
             return 1;
         }
@@ -3279,7 +3075,6 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-			shutdownOpus();
             shutdownGpioPtt();
             return 1;
         }
@@ -3288,7 +3083,6 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-			shutdownOpus();
             shutdownGpioPtt();
             return 1;
         }
@@ -3304,7 +3098,6 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-			shutdownOpus();
             shutdownGpioPtt();
             return 1;
         }
@@ -3314,7 +3107,6 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-			shutdownOpus();
             shutdownGpioPtt();
             return 1;
         }
@@ -3324,7 +3116,6 @@ int main(int argc, char** argv) {
             closeSocket(sock);
             cleanupSockets();
             shutdownPortAudio();
-			shutdownOpus();
             shutdownGpioPtt();
             return 1;
         }
@@ -3376,7 +3167,6 @@ int main(int argc, char** argv) {
 	closeSocket(sock);
 
     shutdownPortAudio();
-	shutdownOpus();
     shutdownGpioPtt();
     cleanupSockets();
     return 0;

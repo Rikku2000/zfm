@@ -17,7 +17,8 @@ const ovCtx     = wfOverlay ? wfOverlay.getContext("2d") : null;
 
 let currentWaveTg = "gateway";
 let autoFollowTg = true;
-
+let lastTalkgroups = [];
+let emptyWaveCount = 0;
 if (autoFollowEl) {
   autoFollowTg = !!autoFollowEl.checked;
   autoFollowEl.addEventListener("change", () => {
@@ -61,9 +62,17 @@ function renderStatus(data) {
   } else {
     clientCountEl.textContent = "--";
   }
-
   const talkgroups = data.talkgroups || [];
+  lastTalkgroups = talkgroups;
 
+  if (currentWaveTg === "gateway") {
+    const usable = talkgroups.filter(t => t && t.name && t.name !== "-");
+    const hasGateway = usable.some(t => t.name === "gateway");
+    if (!hasGateway && usable.length) {
+      currentWaveTg = usable[0].name;
+      if (waveTgLabelEl) waveTgLabelEl.textContent = currentWaveTg || "-";
+    }
+  }
   updateWaveformTgFromActivity(talkgroups);
   renderTalkgroups(talkgroups);
 
@@ -355,10 +364,21 @@ function updateWaveformTgFromActivity(talkgroups) {
   if (!autoFollowTg) return;
   if (!Array.isArray(talkgroups) || talkgroups.length === 0) return;
 
-  const usable = talkgroups.filter(t => t && t.name && t.name !== "-" && (typeof t.listeners !== "number" || t.listeners > 0));
+  const usable = talkgroups.filter(t => t && t.name && t.name !== "-");
   if (!usable.length) return;
 
-  let candidate = usable.find(t => t.active_speaker);
+  let candidate = null;
+  const wxName = (weatherTgEl && weatherTgEl.textContent && weatherTgEl.textContent !== "--")
+    ? weatherTgEl.textContent.replace(/\s*\(RX Only\)\s*$/i, "").trim()
+    : "";
+  if (wxName) {
+    const wx = usable.find(t => t && t.name === wxName);
+    if (wx && (wx.active_speaker || (wx.speak_ms || 0) > 0 || (wx.audio_level || 0) > 0)) {
+      candidate = wx;
+    }
+  }
+
+  if (!candidate) candidate = usable.find(t => t.active_speaker);
   if (!candidate) {
     candidate = usable
       .slice()
@@ -384,9 +404,28 @@ async function fetchWaveform(tg) {
     if (!res.ok) return;
     const data = await res.json();
     const samples = data.samples || [];
+	if (!data.samples || data.samples.length === 0) {
+	  data.samples = new Array(512).fill(0);
+	}
     if (samples.length) {
+      emptyWaveCount = 0;
       lastSamples = samples;
       lastSampleTs = performance.now();
+    } else {
+      emptyWaveCount++;
+      if (emptyWaveCount >= 5 && Array.isArray(lastTalkgroups) && lastTalkgroups.length) {
+        const usable = lastTalkgroups.filter(t => t && t.name && t.name !== "-");
+        let candidate = usable.find(t => t && t.active_speaker);
+        if (!candidate) {
+          candidate = usable.slice().sort((a, b) => (b.activity_score || 0) - (a.activity_score || 0))[0];
+        }
+        if (!candidate) candidate = usable[0];
+        if (candidate && candidate.name && candidate.name !== currentWaveTg) {
+          currentWaveTg = candidate.name;
+          if (waveTgLabelEl) waveTgLabelEl.textContent = currentWaveTg || "-";
+        }
+        emptyWaveCount = 0;
+      }
     }
   } catch (_) {}
 }
@@ -466,7 +505,7 @@ function resizeWaterfallIfNeeded() {
   specH = Math.round(viewH * 0.28);
   wfallH = viewH - specH - 1;
 
-  wfCtx.fillStyle = "#0b0f14";
+  wfCtx.fillStyle = "#121212";
   wfCtx.fillRect(0, 0, viewW, viewH);
 }
 
@@ -531,10 +570,8 @@ function resampleBinsCentered(srcDb, outBins) {
   for (let x = 0; x < outBins; x++) {
     const t = x / (outBins - 1);
     const centered = (t - 0.5) * 2;
-    const srcPos = centered < 0
-      ? (n * 0.5) + (centered + 1) * (n * 0.5)
-      : centered * (n * 0.5);
-
+    const f = Math.abs(centered);
+    const srcPos = f * (n - 1);
     const i0 = clamp(Math.floor(srcPos), 0, n - 1);
     const i1 = clamp(i0 + 1, 0, n - 1);
     const frac = srcPos - i0;
@@ -548,7 +585,7 @@ function drawOverlays(lineMagDb) {
 
   ovCtx.clearRect(0, 0, viewW, viewH);
 
-  ovCtx.fillStyle = "rgba(11, 15, 20, 0.85)";
+  ovCtx.fillStyle = "rgba(13, 13, 13, 0.85)";
   ovCtx.fillRect(0, 0, viewW, specH);
 
   ovCtx.strokeStyle = "rgba(255,255,255,0.07)";
@@ -575,7 +612,7 @@ function drawOverlays(lineMagDb) {
   ovCtx.stroke();
 
   if (lineMagDb) {
-    ovCtx.strokeStyle = "rgba(220, 235, 255, 0.95)";
+    ovCtx.strokeStyle = "rgba(47, 81, 48, 0.95)";
     ovCtx.lineWidth = 1.5;
     ovCtx.beginPath();
     for (let x = 0; x < DISPLAY_BINS; x++) {
@@ -630,12 +667,15 @@ function renderFrame(ts) {
     scrollAcc -= 1;
 
     const now = performance.now();
-    const isLive = (now - lastSampleTs) < 650;
+	const isLive = (now - lastSampleTs) < 650;
 
-    if (isLive && lastSamples.length) {
-      const magHalf = fftMagDb(lastSamples, FFT_N);
-      lastMag = resampleBinsCentered(magHalf, DISPLAY_BINS);
-    }
+	if (isLive && lastSamples.length) {
+	  const magHalf = fftMagDb(lastSamples, FFT_N);
+	  lastMag = resampleBinsCentered(magHalf, DISPLAY_BINS);
+	} else {
+	  lastMag = new Float32Array(DISPLAY_BINS);
+	  for (let i = 0; i < DISPLAY_BINS; i++) lastMag[i] = -80;
+	}
 
     if (!lastMag) {
       lastMag = new Float32Array(DISPLAY_BINS);
@@ -677,7 +717,7 @@ function renderFrame(ts) {
     }
     wfCtx.putImageData(img, 0, specH + 1);
 
-    wfCtx.fillStyle = "#0b0f14";
+    wfCtx.fillStyle = "#121212";
     wfCtx.fillRect(0, 0, viewW, specH);
 
     drawOverlays(lineMag);
