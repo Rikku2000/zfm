@@ -1,3 +1,7 @@
+#ifndef GUI
+#define GUI
+#endif
+
 #include "client.cpp"
 
 #include <cmath>
@@ -231,7 +235,7 @@ static bool GuiStartCore() {
     g_running = true;
     g_canTalk = false;
 
-	if (g_cfg.mode == "parrot") {
+	if (g_cfg.mode == "Parrot") {
 		g_connected = true;
 		GuiAppendLog("Parrot mode active (no server connection).");
 		return true;
@@ -409,7 +413,7 @@ static void GuiHandleCommand(const std::string& input) {
 
     GuiAppendLog(std::string("> ") + input);
 
-    if (g_cfg.mode == "parrot") {
+    if (g_cfg.mode == "Parrot") {
         if (input == "t" || input == "/talk") {
             GuiAppendLog("Starting parrot session");
             std::thread(doParrotSession, g_cfg.gpio_ptt_enabled).detach();
@@ -575,6 +579,107 @@ static void GuiPushToTalkLoop() {
     g_guiPttThreadRunning = false;
 	g_talkerActive = false;
 	g_audioLevel = 0.0f;
+}
+
+static void GuiParrotPttLoop() {
+    g_guiPttThreadRunning = true;
+
+    if (!g_connected) {
+        GuiAppendLog("[WARN] Parrot PTT requested but core not running");
+        g_guiPttThreadRunning = false;
+        return;
+    }
+
+    g_isTalking = true;
+    g_currentSpeaker = g_cfg.callsign;
+    g_talkerStart = std::chrono::steady_clock::now();
+    g_talkerActive = true;
+
+    const int maxRecordMs = 6000;
+    auto tStart = std::chrono::steady_clock::now();
+
+    std::vector<std::vector<char>> recordedFrames;
+    recordedFrames.reserve(400);
+
+    while (g_running && g_guiPttHeld.load()) {
+        auto now = std::chrono::steady_clock::now();
+        int elapsed = (int)std::chrono::duration_cast<std::chrono::milliseconds>(now - tStart).count();
+        if (elapsed >= maxRecordMs) {
+            GuiAppendLog("[INFO] Parrot PTT: max record time reached");
+            break;
+        }
+
+        std::vector<char> frame = captureAudioFrame();
+        if (!g_running) break;
+        if (frame.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        UpdateTxMicLevelFromFrame(frame);
+        recordedFrames.push_back(std::move(frame));
+    }
+
+    g_talkerActive = false;
+    g_audioLevel = 0.0f;
+
+    if (recordedFrames.empty()) {
+        g_currentSpeaker.clear();
+        g_isTalking = false;
+        g_guiPttThreadRunning = false;
+        return;
+    }
+
+    const bool savedSqEn   = g_rxSquelchEnabled.load();
+    const bool savedSqAuto = g_rxSquelchAuto.load();
+    const int  savedSqLvl  = g_rxSquelchLevel.load();
+    const int  savedSqVPct = g_rxSquelchVoicePct.load();
+    const int  savedSqHang = g_rxSquelchHangMs.load();
+
+    g_rxSquelchEnabled = false;
+    g_rxSquelchAuto    = false;
+
+    FlushAudioOutput();
+
+    g_currentSpeaker = g_cfg.callsign + " (Parrot)";
+    g_talkerStart = std::chrono::steady_clock::now();
+    g_talkerActive = true;
+
+    for (const auto& f : recordedFrames) {
+        if (f.empty()) continue;
+        size_t sampleCount = f.size() / sizeof(int16_t);
+        unsigned long frames = (unsigned long)(sampleCount / (size_t)g_channels);
+        if (frames == 0) continue;
+
+        const int16_t* inSamples = reinterpret_cast<const int16_t*>(f.data());
+
+        float gain = g_outputGain.load();
+        std::vector<int16_t> outSamples(sampleCount);
+        if (gain == 1.0f) {
+            std::memcpy(outSamples.data(), inSamples, sampleCount * sizeof(int16_t));
+        } else {
+            for (size_t i = 0; i < sampleCount; ++i) {
+                float v = inSamples[i] * gain;
+                if (v > 32767.0f)  v = 32767.0f;
+                if (v < -32768.0f) v = -32768.0f;
+                outSamples[i] = (int16_t)v;
+            }
+        }
+        if (!outSamples.empty()) applySoftLimiter(outSamples, 0.95f);
+        audioOutWriteBlockingChunked(outSamples.data(), frames);
+    }
+
+    g_talkerActive = false;
+    g_audioLevel = 0.0f;
+    g_currentSpeaker.clear();
+    g_isTalking = false;
+
+    g_rxSquelchEnabled  = savedSqEn;
+    g_rxSquelchAuto     = savedSqAuto;
+    g_rxSquelchLevel    = savedSqLvl;
+    g_rxSquelchVoicePct = savedSqVPct;
+    g_rxSquelchHangMs   = savedSqHang;
+
+    g_guiPttThreadRunning = false;
 }
 
 static SDL_Color COL_BG        = { 0x12, 0x12, 0x12, 255 };
@@ -2289,8 +2394,13 @@ int main(int argc, char** argv) {
 							continue;
 
 						if (i == id_txButton) {
-							if (g_cfg.mode == "parrot" || g_cfg.vox_enabled) {
-								GuiHandleCommand("t");
+							if (g_cfg.mode == "Parrot" || g_cfg.vox_enabled) {
+								if (!g_guiPttThreadRunning) {
+									g_guiPttHeld = true;
+									std::thread(GuiParrotPttLoop).detach();
+								} else {
+									g_guiPttHeld = true;
+								}
 							} else {
 								if (!g_guiPttThreadRunning) {
 									g_guiPttHeld = true;
@@ -2380,7 +2490,7 @@ int main(int argc, char** argv) {
 				g_mouseDown = false;
 				g_activeSlider = -1;
 
-				if (!g_cfg.vox_enabled && g_cfg.mode != "parrot") {
+				if (!g_cfg.vox_enabled) {
 					g_guiPttHeld = false;
 				}
 			} else if (ev.type == SDL_TEXTINPUT) {
@@ -2419,17 +2529,19 @@ int main(int argc, char** argv) {
                     if (g_focusWidget < 0 || g_focusWidget >= (int)g_widgets.size()) return false;
                     return g_widgets[g_focusWidget].type == W_EDIT;
                 };
-                if (ui_kb_ptt_en && !focusedIsEdit() && !ev.key.repeat &&
-                    (int)key == ui_kb_ptt_keycode && !g_cfg.vox_enabled && g_cfg.mode != "parrot") {
-                    if (g_connected && !g_isTalking.load()) {
-                        if (!g_guiPttThreadRunning) {
-                            g_guiPttHeld = true;
-                            std::thread(GuiPushToTalkLoop).detach();
-                        } else {
-                            g_guiPttHeld = true;
-                        }
-                    }
-                }
+				if (ui_kb_ptt_en && !focusedIsEdit() && !ev.key.repeat &&
+				    (int)key == ui_kb_ptt_keycode && !g_cfg.vox_enabled) {
+					if (g_connected && !g_isTalking.load()) {
+						g_guiPttHeld = true;
+						if (!g_guiPttThreadRunning) {
+							if (g_cfg.mode == "Parrot") {
+								std::thread(GuiParrotPttLoop).detach();
+							} else {
+								std::thread(GuiPushToTalkLoop).detach();
+							}
+						}
+					}
+				}
 
                 if (key == SDLK_ESCAPE) {
                     running = false;
@@ -2503,9 +2615,9 @@ int main(int argc, char** argv) {
                         GuiHandleCommand(ui_cmd);
                     }
                 }
-            } else if (ev.type == SDL_KEYUP) {
+			} else if (ev.type == SDL_KEYUP) {
                 SDL_Keycode key = ev.key.keysym.sym;
-                if (ui_kb_ptt_en && (int)key == ui_kb_ptt_keycode && !g_cfg.vox_enabled && g_cfg.mode != "parrot") {
+				if (ui_kb_ptt_en && (int)key == ui_kb_ptt_keycode && !g_cfg.vox_enabled) {
                     g_guiPttHeld = false;
                 }
             }

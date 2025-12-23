@@ -601,7 +601,14 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
 		else if (parseIntField(l,  "rx_squelch_hang_ms", ival)) cfg.rx_squelch_hang_ms = ival;
     }
 
-	if (cfg.use_adpcm) {
+    {
+        std::string m = cfg.mode;
+        std::transform(m.begin(), m.end(), m.begin(), [](unsigned char c){ return (char)tolower(c); });
+        if (m == "Parrot") cfg.mode = "Parrot";
+        else cfg.mode = "Server";
+    }
+
+    if (cfg.use_adpcm) {
 		cfg.sample_rate       = 22050;
 		cfg.frames_per_buffer = 960;
 		cfg.channels          = 1;
@@ -2845,13 +2852,14 @@ void doParrotSession(bool usePtt)
     const int minRecordMs = 0;
 #endif
 
+#ifdef GUI
+    g_currentSpeaker = g_cfg.callsign;
+    g_talkerStart = std::chrono::steady_clock::now();
+    g_talkerActive = true;
+#endif
+
     if (usePtt) {
         setPtt(true);
-#ifdef GUI
-        g_currentSpeaker = g_cfg.callsign;
-        g_talkerStart = std::chrono::steady_clock::now();
-        g_talkerActive = true;
-#endif
     }
 
     const int silenceFramesNeeded = 50;
@@ -2922,6 +2930,11 @@ void doParrotSession(bool usePtt)
 
     if (recordedFrames.empty()) {
         std::cout << "Parrot: nothing recorded.\n";
+#ifdef GUI
+        g_talkerActive = false;
+        g_audioLevel = 0.0f;
+        if (g_currentSpeaker == g_cfg.callsign) g_currentSpeaker.clear();
+#endif
         return;
     }
 
@@ -2937,7 +2950,7 @@ void doParrotSession(bool usePtt)
     FlushAudioOutput();
 
 #ifdef GUI
-    g_currentSpeaker = "PARROT";
+    g_currentSpeaker = g_cfg.callsign + " (Parrot)";
     g_talkerStart = std::chrono::steady_clock::now();
     g_talkerActive = true;
 #endif
@@ -2975,7 +2988,7 @@ void doParrotSession(bool usePtt)
 #ifdef GUI
     g_talkerActive = false;
     g_audioLevel = 0.0f;
-    if (g_currentSpeaker == "PARROT") g_currentSpeaker.clear();
+    if (g_currentSpeaker == g_cfg.callsign + " (Parrot)") g_currentSpeaker.clear();
 #endif
 
     g_rxSquelchEnabled  = savedSqEn;
@@ -3076,7 +3089,7 @@ int main(int argc, char** argv) {
 		std::thread(pttManagerThreadFunc).detach();
 	}
 
-    if (g_cfg.mode == "parrot") {
+    if (g_cfg.mode == "Parrot") {
         parrotLoop(g_cfg);
         shutdownPortAudio();
         shutdownGpioPtt();
