@@ -467,6 +467,9 @@ struct ClientConfig {
     bool gpio_ptt_active_high;
     int  gpio_ptt_hold_ms;
 
+	bool keyboard_ptt_enabled;
+	int  keyboard_ptt_keycode;
+
     bool vox_enabled;
     int  vox_threshold;
 
@@ -513,6 +516,9 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
     cfg.gpio_ptt_active_high = true;
     cfg.gpio_ptt_hold_ms = 250;
 
+	cfg.keyboard_ptt_enabled = true;
+	cfg.keyboard_ptt_keycode = 32;
+
     cfg.vox_enabled = false;
     cfg.vox_threshold = 5000;
 
@@ -521,7 +527,6 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
 
     cfg.ptt_cmd_on.clear();
     cfg.ptt_cmd_off.clear();
-
 	
     cfg.ptt_serial_port.clear();
     cfg.ptt_serial_line = "RTS";
@@ -573,6 +578,8 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
         else if (parseIntField(l, "ptt_pin", ival)) cfg.gpio_ptt_pin = ival;
         else if (parseBoolField(l, "active_high", bval)) cfg.gpio_ptt_active_high = bval;
         else if (parseIntField(l, "ptt_hold_ms", ival)) cfg.gpio_ptt_hold_ms = ival;
+		else if (parseBoolField(l, "keyboard_ptt_enabled", bval)) cfg.keyboard_ptt_enabled = bval;
+		else if (parseIntField(l, "keyboard_ptt_keycode", ival)) cfg.keyboard_ptt_keycode = ival;
         else if (parseStringField(l, "ptt_cmd_on", sval))  cfg.ptt_cmd_on  = sval;
         else if (parseStringField(l, "ptt_cmd_off", sval)) cfg.ptt_cmd_off = sval;
         else if (parseStringField(l, "ptt_serial_port", sval)) cfg.ptt_serial_port = sval;
@@ -626,6 +633,8 @@ static bool saveClientConfigFile(const std::string& path, const ClientConfig& cf
     f << "  \"ptt_pin\": " << cfg.gpio_ptt_pin << ",\n";
     f << "  \"active_high\": " << (cfg.gpio_ptt_active_high ? "true" : "false") << ",\n";
     f << "  \"ptt_hold_ms\": " << cfg.gpio_ptt_hold_ms << ",\n";
+	f << "  \"keyboard_ptt_enabled\": " << (cfg.keyboard_ptt_enabled ? "true" : "false") << ",\n";
+	f << "  \"keyboard_ptt_keycode\": " << cfg.keyboard_ptt_keycode << ",\n";
     f << "  \"vox_enabled\": " << (cfg.vox_enabled ? "true" : "false") << ",\n";
     f << "  \"vox_threshold\": " << cfg.vox_threshold << ",\n";
     f << "  \"input_gain\": " << cfg.input_gain << ",\n";

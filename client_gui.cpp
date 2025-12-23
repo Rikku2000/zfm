@@ -82,6 +82,11 @@ static std::atomic<bool> g_isTalking(false);
 static std::atomic<bool> g_guiPttHeld(false);
 static std::atomic<bool> g_guiPttThreadRunning(false);
 
+static bool ui_kb_ptt_en = true;
+static int  ui_kb_ptt_keycode = SDLK_SPACE;
+static std::string ui_kb_ptt_keyname = "SPACE";
+static bool g_capturePttKey = false;
+
 static void GuiAppendLog(const std::string& text) {
     std::lock_guard<std::mutex> lock(g_logMutex);
     std::string s = text;
@@ -1282,6 +1287,11 @@ static void CfgToUi() {
     ui_gpio_ah       = g_cfg.gpio_ptt_active_high;
     ui_gpio_hold_ms  = std::to_string(g_cfg.gpio_ptt_hold_ms);
 
+    ui_kb_ptt_en      = g_cfg.keyboard_ptt_enabled;
+    ui_kb_ptt_keycode = g_cfg.keyboard_ptt_keycode;
+    ui_kb_ptt_keyname = SDL_GetKeyName((SDL_Keycode)ui_kb_ptt_keycode);
+    if (ui_kb_ptt_keyname.empty()) ui_kb_ptt_keyname = "(none)";
+
     ui_vox_en        = g_cfg.vox_enabled;
     ui_vox_thresh    = std::to_string(g_cfg.vox_threshold);
 
@@ -1471,6 +1481,9 @@ static void UiToCfg() {
     g_cfg.gpio_ptt_pin         = std::atoi(ui_gpio_pin.c_str());
     g_cfg.gpio_ptt_active_high = ui_gpio_ah;
     g_cfg.gpio_ptt_hold_ms     = std::atoi(ui_gpio_hold_ms.c_str());
+
+    g_cfg.keyboard_ptt_enabled = ui_kb_ptt_en;
+    g_cfg.keyboard_ptt_keycode = ui_kb_ptt_keycode;
 
     g_cfg.input_gain  = ui_in_gain;
     g_cfg.output_gain = ui_out_gain;
@@ -1847,6 +1860,7 @@ int main(int argc, char** argv) {
     int id_sendBtn = -1;
     int id_btnClearLog = -1;
     int id_btnSaveLog = -1;
+    int id_kbPttKeyBtn = -1;
 
     bool fullscreen = false;
 
@@ -1875,6 +1889,7 @@ int main(int argc, char** argv) {
 	id_btnLoad1 = id_btnSave1 = id_btnLoad2 = id_btnSave2 = id_btnLoad3 = id_btnSave3 = -1;
 	id_txButton = id_btnConnect = id_cmdEdit = id_sendBtn = -1;
 	id_btnClearLog = id_btnSaveLog = -1;
+	id_kbPttKeyBtn = -1;
 
     g_widgets.clear();
 
@@ -2017,6 +2032,12 @@ int main(int argc, char** argv) {
 
 		AddLabel(3, xLabel, y, "Hang (ms)");
 		AddSlider(3, xCtrl, y, fullW, &ui_rx_squelch_hang, 0, 2000, ""); y += 44;
+
+		AddCheck(3, xLabel, y, "Keyboard PTT", &ui_kb_ptt_en); y += 34;
+		AddLabel(3, xLabel, y, "PTT Key");
+		id_kbPttKeyBtn = AddButton(3, xCtrl, y - 4, 140, 30, ui_kb_ptt_keyname.c_str());
+		AddLabel(3, xCtrl + 150, y + 6, "(click to change)");
+		y += 44;
 
 		id_btnLoad3 = AddButton(3, w - 190, y + 8, 80, 30, "Load");
 		id_btnSave3 = AddButton(3, w - 100, y + 8, 80, 30, "Save");
@@ -2280,7 +2301,12 @@ int main(int argc, char** argv) {
 							}
 						} else if (i == id_sendBtn) {
 							GuiHandleCommand(ui_cmd);
-						} else if (i == id_btnConnect) {
+						} else if (i == id_kbPttKeyBtn) {
+                            g_capturePttKey = true;
+                            g_focusWidget = -1;
+                            for (auto &ww : g_widgets) ww.focused = false;
+                            wdg.label = "Press a key...";
+                        } else if (i == id_btnConnect) {
 							if (!g_connected) {
 								UiToCfg();
 								if (!GuiStartCore()) {
@@ -2378,6 +2404,33 @@ int main(int argc, char** argv) {
             } else if (ev.type == SDL_KEYDOWN) {
                 SDL_Keycode key = ev.key.keysym.sym;
 
+                if (g_capturePttKey) {
+                    g_capturePttKey = false;
+                    ui_kb_ptt_keycode = (int)key;
+                    ui_kb_ptt_keyname = SDL_GetKeyName(key);
+                    if (ui_kb_ptt_keyname.empty()) ui_kb_ptt_keyname = "(none)";
+                    if (id_kbPttKeyBtn >= 0 && id_kbPttKeyBtn < (int)g_widgets.size()) {
+                        g_widgets[id_kbPttKeyBtn].label = ui_kb_ptt_keyname;
+                    }
+                    continue;
+                }
+
+                auto focusedIsEdit = [&]() -> bool {
+                    if (g_focusWidget < 0 || g_focusWidget >= (int)g_widgets.size()) return false;
+                    return g_widgets[g_focusWidget].type == W_EDIT;
+                };
+                if (ui_kb_ptt_en && !focusedIsEdit() && !ev.key.repeat &&
+                    (int)key == ui_kb_ptt_keycode && !g_cfg.vox_enabled && g_cfg.mode != "parrot") {
+                    if (g_connected && !g_isTalking.load()) {
+                        if (!g_guiPttThreadRunning) {
+                            g_guiPttHeld = true;
+                            std::thread(GuiPushToTalkLoop).detach();
+                        } else {
+                            g_guiPttHeld = true;
+                        }
+                    }
+                }
+
                 if (key == SDLK_ESCAPE) {
                     running = false;
 				} else if (key == SDLK_F11 || (key == SDLK_RETURN && (ev.key.keysym.mod & KMOD_ALT))) {
@@ -2449,6 +2502,11 @@ int main(int argc, char** argv) {
                     if (g_focusWidget == id_cmdEdit) {
                         GuiHandleCommand(ui_cmd);
                     }
+                }
+            } else if (ev.type == SDL_KEYUP) {
+                SDL_Keycode key = ev.key.keysym.sym;
+                if (ui_kb_ptt_en && (int)key == ui_kb_ptt_keycode && !g_cfg.vox_enabled && g_cfg.mode != "parrot") {
+                    g_guiPttHeld = false;
                 }
             }
         }
