@@ -68,9 +68,9 @@ std::atomic<bool>  g_talkerActive(false);
 std::chrono::steady_clock::time_point g_talkerStart;
 #endif
 
-static const size_t ZFM_MAX_LINE_BYTES = 4096;
-static const size_t ZFM_MAX_RX_PAYLOAD = 256 * 1024;
-static const size_t ZFM_MAX_TX_PAYLOAD = 256 * 1024;
+static const size_t MAX_LINE_BYTES = 4096;
+static const size_t MAX_RX_PAYLOAD = 256 * 1024;
+static const size_t MAX_TX_PAYLOAD = 256 * 1024;
 
 static std::string g_sockStash;
 
@@ -318,7 +318,7 @@ static bool recvLine(SOCKET sock, std::string& outLine)
             return true;
         }
 
-        if (g_sockStash.size() >= ZFM_MAX_LINE_BYTES) {
+        if (g_sockStash.size() >= MAX_LINE_BYTES) {
             return false;
         }
 
@@ -503,7 +503,7 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
     cfg.server_port = 26613;
     cfg.callsign = "guest";
     cfg.password = "passw0rd";
-    cfg.talkgroup = "gateway";
+    cfg.talkgroup = "Gateway";
 
     cfg.sample_rate = 22050;
     cfg.frames_per_buffer = 960;
@@ -697,7 +697,7 @@ static SDL_AudioDeviceID g_sdlInDev  = 0;
 static SDL_AudioDeviceID g_sdlOutDev = 0;
 static SDL_AudioSpec     g_sdlInSpec;
 static SDL_AudioSpec     g_sdlOutSpec;
-static const int         ZFM_ANDROID_MAX_QUEUE_MS = 250;
+static const int         ANDROID_MAX_QUEUE_MS = 250;
 
 static inline void AndroidFlushMicQueue() {
     if (g_sdlInDev) SDL_ClearQueuedAudio(g_sdlInDev);
@@ -748,7 +748,7 @@ static bool audioOutWrite(const int16_t* samples, unsigned long frames) {
 
     const Uint32 maxQueueBytes = (Uint32)(
         (uint64_t)g_sampleRate * (uint64_t)g_channels * sizeof(int16_t) *
-        (uint64_t)ZFM_ANDROID_MAX_QUEUE_MS / 1000ULL
+        (uint64_t)ANDROID_MAX_QUEUE_MS / 1000ULL
     );
 
     Uint32 q = SDL_GetQueuedAudioSize(g_sdlOutDev);
@@ -1449,7 +1449,7 @@ static RxVoiceMetrics analyzeRxVoice(const int16_t* samples, size_t sampleCount,
 	return m;
 }
 
-static const int ZFM_NET_AUDIO_RATE = 22050;
+static const int NET_AUDIO_RATE = 22050;
 
 struct LinearResamplerState {
     double pos;
@@ -1459,12 +1459,12 @@ struct LinearResamplerState {
     LinearResamplerState() : pos(0.0), lastFrame(), hasLast(false) {}
 };
 
-static int zfm_round_to_int(double v) {
+static int round_to_int(double v) {
     if (v >= 0.0) return (int)floor(v + 0.5);
     return (int)ceil(v - 0.5);
 }
 
-static int16_t zfm_sample_at(const int16_t* in,
+static int16_t sample_at(const int16_t* in,
                              size_t inFrames,
                              int channels,
                              const LinearResamplerState& st,
@@ -1499,7 +1499,7 @@ static std::vector<int16_t> resampleMono16Linear(const std::vector<int16_t>& in,
         const int16_t s1 = in[std::min(idx + 1, in.size() - 1)];
 
         const double v = (1.0 - frac) * (double)s0 + frac * (double)s1;
-		long vv = (long)zfm_round_to_int(v);
+		long vv = (long)round_to_int(v);
         if (vv > 32767) vv = 32767;
         if (vv < -32768) vv = -32768;
         out[i] = (int16_t)vv;
@@ -1539,10 +1539,10 @@ static std::vector<int16_t> resampleLinearInterleaved(const int16_t* in,
         const size_t i1 = i0 + 1;
 
         for (int c = 0; c < channels; ++c) {
-            const int16_t s0 = zfm_sample_at(in, inFrames, channels, st, i0, c);
-            const int16_t s1 = zfm_sample_at(in, inFrames, channels, st, i1, c);
+            const int16_t s0 = sample_at(in, inFrames, channels, st, i0, c);
+            const int16_t s1 = sample_at(in, inFrames, channels, st, i1, c);
             const double v = (1.0 - frac) * (double)s0 + frac * (double)s1;
-            int iv = zfm_round_to_int(v);
+            int iv = round_to_int(v);
             if (iv > 32767) iv = 32767;
             if (iv < -32768) iv = -32768;
             out.push_back((int16_t)iv);
@@ -1573,11 +1573,11 @@ void playAudioFrame(const std::vector<char>& frame) {
 
     static LinearResamplerState s_rxResampler;
     std::vector<int16_t> resampled;
-    if (g_sampleRate != ZFM_NET_AUDIO_RATE) {
+    if (g_sampleRate != NET_AUDIO_RATE) {
         resampled = resampleLinearInterleaved(inSamples,
                                               (size_t)inFrames,
                                               g_channels,
-                                              ZFM_NET_AUDIO_RATE,
+                                              NET_AUDIO_RATE,
                                               g_sampleRate,
                                               s_rxResampler);
         if (resampled.empty()) return;
@@ -1703,7 +1703,11 @@ std::vector<std::string> g_serverTalkgroups;
 #ifdef GUI
 extern std::vector<std::string> g_tgComboItems;
 extern int ui_tg_index;
+#if defined(__linux__)
+static std::string ui_talkgroup;
+#else
 extern std::string ui_talkgroup;
+#endif
 #endif
 
 static const int VOX_TRIGGER_FRAMES_NEEDED  = 6;
@@ -1978,7 +1982,7 @@ static bool sendVoiceFrameToServer(SOCKET sock, const std::vector<char>& pcmByte
 {
     if (pcmBytes.empty()) return true;
 
-    if (pcmBytes.size() > ZFM_MAX_TX_PAYLOAD) {
+    if (pcmBytes.size() > MAX_TX_PAYLOAD) {
         LOG_WARN("Refusing to send huge PCM payload: %zu bytes\n", pcmBytes.size());
         return false;
     }
@@ -2563,7 +2567,7 @@ void receiverLoop(SOCKET sock) {
 			size_t size = 0;
 			iss >> user >> size;
 
-			if (user.empty() || size == 0 || size > ZFM_MAX_RX_PAYLOAD) {
+			if (user.empty() || size == 0 || size > MAX_RX_PAYLOAD) {
 				LOG_WARN("Bad AUDIO_FROM frame header (user='%s' size=%zu)\n", user.c_str(), size);
 				g_running = false;
 				break;
@@ -2605,7 +2609,7 @@ void receiverLoop(SOCKET sock) {
 			size_t size = 0;
 			iss >> user >> seq >> rate >> size;
 
-			if (user.empty() || size == 0 || size > ZFM_MAX_RX_PAYLOAD) {
+			if (user.empty() || size == 0 || size > MAX_RX_PAYLOAD) {
 				LOG_WARN("Bad AUDIO_ADPCM_FROM header (user='%s' seq=%u rate=%u size=%zu)\n",
 						 user.c_str(), seq, (unsigned)rate, size);
 				g_running = false;

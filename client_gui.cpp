@@ -1,7 +1,3 @@
-#ifndef GUI
-#define GUI
-#endif
-
 #include "client.cpp"
 
 #include <cmath>
@@ -538,7 +534,7 @@ static void GuiPushToTalkLoop() {
 		payload = std::move(frame);
 		audioCmd = "AUDIO";
 
-        if (payload.size() > ZFM_MAX_TX_PAYLOAD) {
+        if (payload.size() > MAX_TX_PAYLOAD) {
             GuiAppendLog("[ERROR] Refusing to send huge audio payload: " + std::to_string(payload.size()));
             g_running = false;
             break;
@@ -1276,7 +1272,11 @@ static std::string ui_password;
 #if defined(__ANDROID__)
 std::string ui_talkgroup;
 #else
+#if defined(__linux__)
+extern std::string ui_talkgroup;
+#else
 static std::string ui_talkgroup;
+#endif
 #endif
 
 std::vector<std::string> g_tgComboItems;
