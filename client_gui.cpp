@@ -1270,7 +1270,7 @@ static std::string ui_callsign;
 static std::string ui_password;
 
 #if defined(__ANDROID__)
-std::string ui_talkgroup;
+extern std::string ui_talkgroup;
 #else
 #if defined(__linux__)
 extern std::string ui_talkgroup;
