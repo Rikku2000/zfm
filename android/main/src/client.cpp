@@ -679,6 +679,11 @@ static bool saveClientConfigFile(const std::string& path, const ClientConfig& cf
 	f << "  \"rx_squelch_level\": " << cfg.rx_squelch_level << ",\n";
 	f << "  \"rx_squelch_voice_pct\": " << cfg.rx_squelch_voice_pct << ",\n";
 	f << "  \"rx_squelch_hang_ms\": " << cfg.rx_squelch_hang_ms << ",\n";
+    f << "  \"tx_squelch_enabled\": " << (cfg.tx_squelch_enabled ? "true" : "false") << ",\n";
+	f << "  \"tx_squelch_auto\": " << (cfg.tx_squelch_auto ? "true" : "false") << ",\n";
+	f << "  \"tx_squelch_level\": " << cfg.tx_squelch_level << ",\n";
+	f << "  \"tx_squelch_voice_pct\": " << cfg.tx_squelch_voice_pct << ",\n";
+	f << "  \"tx_squelch_hang_ms\": " << cfg.tx_squelch_hang_ms << ",\n";
 	f << "  \"use_adpcm\": " << (cfg.use_adpcm ? "true" : "false") << ",\n";
 	f << "  \"adpcm_adaptive\": " << (cfg.adpcm_adaptive ? "true" : "false") << ",\n";
 	f << "  \"adpcm_jitter_frames\": " << cfg.adpcm_jitter_frames << ",\n";
