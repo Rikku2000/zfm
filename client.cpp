@@ -61,6 +61,12 @@ std::atomic<int>  g_rxSquelchLevel(55);
 std::atomic<int>  g_rxSquelchVoicePct(55);
 std::atomic<int>  g_rxSquelchHangMs(450);
 
+std::atomic<bool> g_txSquelchEnabled(false);
+std::atomic<bool> g_txSquelchAuto(true);
+std::atomic<int>  g_txSquelchLevel(55);
+std::atomic<int>  g_txSquelchVoicePct(55);
+std::atomic<int>  g_txSquelchHangMs(450);
+
 static void stopAdpcmPlayoutThread();
 
 #ifdef GUI
@@ -91,7 +97,6 @@ enum LogColorLevel {
 	LOG_CYAN,
 	LOG_WHITE
 };
-
 
 #ifdef _WIN32
 void title() {
@@ -495,6 +500,12 @@ struct ClientConfig {
 	int  rx_squelch_level;
 	int  rx_squelch_voice_pct;
 	int  rx_squelch_hang_ms;
+
+	bool tx_squelch_enabled;
+	bool tx_squelch_auto;
+	int  tx_squelch_level;
+	int  tx_squelch_voice_pct;
+	int  tx_squelch_hang_ms;
 };
 
 bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
@@ -543,6 +554,12 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
 	cfg.rx_squelch_level   = 55;
 	cfg.rx_squelch_voice_pct = 55;
 	cfg.rx_squelch_hang_ms = 450;
+
+	cfg.tx_squelch_enabled = false;
+	cfg.tx_squelch_auto    = true;
+	cfg.tx_squelch_level   = 55;
+	cfg.tx_squelch_voice_pct = 55;
+	cfg.tx_squelch_hang_ms = 450;
 
     std::ifstream f(path.c_str());
     if (!f.is_open()) {
@@ -599,6 +616,11 @@ bool loadClientConfig(const std::string& path, ClientConfig& cfg) {
 		else if (parseIntField(l,  "rx_squelch_level", ival)) cfg.rx_squelch_level = ival;
 		else if (parseIntField(l,  "rx_squelch_voice_pct", ival)) cfg.rx_squelch_voice_pct = ival;
 		else if (parseIntField(l,  "rx_squelch_hang_ms", ival)) cfg.rx_squelch_hang_ms = ival;
+		else if (parseBoolField(l, "tx_squelch_enabled", bval)) cfg.tx_squelch_enabled = bval;
+		else if (parseBoolField(l, "tx_squelch_auto", bval)) cfg.tx_squelch_auto = bval;
+		else if (parseIntField(l, "tx_squelch_level", ival)) cfg.tx_squelch_level = ival;
+		else if (parseIntField(l, "tx_squelch_voice_pct", ival)) cfg.tx_squelch_voice_pct = ival;
+		else if (parseIntField(l, "tx_squelch_hang_ms", ival)) cfg.tx_squelch_hang_ms = ival;
     }
 
     {
@@ -715,8 +737,7 @@ static bool audioOutWrite(const int16_t* samples, unsigned long frames) {
         static int dropCount = 0;
         dropCount++;
         if (dropCount <= 5 || (dropCount % 50) == 0) {
-            LOG_WARN("Audio overrun protection: dropping %lu frames (avail=%ld)\n",
-                     frames, avail);
+            LOG_WARN("Audio overrun protection: dropping %lu frames (avail=%ld)\n",frames, avail);
         }
 
         if ((dropCount % 200) == 0) {
@@ -1091,6 +1112,11 @@ bool initPortAudio(const ClientConfig& cfg) {
 	g_rxSquelchLevel    = cfg.rx_squelch_level;
 	g_rxSquelchVoicePct = cfg.rx_squelch_voice_pct;
 	g_rxSquelchHangMs   = cfg.rx_squelch_hang_ms;
+	g_txSquelchEnabled  = cfg.tx_squelch_enabled;
+	g_txSquelchAuto     = cfg.tx_squelch_auto;
+	g_txSquelchLevel    = cfg.tx_squelch_level;
+	g_txSquelchVoicePct = cfg.tx_squelch_voice_pct;
+	g_txSquelchHangMs   = cfg.tx_squelch_hang_ms;
 
     int devCount = Pa_GetDeviceCount();
     if (devCount < 0) {
@@ -1227,6 +1253,11 @@ bool initPortAudio(const ClientConfig& cfg) {
     g_rxSquelchLevel    = cfg.rx_squelch_level;
     g_rxSquelchVoicePct = cfg.rx_squelch_voice_pct;
     g_rxSquelchHangMs   = cfg.rx_squelch_hang_ms;
+	g_txSquelchEnabled  = cfg.tx_squelch_enabled;
+	g_txSquelchAuto     = cfg.tx_squelch_auto;
+	g_txSquelchLevel    = cfg.tx_squelch_level;
+	g_txSquelchVoicePct = cfg.tx_squelch_voice_pct;
+	g_txSquelchHangMs   = cfg.tx_squelch_hang_ms;
 
     SDL_AudioSpec want;
     SDL_zero(want);
@@ -1448,6 +1479,118 @@ static RxVoiceMetrics analyzeRxVoice(const int16_t* samples, size_t sampleCount,
 
 	return m;
 }
+
+struct TxVoiceMetrics {
+    float rms;
+    float voiceRatio;
+    TxVoiceMetrics() : rms(0.0f), voiceRatio(0.0f) {}
+};
+
+static TxVoiceMetrics analyzeTxVoice(const int16_t* samples, size_t sampleCount, int channels, int sampleRate) {
+    TxVoiceMetrics m;
+    if (!samples || sampleCount == 0 || channels <= 0 || sampleRate <= 0) return m;
+
+    static float hp_y_tx = 0.0f;
+    static float hp_x1_tx = 0.0f;
+    static float lp_y_tx = 0.0f;
+
+    float dt = 1.0f / (float)sampleRate;
+    float rc_hp = 1.0f / (2.0f * 3.14159265f * 300.0f);
+    float a = rc_hp / (rc_hp + dt);
+    float rc_lp = 1.0f / (2.0f * 3.14159265f * 3000.0f);
+    float b = rc_lp / (rc_lp + dt);
+
+    double sumSq = 0.0;
+    double sumBandSq = 0.0;
+    size_t frames = sampleCount / (size_t)channels;
+
+    for (size_t f = 0; f < frames; ++f) {
+        double acc = 0.0;
+        for (int c = 0; c < channels; ++c) {
+            acc += samples[f * (size_t)channels + (size_t)c] / 32768.0;
+        }
+        float x = (float)(acc / (double)channels);
+        sumSq += (double)x * (double)x;
+
+        float hp = a * (hp_y_tx + x - hp_x1_tx);
+        hp_y_tx = hp;
+        hp_x1_tx = x;
+        float lp = b * lp_y_tx + (1.0f - b) * hp;
+        lp_y_tx = lp;
+
+        sumBandSq += (double)lp * (double)lp;
+    }
+
+    if (frames > 0) {
+        m.rms = (float)std::sqrt(sumSq / (double)frames);
+        double totalE = sumSq / (double)frames;
+        double bandE  = sumBandSq / (double)frames;
+        m.voiceRatio = (totalE > 1e-12) ? (float)(bandE / totalE) : 0.0f;
+        if (m.voiceRatio < 0.0f) m.voiceRatio = 0.0f;
+        if (m.voiceRatio > 1.0f) m.voiceRatio = 1.0f;
+    }
+
+    return m;
+}
+
+static bool applyTxSquelchToFrame(std::vector<char>& frame, int channels, int sampleRate)
+{
+    if (frame.empty()) return true;
+    const bool sqEnabled = g_txSquelchEnabled.load();
+    if (!sqEnabled) return true;
+
+    const bool sqAuto = g_txSquelchAuto.load();
+    int sqLevel = g_txSquelchLevel.load();
+    int sqVoicePct = g_txSquelchVoicePct.load();
+    int sqHangMs = g_txSquelchHangMs.load();
+
+    if (sqLevel < 0) sqLevel = 0; if (sqLevel > 100) sqLevel = 100;
+    if (sqVoicePct < 0) sqVoicePct = 0; if (sqVoicePct > 100) sqVoicePct = 100;
+    if (sqHangMs < 0) sqHangMs = 0; if (sqHangMs > 5000) sqHangMs = 5000;
+
+    size_t sampleCount = frame.size() / sizeof(int16_t);
+    if (sampleCount == 0) return true;
+
+    const int16_t* samples = reinterpret_cast<const int16_t*>(frame.data());
+    TxVoiceMetrics met = analyzeTxVoice(samples, sampleCount, channels, sampleRate);
+
+    float t = (float)sqLevel / 100.0f;
+    float thrStatic = 0.10f + (0.01f - 0.10f) * t;
+    float voiceThr  = (float)sqVoicePct / 100.0f;
+
+    static bool gateOpen = true;
+    static std::chrono::steady_clock::time_point lastVoice = std::chrono::steady_clock::now();
+    static float noiseFloor = 0.02f;
+
+    float thr = thrStatic;
+    if (sqAuto) {
+        bool looksVoice = (met.voiceRatio >= voiceThr);
+        if (!gateOpen && !looksVoice) {
+            noiseFloor = noiseFloor * 0.995f + met.rms * 0.005f;
+            if (noiseFloor < 0.0025f) noiseFloor = 0.0025f;
+            if (noiseFloor > 0.40f)   noiseFloor = 0.40f;
+        }
+        thr = std::max(0.004f, noiseFloor * 2.5f);
+        thr *= (1.4f - 0.7f * t);
+    }
+
+    bool isVoiceNow = (met.rms >= thr) && (met.voiceRatio >= voiceThr);
+    auto now = std::chrono::steady_clock::now();
+    if (isVoiceNow) {
+        lastVoice = now;
+        gateOpen = true;
+    }
+
+    long long sinceVoiceMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastVoice).count();
+    if (sinceVoiceMs > (long long)sqHangMs) gateOpen = false;
+
+    if (!gateOpen) {
+        std::memset(frame.data(), 0, frame.size());
+    }
+
+    return gateOpen;
+}
+
 
 static const int NET_AUDIO_RATE = 22050;
 
@@ -1722,6 +1865,7 @@ static const int VOX_MAX_THRESHOLD_PEAK  = 25000;
 #include <deque>
 
 std::vector<char> captureAudioFrame();
+static inline void UpdateTxMicLevelFromFrame(const std::vector<char>& frame);
 void playAudioFrame(const std::vector<char>& pcm);
 
 static std::mutex g_adpcmJbMutex;
@@ -2770,6 +2914,12 @@ void doTalkSession(SOCKET sock) {
         if (frame.empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
+        }
+
+        UpdateTxMicLevelFromFrame(frame);
+        bool txGateOpen = true;
+        if (g_txSquelchEnabled.load()) {
+            txGateOpen = applyTxSquelchToFrame(frame, g_channels, g_sampleRate);
         }
 
         if (voxMode) {

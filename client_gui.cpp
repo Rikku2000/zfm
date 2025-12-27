@@ -1298,6 +1298,12 @@ static int  ui_rx_squelch_level = 55;
 static int  ui_rx_squelch_voice = 55;
 static int  ui_rx_squelch_hang  = 450;
 
+static bool ui_tx_squelch_en = false;
+static bool ui_tx_squelch_auto = true;
+static int  ui_tx_squelch_level = 55;
+static int  ui_tx_squelch_voice = 55;
+static int  ui_tx_squelch_hang  = 450;
+
 static int ui_in_gain  = 100;
 static int ui_out_gain = 100;
 
@@ -1408,6 +1414,12 @@ static void CfgToUi() {
 	ui_rx_squelch_level = g_cfg.rx_squelch_level;
 	ui_rx_squelch_voice = g_cfg.rx_squelch_voice_pct;
 	ui_rx_squelch_hang  = g_cfg.rx_squelch_hang_ms;
+
+	ui_tx_squelch_en    = g_cfg.tx_squelch_enabled;
+	ui_tx_squelch_auto  = g_cfg.tx_squelch_auto;
+	ui_tx_squelch_level = g_cfg.tx_squelch_level;
+	ui_tx_squelch_voice = g_cfg.tx_squelch_voice_pct;
+	ui_tx_squelch_hang  = g_cfg.tx_squelch_hang_ms;
 
     if (g_codecItems.empty()) {
         g_codecItems.push_back("PCM (raw)");
@@ -1598,6 +1610,11 @@ static void UiToCfg() {
 	g_cfg.rx_squelch_level     = ui_rx_squelch_level;
 	g_cfg.rx_squelch_voice_pct = ui_rx_squelch_voice;
 	g_cfg.rx_squelch_hang_ms   = ui_rx_squelch_hang;
+	g_cfg.tx_squelch_enabled   = ui_tx_squelch_en;
+	g_cfg.tx_squelch_auto      = ui_tx_squelch_auto;
+	g_cfg.tx_squelch_level     = ui_tx_squelch_level;
+	g_cfg.tx_squelch_voice_pct = ui_tx_squelch_voice;
+	g_cfg.tx_squelch_hang_ms   = ui_tx_squelch_hang;
 
     g_cfg.use_adpcm = (ui_codec_index == 1);
 
@@ -2138,6 +2155,18 @@ int main(int argc, char** argv) {
 		AddLabel(3, xLabel, y, "Hang (ms)");
 		AddSlider(3, xCtrl, y, fullW, &ui_rx_squelch_hang, 0, 2000, ""); y += 44;
 
+		AddCheck(3, xLabel, y, "TX Squelch", &ui_tx_squelch_en);
+		AddCheck(3, xCtrl, y, "Auto", &ui_tx_squelch_auto); y += 30;
+
+		AddLabel(3, xLabel, y, "Level");
+		AddSlider(3, xCtrl, y, fullW, &ui_tx_squelch_level, 0, 100, ""); y += 34;
+
+		AddLabel(3, xLabel, y, "Discriminator");
+		AddSlider(3, xCtrl, y, fullW, &ui_tx_squelch_voice, 0, 100, ""); y += 34;
+
+		AddLabel(3, xLabel, y, "Hang (ms)");
+		AddSlider(3, xCtrl, y, fullW, &ui_tx_squelch_hang, 0, 2000, ""); y += 44;
+
 		AddCheck(3, xLabel, y, "Keyboard PTT", &ui_kb_ptt_en); y += 34;
 		AddLabel(3, xLabel, y, "PTT Key");
 		id_kbPttKeyBtn = AddButton(3, xCtrl, y - 4, 140, 30, ui_kb_ptt_keyname.c_str());
@@ -2670,6 +2699,19 @@ int main(int argc, char** argv) {
 		g_rxSquelchLevel    = ui_rx_squelch_level;
 		g_rxSquelchVoicePct = ui_rx_squelch_voice;
 		g_rxSquelchHangMs   = ui_rx_squelch_hang;
+
+		if (ui_tx_squelch_level < 0) ui_tx_squelch_level = 0;
+		if (ui_tx_squelch_level > 100) ui_tx_squelch_level = 100;
+		if (ui_tx_squelch_voice < 0) ui_tx_squelch_voice = 0;
+		if (ui_tx_squelch_voice > 100) ui_tx_squelch_voice = 100;
+		if (ui_tx_squelch_hang < 0) ui_tx_squelch_hang = 0;
+		if (ui_tx_squelch_hang > 5000) ui_tx_squelch_hang = 5000;
+
+		g_txSquelchEnabled  = ui_tx_squelch_en;
+		g_txSquelchAuto     = ui_tx_squelch_auto;
+		g_txSquelchLevel    = ui_tx_squelch_level;
+		g_txSquelchVoicePct = ui_tx_squelch_voice;
+		g_txSquelchHangMs   = ui_tx_squelch_hang;
 
 		if (id_txButton >= 0 && id_txButton < (int)g_widgets.size()) {
 			bool enabled = g_connected && !g_isTalking.load();
