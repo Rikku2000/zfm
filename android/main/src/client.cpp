@@ -1,6 +1,8 @@
 #include <iostream>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
 #include <atomic>
 #include <vector>
 #include <string>
@@ -16,12 +18,14 @@
 #include <ctime>
 #include <cstdio>
 #include <cmath>
+#include <functional>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
   #define NOMINMAX
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <mstcpip.h>
   typedef int socklen_t;
   #pragma comment(lib, "Ws2_32.lib")
 #else
@@ -79,6 +83,10 @@ static const size_t MAX_RX_PAYLOAD = 256 * 1024;
 static const size_t MAX_TX_PAYLOAD = 256 * 1024;
 
 static std::string g_sockStash;
+std::atomic<bool> g_running(true);
+
+static std::atomic<bool> g_hbStop(false);
+static std::thread g_hbThread;
 
 #define RESET       "\033[0m"
 #define RED         "\033[1;31m"
@@ -234,6 +242,48 @@ void closeSocket(SOCKET s) {
 #endif
 }
 
+static void configureSocketKeepalive(SOCKET s)
+{
+    int opt = 1;
+    if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&opt, sizeof(opt)) != 0) {
+    }
+
+#ifdef _WIN32
+    tcp_keepalive ka;
+    ka.onoff = 1;
+    ka.keepalivetime = 30000;
+    ka.keepaliveinterval = 10000;
+    DWORD bytesReturned = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytesReturned, NULL, NULL);
+#else
+    #if defined(TCP_KEEPIDLE)
+        int idle = 30;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    #elif defined(TCP_KEEPALIVE)
+        int idle = 30;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+    #endif
+
+    #if defined(TCP_KEEPINTVL)
+        int intvl = 10;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    #endif
+
+    #if defined(TCP_KEEPCNT)
+        int cnt = 3;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    #endif
+#endif
+}
+
+static void configureSocketForRealtime(SOCKET s)
+{
+    int flag = 1;
+    if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag)) != 0) {
+    }
+    configureSocketKeepalive(s);
+}
+
 static bool sendAll(SOCKET sock, const void* data, size_t len)
 {
     const char* p = reinterpret_cast<const char*>(data);
@@ -260,6 +310,36 @@ static bool sendAll(SOCKET sock, const void* data, size_t len)
         sent += (size_t)n;
     }
     return true;
+}
+
+static void stopHeartbeat()
+{
+    g_hbStop = true;
+    if (g_hbThread.joinable()) g_hbThread.join();
+    g_hbStop = false;
+}
+
+static void startHeartbeat(SOCKET sock)
+{
+    stopHeartbeat();
+    g_hbStop = false;
+
+    g_hbThread = std::thread([sock]() {
+        using namespace std::chrono;
+        while (!g_hbStop.load() && g_running.load()) {
+            for (int i = 0; i < 150; ++i) {
+                if (g_hbStop.load() || !g_running.load()) return;
+                std::this_thread::sleep_for(milliseconds(100));
+            }
+            if (g_hbStop.load() || !g_running.load()) return;
+
+            static const char kPing[] = "PING\n";
+            if (!sendAll(sock, kPing, sizeof(kPing) - 1)) {
+                g_running = false;
+                return;
+            }
+        }
+    });
 }
 
 static bool recvSome(SOCKET sock, void* out, size_t outCap, size_t& got)
@@ -398,11 +478,7 @@ bool connectToServerHost(const std::string& host, int port, SOCKET& outSock)
         return false;
     }
 
-    int flag = 1;
-    if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
-                   (char*)&flag, sizeof(flag)) != 0) {
-        LOG_WARN("Warning: failed to set TCP_NODELAY on client socket\n");
-    }
+    configureSocketForRealtime(s);
 
     outSock = s;
     return true;
@@ -838,7 +914,47 @@ static int          g_cm108Pin    = 0;
 
 extern ClientConfig g_cfg;
 
-std::atomic<bool> g_running(true);
+static std::atomic<bool> g_shouldQuit(false);
+
+static std::mutex g_cmdMutex;
+static std::condition_variable g_cmdCv;
+static std::deque<std::string> g_cmdQueue;
+static std::atomic<bool> g_stdinClosed(false);
+
+static void stdinThreadFunc() {
+    std::string line;
+    while (true) {
+        if (!std::getline(std::cin, line)) {
+            g_stdinClosed = true;
+            g_shouldQuit = true;
+            g_cmdCv.notify_all();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_cmdMutex);
+            g_cmdQueue.push_back(line);
+        }
+        g_cmdCv.notify_one();
+    }
+}
+
+static bool popCommand(std::string& out, int timeoutMs) {
+    std::unique_lock<std::mutex> lk(g_cmdMutex);
+    if (g_cmdQueue.empty()) {
+        if (timeoutMs <= 0) return false;
+        g_cmdCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), []{
+            return !g_cmdQueue.empty() || g_shouldQuit.load() || g_stdinClosed.load();
+        });
+    }
+    if (g_cmdQueue.empty()) return false;
+    out = std::move(g_cmdQueue.front());
+    g_cmdQueue.pop_front();
+    return true;
+}
+
+#ifdef GUI
+static std::function<void()> g_onDisconnected;
+#endif
 
 extern std::atomic<float> g_inputGain;
 extern std::atomic<float> g_outputGain;
@@ -2596,6 +2712,11 @@ void receiverLoop(SOCKET sock) {
 #endif
 
             g_running = false;
+#ifdef GUI
+            if (g_onDisconnected) {
+                try { g_onDisconnected(); } catch (...) { }
+            }
+#endif
             break;
         }
 
@@ -2603,7 +2724,9 @@ void receiverLoop(SOCKET sock) {
         std::string cmd;
         iss >> cmd;
 
-        if (cmd == "SPEAK_GRANTED") {
+        if (cmd == "PONG") {
+        }
+        else if (cmd == "SPEAK_GRANTED") {
             int ms;
             iss >> ms;
             g_maxTalkMs = ms;
@@ -3256,57 +3379,57 @@ int main(int argc, char** argv) {
     }
 
     initSockets();
-    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == INVALID_SOCKET) {
-        std::cerr << "Failed to create socket\n";
-        cleanupSockets();
-        shutdownPortAudio();
-        shutdownGpioPtt();
-        return 1;
-    }
 
-	struct addrinfo hints;
-	std::memset(&hints, 0, sizeof(hints));
+    std::thread(stdinThreadFunc).detach();
 
-	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_STREAM;
+    auto sleepWithQuit = [](int ms) {
+        const int step = 100;
+        for (int t = 0; t < ms && !g_shouldQuit.load(); t += step)
+            std::this_thread::sleep_for(std::chrono::milliseconds(step));
+    };
 
-	struct addrinfo* res = NULL;
-	std::ostringstream portStr;
-	portStr << g_cfg.server_port;
+    auto doAuthJoin = [&](SOCKET sock) -> bool {
+        {
+            std::ostringstream oss;
+            oss << "AUTH " << g_cfg.callsign << " " << g_cfg.password << "\n";
+            std::string cmd = oss.str();
+            if (!sendAll(sock, cmd.data(), cmd.size())) {
+                LOG_ERROR("Send AUTH failed\n");
+                return false;
+            }
+            std::string line;
+            if (!recvLine(sock, line)) {
+                LOG_ERROR("AUTH response failed\n");
+                return false;
+            }
+            if (line != "AUTH_OK") {
+                LOG_ERROR("Auth failed: %s\n", line.c_str());
+                return false;
+            }
+            LOG_OK("Authenticated.\n");
+        }
 
-	int rv = getaddrinfo(g_cfg.server_ip.c_str(), portStr.str().c_str(), &hints, &res);
-	if (rv != 0 || !res) {
-#ifdef _WIN32
-		LOG_ERROR("getaddrinfo failed for server '%s': %s\n",g_cfg.server_ip.c_str(), gai_strerrorA(rv));
-#else
-		LOG_ERROR("getaddrinfo failed for server '%s': %s\n",g_cfg.server_ip.c_str(), gai_strerror(rv));
-#endif
-		closeSocket(sock);
-		cleanupSockets();
-		shutdownPortAudio();
-		shutdownGpioPtt();
-		return 1;
-	}
-
-	bool connected = false;
-	for (struct addrinfo* p = res; p != NULL; p = p->ai_next) {
-		if (connect(sock, p->ai_addr, (int)p->ai_addrlen) == 0) {
-			connected = true;
-			break;
-		}
-	}
-
-	freeaddrinfo(res);
-
-	if (!connected) {
-		LOG_ERROR("Connect failed to %s:%d\n",g_cfg.server_ip.c_str(), g_cfg.server_port);
-		closeSocket(sock);
-		cleanupSockets();
-		shutdownPortAudio();
-		shutdownGpioPtt();
-		return 1;
-	}
+        {
+            std::ostringstream oss;
+            oss << "JOIN " << g_cfg.talkgroup << "\n";
+            std::string cmd = oss.str();
+            if (!sendAll(sock, cmd.data(), cmd.size())) {
+                LOG_ERROR("Send JOIN failed\n");
+                return false;
+            }
+            std::string line;
+            if (!recvLine(sock, line)) {
+                LOG_ERROR("JOIN response failed\n");
+                return false;
+            }
+            LOG_INFO("[SERVER] %s\n", line.c_str());
+            if (line.find("JOIN_OK") != 0) {
+                LOG_ERROR("Join failed.\n");
+                return false;
+            }
+        }
+        return true;
+    };
 
 	if (g_cfg.gpio_ptt_enabled && !g_cfg.vox_enabled) {
 		g_pttAutoEnabled = true;
@@ -3315,114 +3438,90 @@ int main(int argc, char** argv) {
 		g_pttAutoEnabled = false;
 	}
 
-    {
-        std::ostringstream oss;
-        oss << "AUTH " << g_cfg.callsign << " " << g_cfg.password << "\n";
-        std::string cmd = oss.str();
-        if (!sendAll(sock, cmd.data(), cmd.size())) {
-            LOG_ERROR("Send AUTH failed\n");
-            closeSocket(sock);
-            cleanupSockets();
-            shutdownPortAudio();
-            shutdownGpioPtt();
-            return 1;
-        }
-        std::string line;
-        if (!recvLine(sock, line)) {
-            LOG_ERROR("AUTH response failed\n");
-            closeSocket(sock);
-            cleanupSockets();
-            shutdownPortAudio();
-            shutdownGpioPtt();
-            return 1;
-        }
-        if (line != "AUTH_OK") {
-            LOG_ERROR("Auth failed: %s\n", line.c_str());
-            closeSocket(sock);
-            cleanupSockets();
-            shutdownPortAudio();
-            shutdownGpioPtt();
-            return 1;
-        }
-        LOG_OK("Authenticated.\n");
-    }
+    while (!g_shouldQuit.load()) {
+        SOCKET sock = INVALID_SOCKET;
+        g_running = true;
+        g_canTalk = false;
 
-    {
-        std::ostringstream oss;
-        oss << "JOIN " << g_cfg.talkgroup << "\n";
-        std::string cmd = oss.str();
-        if (!sendAll(sock, cmd.data(), cmd.size())) {
-            LOG_ERROR("Send JOIN failed\n");
-            closeSocket(sock);
-            cleanupSockets();
-            shutdownPortAudio();
-            shutdownGpioPtt();
-            return 1;
+        while (!g_shouldQuit.load() && !connectToServerHost(g_cfg.server_ip, g_cfg.server_port, sock)) {
+            LOG_WARN("Server offline (%s:%d). Retrying...\n", g_cfg.server_ip.c_str(), g_cfg.server_port);
+            sleepWithQuit(2000);
         }
-        std::string line;
-        if (!recvLine(sock, line)) {
-            LOG_ERROR("JOIN response failed\n");
+        if (g_shouldQuit.load()) break;
+
+        if (!doAuthJoin(sock)) {
+            LOG_WARN("Handshake failed. Retrying...\n");
             closeSocket(sock);
-            cleanupSockets();
-            shutdownPortAudio();
-            shutdownGpioPtt();
-            return 1;
+            sleepWithQuit(2000);
+            continue;
         }
-        LOG_INFO("[SERVER] %s\n", line.c_str());
-        if (line.find("JOIN_OK") != 0) {
-            LOG_ERROR("Join failed.\n");
-            closeSocket(sock);
-            cleanupSockets();
-            shutdownPortAudio();
-            shutdownGpioPtt();
-            return 1;
+
+        if (g_cfg.gpio_ptt_enabled && !g_cfg.vox_enabled) {
+            g_pttAutoEnabled = true;
+            g_lastRxAudioTime = std::chrono::steady_clock::now();
+        } else {
+            g_pttAutoEnabled = false;
         }
-    }
 
-    std::thread recvThread(receiverLoop, sock);
+        startHeartbeat(sock);
 
-    if (g_cfg.vox_enabled) {
-        LOG_INFO("[VOX] Hands-free mode: no 't' needed.\n");
-        LOG_INFO("Use Ctrl+C to terminate the client.\n");
-        voxAutoLoop(sock);
-        g_running = false;
-    } else {
-        while (g_running) {
-            LOG_INFO("> ");
-            std::string input;
-            if (!std::getline(std::cin, input)) {
-                g_running = false;
-                break;
-            }
+        std::thread recvThread(receiverLoop, sock);
 
-            if (input == "q" || input == "/quit") {
-                g_running = false;
-                break;
-            } else if (input == "t" || input == "/talk") {
-                if (!g_running) break;
-                doTalkSession(sock);
-            } else if (!input.empty() && input[0] == '/') {
-                std::string adminPayload = input.substr(1);
-                std::string cmd = "ADMIN " + adminPayload + "\n";
-                if (!sendAll(sock, cmd.data(), cmd.size())) {
-                    LOG_ERROR("Failed to send admin cmd.\n");
+        if (g_cfg.vox_enabled) {
+            LOG_INFO("[VOX] Hands-free mode: no 't' needed.\n");
+            LOG_INFO("Use Ctrl+C to terminate the client.\n");
+            voxAutoLoop(sock);
+            g_running = false;
+        } else {
+            bool promptShown = false;
+            while (g_running) {
+                if (!promptShown) {
+                    LOG_INFO("> ");
+                    promptShown = true;
+                }
+
+                std::string input;
+                if (!popCommand(input, 200)) {
+                    if (!g_running || g_shouldQuit.load()) break;
+                    continue;
+                }
+                promptShown = false;
+
+                if (input == "q" || input == "/quit") {
+                    g_shouldQuit = true;
                     g_running = false;
                     break;
+                } else if (input == "t" || input == "/talk") {
+                    if (!g_running) break;
+                    doTalkSession(sock);
+                } else if (!input.empty() && input[0] == '/') {
+                    std::string adminPayload = input.substr(1);
+                    std::string cmd = "ADMIN " + adminPayload + "\n";
+                    if (!sendAll(sock, cmd.data(), cmd.size())) {
+                        LOG_ERROR("Failed to send admin cmd.\n");
+                        g_running = false;
+                        break;
+                    }
+                } else {
+                    LOG_WARN("Unknown cmd.\n");
                 }
-            } else {
-                LOG_WARN("Unknown cmd.\n");
             }
         }
-    }
 
-	g_running = false;
+        g_running = false;
 #if defined(_WIN32) || defined(_WIN64)
-	if (sock != INVALID_SOCKET) shutdown(sock, SD_BOTH);
+        if (sock != INVALID_SOCKET) shutdown(sock, SD_BOTH);
 #else
-	if (sock != INVALID_SOCKET) shutdown(sock, SHUT_RDWR);
+        if (sock != INVALID_SOCKET) shutdown(sock, SHUT_RDWR);
 #endif
-	if (recvThread.joinable()) recvThread.join();
-	closeSocket(sock);
+        if (recvThread.joinable()) recvThread.join();
+        if (sock != INVALID_SOCKET) closeSocket(sock);
+
+        if (g_shouldQuit.load()) break;
+
+        LOG_WARN("Connection lost. Reconnecting...\n");
+        sleepWithQuit(2000);
+    }
 
     shutdownPortAudio();
     shutdownGpioPtt();

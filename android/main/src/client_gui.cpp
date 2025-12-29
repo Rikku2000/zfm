@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <ctime>
 #include <cctype>
+#include <algorithm>
 
 #if defined(__ANDROID__)
 #include "SDL.h"
@@ -72,6 +73,12 @@ static SOCKET g_guiSock = INVALID_SOCKET;
 static std::thread g_recvThread;
 static std::thread g_voxThread;
 static bool g_connected = false;
+
+static std::atomic<bool> g_autoReconnect(true);
+static std::atomic<bool> g_coreDesired(false);
+static std::atomic<bool> g_reconnectRequested(false);
+static std::atomic<bool> g_guiShuttingDown(false);
+static std::thread g_reconnectThread;
 
 static std::string g_cfgPath = "client.json";
 
@@ -177,6 +184,7 @@ static void GuiStopCore() {
     g_guiPttHeld = false;
     g_canTalk = false;
     g_running = false;
+    stopHeartbeat();
 
     for (int i = 0; i < 200; ++i) {
         if (!g_guiPttThreadRunning.load() && !g_isTalking.load()) break;
@@ -305,6 +313,8 @@ static bool GuiStartCore() {
         return false;
     }
 
+    configureSocketForRealtime(sock);
+
     {
         std::lock_guard<std::mutex> lock(g_speakerMutex);
         g_currentSpeaker.clear();
@@ -371,6 +381,7 @@ static bool GuiStartCore() {
     }
 
     g_guiSock = sock;
+    startHeartbeat(g_guiSock);
     g_recvThread = std::thread(receiverLoop, g_guiSock);
     if (g_cfg.vox_enabled) {
         g_voxThread = std::thread(voxAutoLoop, g_guiSock);
@@ -899,6 +910,33 @@ static int  g_kbTargetEdit = -1;
 static SDL_Rect g_kbRect = {0,0,0,0};
 static std::vector<OsKey> g_kbKeys;
 
+static Uint32 g_kbPreviewUntil = 0;
+static SDL_Rect g_kbPreviewRect = {0,0,0,0};
+static std::string g_kbPreviewText;
+
+static inline int clampi(int v, int lo, int hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+static void ShowKbPreview(const OsKey& k) {
+    g_kbPreviewText = k.label;
+    Uint32 now = SDL_GetTicks();
+    g_kbPreviewUntil = now + 250;
+
+    int w = std::max(60, k.rect.w);
+    int h = 60;
+    int x = k.rect.x + (k.rect.w / 2) - (w / 2);
+    int y = k.rect.y - h - 10;
+
+    int maxX = g_kbRect.x + g_kbRect.w - w;
+    x = clampi(x, g_kbRect.x, maxX);
+    if (y < 0) y = 0;
+
+    g_kbPreviewRect = { x, y, w, h };
+}
+
 static int g_id_cmdEdit_global = -1;
 
 static void InsertTextToFocused(const std::string& t, TTF_Font* fontForMeasure = nullptr) {
@@ -1078,18 +1116,29 @@ static void DrawOnScreenKeyboard(SDL_Renderer* r, TTF_Font* font, int winW, int 
     DrawRectBorder(r, g_kbRect, kbBd, 1);
 
     int mx, my;
-    SDL_GetMouseState(&mx, &my);
+    Uint32 buttons = SDL_GetMouseState(&mx, &my);
     SDL_Point pt = { mx, my };
+    bool leftDown = (buttons & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
 
     for (auto& k : g_kbKeys) {
         bool hover = SDL_PointInRect(&pt, &k.rect);
+        bool pressed = hover && leftDown;
 
         SDL_Color bg = hover ? keyBg2 : keyBg;
+        if (pressed) { bg.r = 0x3a; bg.g = 0x3a; bg.b = 0x3a; bg.a = 255; }
         if (k.kind != OsKey::Normal && !hover) { bg.r = 0x26; bg.g = 0x26; bg.b = 0x26; bg.a = 255; }
 
         DrawRect(r, k.rect, bg);
         DrawRectBorder(r, k.rect, kbBd, 1);
         DrawTextCentered(r, font, k.label, k.rect, COL_TEXT);
+    }
+
+    if (!g_kbPreviewText.empty() && SDL_GetTicks() < g_kbPreviewUntil) {
+        SDL_Color bubbleBg = { 0x10, 0x10, 0x10, 235 };
+        SDL_Color bubbleBd = { 0xaa, 0xaa, 0xaa, 255 };
+        DrawRect(r, g_kbPreviewRect, bubbleBg);
+        DrawRectBorder(r, g_kbPreviewRect, bubbleBd, 2);
+        DrawTextCentered(r, font, g_kbPreviewText, g_kbPreviewRect, COL_TEXT);
     }
 }
 
@@ -1101,6 +1150,8 @@ static bool HandleOnScreenKeyboardClick(int mx, int my) {
 
     for (auto& k : g_kbKeys) {
         if (!SDL_PointInRect(&pt, &k.rect)) continue;
+
+        ShowKbPreview(k);
 
         switch (k.kind) {
             case OsKey::Normal: {
@@ -1897,6 +1948,39 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    g_onDisconnected = []() {
+        g_reconnectRequested = true;
+        GuiAppendLog("[WARN] Server connection lost. Auto-reconnect is active.");
+    };
+
+    g_guiShuttingDown = false;
+    g_reconnectThread = std::thread([]() {
+        auto sleepMs = [](int ms) {
+            const int step = 100;
+            for (int t = 0; t < ms && !g_guiShuttingDown.load(); t += step)
+                std::this_thread::sleep_for(std::chrono::milliseconds(step));
+        };
+
+        while (!g_guiShuttingDown.load()) {
+            if (g_autoReconnect.load() && g_coreDesired.load() && g_reconnectRequested.load()) {
+                if (g_connected) {
+                    GuiStopCore();
+                }
+
+                while (!g_guiShuttingDown.load() && g_autoReconnect.load() && g_coreDesired.load() && !g_connected) {
+                    if (GuiStartCore()) {
+                        g_reconnectRequested = false;
+                        break;
+                    }
+                    GuiAppendLog("[WARN] Reconnect failed. Retrying in 2s...");
+                    sleepMs(2000);
+                }
+            }
+
+            sleepMs(200);
+        }
+    });
+
 #ifdef __ANDROID__
 	SDL_Window* window = SDL_CreateWindow("zFM Client", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 0, 0, SDL_WINDOW_FULLSCREEN_DESKTOP);
 #else
@@ -1904,6 +1988,8 @@ int main(int argc, char** argv) {
 #endif
     if (!window) {
         std::cerr << "CreateWindow failed: " << SDL_GetError() << "\n";
+        g_guiShuttingDown = true;
+        if (g_reconnectThread.joinable()) g_reconnectThread.join();
         TTF_Quit();
         SDL_Quit();
         return 1;
@@ -1924,6 +2010,8 @@ int main(int argc, char** argv) {
     if (!renderer) {
         std::cerr << "CreateRenderer failed: " << SDL_GetError() << "\n";
         SDL_DestroyWindow(window);
+        g_guiShuttingDown = true;
+        if (g_reconnectThread.joinable()) g_reconnectThread.join();
         TTF_Quit();
         SDL_Quit();
         return 1;
@@ -2447,13 +2535,18 @@ int main(int argc, char** argv) {
                             wdg.label = "Press a key...";
                         } else if (i == id_btnConnect) {
 							if (!g_connected) {
+								g_coreDesired = true;
+								g_reconnectRequested = false;
 								UiToCfg();
 								if (!GuiStartCore()) {
 									GuiAppendLog("Connect failed");
+									g_reconnectRequested = true;
 								} else {
 									wdg.label = "Disconnect";
 								}
 							} else {
+								g_coreDesired = false;
+								g_reconnectRequested = false;
 								GuiStopCore();
 								wdg.label = "Connect";
 							}
@@ -2985,6 +3078,9 @@ int main(int argc, char** argv) {
 		
         SDL_RenderPresent(renderer);
     }
+
+    g_guiShuttingDown = true;
+    if (g_reconnectThread.joinable()) g_reconnectThread.join();
 
     GuiStopCore();
 

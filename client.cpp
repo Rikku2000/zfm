@@ -25,6 +25,7 @@
   #define NOMINMAX
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <mstcpip.h>
   typedef int socklen_t;
   #pragma comment(lib, "Ws2_32.lib")
 #else
@@ -82,6 +83,10 @@ static const size_t MAX_RX_PAYLOAD = 256 * 1024;
 static const size_t MAX_TX_PAYLOAD = 256 * 1024;
 
 static std::string g_sockStash;
+std::atomic<bool> g_running(true);
+
+static std::atomic<bool> g_hbStop(false);
+static std::thread g_hbThread;
 
 #define RESET       "\033[0m"
 #define RED         "\033[1;31m"
@@ -237,6 +242,48 @@ void closeSocket(SOCKET s) {
 #endif
 }
 
+static void configureSocketKeepalive(SOCKET s)
+{
+    int opt = 1;
+    if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&opt, sizeof(opt)) != 0) {
+    }
+
+#ifdef _WIN32
+    tcp_keepalive ka;
+    ka.onoff = 1;
+    ka.keepalivetime = 30000;
+    ka.keepaliveinterval = 10000;
+    DWORD bytesReturned = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytesReturned, NULL, NULL);
+#else
+    #if defined(TCP_KEEPIDLE)
+        int idle = 30;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    #elif defined(TCP_KEEPALIVE)
+        int idle = 30;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+    #endif
+
+    #if defined(TCP_KEEPINTVL)
+        int intvl = 10;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    #endif
+
+    #if defined(TCP_KEEPCNT)
+        int cnt = 3;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    #endif
+#endif
+}
+
+static void configureSocketForRealtime(SOCKET s)
+{
+    int flag = 1;
+    if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag)) != 0) {
+    }
+    configureSocketKeepalive(s);
+}
+
 static bool sendAll(SOCKET sock, const void* data, size_t len)
 {
     const char* p = reinterpret_cast<const char*>(data);
@@ -263,6 +310,36 @@ static bool sendAll(SOCKET sock, const void* data, size_t len)
         sent += (size_t)n;
     }
     return true;
+}
+
+static void stopHeartbeat()
+{
+    g_hbStop = true;
+    if (g_hbThread.joinable()) g_hbThread.join();
+    g_hbStop = false;
+}
+
+static void startHeartbeat(SOCKET sock)
+{
+    stopHeartbeat();
+    g_hbStop = false;
+
+    g_hbThread = std::thread([sock]() {
+        using namespace std::chrono;
+        while (!g_hbStop.load() && g_running.load()) {
+            for (int i = 0; i < 150; ++i) {
+                if (g_hbStop.load() || !g_running.load()) return;
+                std::this_thread::sleep_for(milliseconds(100));
+            }
+            if (g_hbStop.load() || !g_running.load()) return;
+
+            static const char kPing[] = "PING\n";
+            if (!sendAll(sock, kPing, sizeof(kPing) - 1)) {
+                g_running = false;
+                return;
+            }
+        }
+    });
 }
 
 static bool recvSome(SOCKET sock, void* out, size_t outCap, size_t& got)
@@ -401,11 +478,7 @@ bool connectToServerHost(const std::string& host, int port, SOCKET& outSock)
         return false;
     }
 
-    int flag = 1;
-    if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
-                   (char*)&flag, sizeof(flag)) != 0) {
-        LOG_WARN("Warning: failed to set TCP_NODELAY on client socket\n");
-    }
+    configureSocketForRealtime(s);
 
     outSock = s;
     return true;
@@ -841,7 +914,6 @@ static int          g_cm108Pin    = 0;
 
 extern ClientConfig g_cfg;
 
-std::atomic<bool> g_running(true);
 static std::atomic<bool> g_shouldQuit(false);
 
 static std::mutex g_cmdMutex;
@@ -2652,7 +2724,9 @@ void receiverLoop(SOCKET sock) {
         std::string cmd;
         iss >> cmd;
 
-        if (cmd == "SPEAK_GRANTED") {
+        if (cmd == "PONG") {
+        }
+        else if (cmd == "SPEAK_GRANTED") {
             int ms;
             iss >> ms;
             g_maxTalkMs = ms;
@@ -3388,6 +3462,8 @@ int main(int argc, char** argv) {
         } else {
             g_pttAutoEnabled = false;
         }
+
+        startHeartbeat(sock);
 
         std::thread recvThread(receiverLoop, sock);
 

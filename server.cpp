@@ -33,6 +33,7 @@
   #define NOMINMAX
   #include <winsock2.h>
   #include <ws2tcpip.h>
+  #include <mstcpip.h>
   typedef int socklen_t;
   #pragma comment(lib, "Ws2_32.lib")
 #else
@@ -199,6 +200,49 @@ void closeSocket(SOCKET s) {
     close(s);
 #endif
 }
+
+static void configureSocketKeepalive(SOCKET s)
+{
+    int opt = 1;
+    if (setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (char*)&opt, sizeof(opt)) != 0) {
+    }
+
+#ifdef _WIN32
+    tcp_keepalive ka;
+    ka.onoff = 1;
+    ka.keepalivetime = 30000;
+    ka.keepaliveinterval = 10000;
+    DWORD bytesReturned = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), NULL, 0, &bytesReturned, NULL, NULL);
+#else
+    #if defined(TCP_KEEPIDLE)
+        int idle = 30;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    #elif defined(TCP_KEEPALIVE)
+        int idle = 30;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+    #endif
+
+    #if defined(TCP_KEEPINTVL)
+        int intvl = 10;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    #endif
+
+    #if defined(TCP_KEEPCNT)
+        int cnt = 3;
+        setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    #endif
+#endif
+}
+
+static void configureSocketForRealtime(SOCKET s)
+{
+    int flag = 1;
+    if (setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag)) != 0) {
+    }
+    configureSocketKeepalive(s);
+}
+
 
 static void shutdownSocket(SOCKET s) {
 #ifdef _WIN32
@@ -405,8 +449,8 @@ extern std::atomic<bool> g_running;
 
 static std::map<std::string, std::chrono::steady_clock::time_point> g_tgWaveLastUpdate;
 
-static const size_t ZFM_MAX_TX_QUEUE_BYTES = 512 * 1024;
-static const size_t ZFM_DROP_AUDIO_AFTER = 256 * 1024;
+static const size_t MAX_TX_QUEUE_BYTES = 512 * 1024;
+static const size_t DROP_AUDIO_AFTER = 256 * 1024;
 
 struct TxChunk {
     std::vector<char> data;
@@ -431,14 +475,14 @@ static bool enqueueToTx(const std::shared_ptr<ClientTxState>& tx,
 {
     if (!tx || len == 0) return true;
 
-    if (isAudio && tx->queuedBytes > ZFM_DROP_AUDIO_AFTER) {
+    if (isAudio && tx->queuedBytes > DROP_AUDIO_AFTER) {
         return true;
     }
 
     std::unique_lock<std::mutex> lk(tx->m);
     if (!tx->alive.load()) return false;
 
-    if (tx->queuedBytes + len > ZFM_MAX_TX_QUEUE_BYTES) {
+    if (tx->queuedBytes + len > MAX_TX_QUEUE_BYTES) {
         return false;
     }
 
@@ -4446,6 +4490,12 @@ void handleClient(SOCKET sock) {
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
+
+        if (cmd == "PING") {
+            static const char kPong[] = "PONG\n";
+            sendAll(sock, kPong, sizeof(kPong) - 1);
+            continue;
+        }
 
 		if (cmd == "AUTH") {
 			std::string user, pass;
