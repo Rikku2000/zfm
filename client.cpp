@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cmath>
 #include <functional>
+#include <map>
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -212,6 +213,15 @@ void logmsg(enum LogColorLevel level, int timed, const char *fmt, ...)
 
 std::mutex g_speakerMutex;
 std::string g_currentSpeaker;
+
+struct TgUserEntry {
+    std::string callsign;
+    std::string role;
+};
+
+std::mutex g_tgUsersMutex;
+std::map<std::string, std::vector<TgUserEntry>> g_tgUsers;
+std::atomic<long long> g_tgUsersLastUpdateMs(0);
 
 std::atomic<bool> g_pttAutoEnabled(false);
 std::atomic<bool> g_pttState(false);
@@ -2834,6 +2844,42 @@ void receiverLoop(SOCKET sock) {
             }
 #endif
         }
+		else if (cmd == "TG_USERS") {
+			std::string tg;
+			iss >> tg;
+			std::string rest;
+			std::getline(iss, rest);
+			if (!rest.empty() && rest[0] == ' ') rest.erase(0, 1);
+
+			std::vector<TgUserEntry> users;
+			if (!rest.empty()) {
+				std::stringstream ss(rest);
+				std::string item;
+				while (std::getline(ss, item, ',')) {
+					item = trim(item);
+					if (item.empty()) continue;
+					TgUserEntry ue;
+					size_t bar = item.find('|');
+					if (bar == std::string::npos) {
+						ue.callsign = item;
+						ue.role = "user";
+					} else {
+						ue.callsign = trim(item.substr(0, bar));
+						ue.role = trim(item.substr(bar + 1));
+						if (ue.role.empty()) ue.role = "user";
+					}
+					if (!ue.callsign.empty()) users.push_back(std::move(ue));
+				}
+			}
+
+			{
+				std::lock_guard<std::mutex> lock(g_tgUsersMutex);
+				g_tgUsers[tg] = std::move(users);
+			}
+			auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now().time_since_epoch()).count();
+			g_tgUsersLastUpdateMs.store(ms);
+		}
 		else if (cmd == "AUDIO_FROM") {
 			std::string user;
 			size_t size = 0;
@@ -3048,6 +3094,20 @@ void doTalkSession(SOCKET sock) {
         bool txGateOpen = true;
         if (g_txSquelchEnabled.load()) {
             txGateOpen = applyTxSquelchToFrame(frame, g_channels, g_sampleRate);
+        }
+
+        static std::chrono::steady_clock::time_point lastGateOpen = std::chrono::steady_clock::now();
+        auto sqNow = std::chrono::steady_clock::now();
+        if (txGateOpen) {
+            lastGateOpen = sqNow;
+        } else if (g_txSquelchEnabled.load()) {
+            int hangMs = g_txSquelchHangMs.load();
+            if (hangMs < 0) hangMs = 0; if (hangMs > 5000) hangMs = 5000;
+            long long closedMs = std::chrono::duration_cast<std::chrono::milliseconds>(sqNow - lastGateOpen).count();
+            if (closedMs > (long long)hangMs) {
+                std::cout << "[TX SQUELCH] No voice detected (hang " << hangMs << "ms). Ending talk session.";
+                break;
+            }
         }
 
         if (voxMode) {

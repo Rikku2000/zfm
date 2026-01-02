@@ -380,6 +380,11 @@ static bool GuiStartCore() {
         }
     }
 
+    {
+        const std::string req = "REQ_ALL_TG_USERS\n";
+        sendAll(sock, req.data(), req.size());
+    }
+
     g_guiSock = sock;
     startHeartbeat(g_guiSock);
     g_recvThread = std::thread(receiverLoop, g_guiSock);
@@ -711,6 +716,8 @@ static SDL_Color COL_BTN_CONNECT    = { 0x4c, 0xaf, 0x50, 255 };
 static SDL_Color COL_BTN_DISCONNECT = { 0xff, 0x52, 0x52, 255 };
 
 static int g_activeTab = 0;
+
+static int g_usersScrollY = 0;
 
 static void DrawRect(SDL_Renderer* r, const SDL_Rect& rc, SDL_Color c) {
     SDL_SetRenderDrawColor(r, c.r, c.g, c.b, c.a);
@@ -2057,8 +2064,9 @@ int main(int argc, char** argv) {
 	SDL_GetWindowSize(window, &w, &h);
 #endif
 
-    SDL_Rect rcTabBar, rcTabMain, rcTabAudio, rcTabGpio, rcTabRadio, rcTabLog;
+    SDL_Rect rcTabBar, rcTabMain, rcTabAudio, rcTabGpio, rcTabRadio, rcTabLog, rcTabUsers;
     SDL_Rect rcLogCard, rcLogInner;
+    SDL_Rect rcUsersCard, rcUsersInner;
     int contentTop = 0;
     int bottomTop = 0;
     int bottomAreaHeight = 0;
@@ -2070,6 +2078,7 @@ int main(int argc, char** argv) {
     int id_sendBtn = -1;
     int id_btnClearLog = -1;
     int id_btnSaveLog = -1;
+    int id_btnRefreshUsers = -1;
     int id_kbPttKeyBtn = -1;
 
     bool fullscreen = false;
@@ -2098,14 +2107,14 @@ int main(int argc, char** argv) {
 
 	id_btnLoad1 = id_btnSave1 = id_btnLoad2 = id_btnSave2 = id_btnLoad3 = id_btnSave3 = -1;
 	id_txButton = id_btnConnect = id_cmdEdit = id_sendBtn = -1;
-	id_btnClearLog = id_btnSaveLog = -1;
+	id_btnClearLog = id_btnSaveLog = id_btnRefreshUsers = -1;
 	id_kbPttKeyBtn = -1;
 
     g_widgets.clear();
 
 	const int tabH     = 28;
 	const int tabY     = 10;
-	const int tabCount = 5;
+	const int tabCount = 6;
 	int space          = 8;
 	int sidePad        = 10;
 
@@ -2122,7 +2131,8 @@ int main(int argc, char** argv) {
 	rcTabAudio = makeRect(startX + (tabW + space) * 1, tabY, tabW, tabH);
 	rcTabGpio = makeRect(startX + (tabW + space) * 2, tabY, tabW, tabH);
 	rcTabRadio = makeRect(startX + (tabW + space) * 3, tabY, tabW, tabH);
-	rcTabLog = makeRect(startX + (tabW + space) * 4, tabY, tabW, tabH);
+	rcTabUsers = makeRect(startX + (tabW + space) * 4, tabY, tabW, tabH);
+	rcTabLog = makeRect(startX + (tabW + space) * 5, tabY, tabW, tabH);
 
     contentTop = rcTabBar.y + rcTabBar.h + 6;
     {
@@ -2295,11 +2305,21 @@ int main(int argc, char** argv) {
 	int logTop    = contentTop + 6;
 	int logBottom = bottomTop - 10;
 	int logHeight = logBottom - logTop;
-	rcLogCard = makeRect(10, logTop, w - 20, logHeight);
-	rcLogInner = makeRect(rcLogCard.x + 8, rcLogCard.y + 24, rcLogCard.w - 16, rcLogCard.h - 72);
 
-	id_btnClearLog = AddButton(4, 20, rcLogCard.h + 16, 80, 30, "Clear Log");
-	id_btnSaveLog = AddButton(4, w - 100, rcLogCard.h + 16, 80, 30, "Save Log");
+	{
+		rcUsersCard = makeRect(10, logTop, w - 20, logHeight);
+		rcUsersInner = makeRect(rcUsersCard.x + 8, rcUsersCard.y + 24, rcUsersCard.w - 16, rcUsersCard.h - 72);
+
+		id_btnRefreshUsers = AddButton(4, w - 100, rcUsersCard.h + 16, 80, 30, "Refresh");
+	}
+
+	{
+		rcLogCard = makeRect(10, logTop, w - 20, logHeight);
+		rcLogInner = makeRect(rcLogCard.x + 8, rcLogCard.y + 24, rcLogCard.w - 16, rcLogCard.h - 72);
+
+		id_btnClearLog = AddButton(5, 20, rcLogCard.h + 16, 80, 30, "Clear Log");
+		id_btnSaveLog = AddButton(5, w - 100, rcLogCard.h + 16, 80, 30, "Save Log");
+	}
 
 #if defined(__ANDROID__)
         if (g_kbVisible) BuildOnScreenKeyboard(w, h);
@@ -2351,6 +2371,17 @@ int main(int argc, char** argv) {
 						*wdg.boundValue = newVal;
 					}
 				}
+			} else if (ev.type == SDL_MOUSEWHEEL) {
+				if (g_activeTab == 4) {
+					int mx = 0, my = 0;
+					SDL_GetMouseState(&mx, &my);
+					SDL_Point pt = { mx, my };
+					if (SDL_PointInRect(&pt, &rcUsersInner)) {
+						int step = (TTF_FontHeight(fontTiny) + 2) * 3;
+						if (step < 12) step = 12;
+						g_usersScrollY += (-ev.wheel.y) * step;
+					}
+				}
 			} else if (ev.type == SDL_MOUSEBUTTONDOWN && ev.button.button == SDL_BUTTON_LEFT) {
 				g_mouseDown = true;
 				g_activeSlider = -1;
@@ -2379,8 +2410,11 @@ int main(int argc, char** argv) {
 				} else if (SDL_PointInRect(&pt, &rcTabRadio)) {
 					g_activeTab = 3; g_focusWidget = -1; g_comboOpen = false;
 					continue;
-				} else if (SDL_PointInRect(&pt, &rcTabLog)) {
+				} else if (SDL_PointInRect(&pt, &rcTabUsers)) {
 					g_activeTab = 4; g_focusWidget = -1; g_comboOpen = false;
+					continue;
+				} else if (SDL_PointInRect(&pt, &rcTabLog)) {
+					g_activeTab = 5; g_focusWidget = -1; g_comboOpen = false;
 					continue;
 				}
 
@@ -2414,6 +2448,8 @@ int main(int argc, char** argv) {
 											GuiAppendLog("[ERROR] Failed to send JOIN for talkgroup " + newTg);
 										} else {
 											GuiAppendLog("Requesting switch to talkgroup: " + newTg);
+											const std::string req = "REQ_ALL_TG_USERS\n";
+											sendAll(g_guiSock, req.data(), req.size());
 										}
 									}
 								}
@@ -2570,6 +2606,11 @@ int main(int argc, char** argv) {
 							SaveLogToFile();
 						} else if (i == id_btnClearLog) {
 							ClearLog();
+						} else if (i == id_btnRefreshUsers) {
+							if (g_connected && g_guiSock != INVALID_SOCKET) {
+								const std::string req = "REQ_ALL_TG_USERS\n";
+								sendAll(g_guiSock, req.data(), req.size());
+							}
 						}
 					} else if (wdg.type == W_SLIDER && wdg.boundValue && wdg.enabled) {
 						int trackX = wdg.rect.x;
@@ -2833,7 +2874,8 @@ int main(int argc, char** argv) {
 		drawTab(rcTabAudio,   "Audio",   1);
 		drawTab(rcTabGpio,    "GPIO",    2);
 		drawTab(rcTabRadio,   "Radio",   3);
-		drawTab(rcTabLog,     "Log",     4);
+		drawTab(rcTabUsers,   "Users",   4);
+		drawTab(rcTabLog,     "Log",     5);
 
         if (g_activeTab == 0 || g_activeTab == 1 || g_activeTab == 2 || g_activeTab == 3) {
             SDL_Rect rcContent = { 10, contentTop, w - 20, (h - bottomAreaHeight) - contentTop - 6 };
@@ -2841,7 +2883,78 @@ int main(int argc, char** argv) {
             DrawRectBorder(renderer, rcContent, COL_PANEL_BD, 1);
         }
 
-        if (g_activeTab == 4) {
+		if (g_activeTab == 4) {
+			DrawRect(renderer, rcUsersCard, COL_PANEL);
+			DrawRectBorder(renderer, rcUsersCard, COL_PANEL_BD, 1);
+			DrawText(renderer, font, "Users online", rcUsersCard.x + 8, rcUsersCard.y + 6, COL_TEXT);
+
+			DrawRect(renderer, rcUsersInner, COL_INPUT_BG);
+			DrawRectBorder(renderer, rcUsersInner, COL_INPUT_BD, 1);
+
+			std::vector<std::pair<std::string, std::vector<TgUserEntry>>> snapshot;
+			{
+				std::lock_guard<std::mutex> lock(g_tgUsersMutex);
+				snapshot.reserve(g_tgUsers.size());
+				for (const auto& kv : g_tgUsers) {
+					snapshot.push_back(kv);
+				}
+			}
+			std::sort(snapshot.begin(), snapshot.end(),
+				[](const std::pair<std::string, std::vector<TgUserEntry>>& a,
+				   const std::pair<std::string, std::vector<TgUserEntry>>& b) {
+					return a.first < b.first;
+				});
+
+			const int lhHeader = TTF_FontHeight(font) + 4;
+			const int lhRow    = TTF_FontHeight(font) + 2;
+			int totalH = 0;
+			for (const auto& tg : snapshot) {
+				totalH += lhHeader;
+				totalH += (int)tg.second.size() * lhRow;
+				totalH += 6;
+			}
+			int maxScroll = std::max(0, totalH - rcUsersInner.h + 8);
+			if (g_usersScrollY < 0) g_usersScrollY = 0;
+			if (g_usersScrollY > maxScroll) g_usersScrollY = maxScroll;
+
+			SDL_RenderSetClipRect(renderer, &rcUsersInner);
+			int yy = rcUsersInner.y + 6 - g_usersScrollY;
+			for (const auto& tg : snapshot) {
+				std::string hdr = tg.first + " (" + std::to_string((int)tg.second.size()) + ")";
+				DrawText(renderer, font, hdr, rcUsersInner.x + 6, yy, COL_TEXT);
+				yy += lhHeader;
+
+				std::vector<TgUserEntry> users = tg.second;
+				std::sort(users.begin(), users.end(), [](const TgUserEntry& a, const TgUserEntry& b){
+					return a.callsign < b.callsign;
+				});
+
+				int row = 0;
+				for (const auto& ue : users) {
+					SDL_Rect rowRc = { rcUsersInner.x + 6, yy, rcUsersInner.w - 12, lhRow };
+					if (row % 2 == 0) {
+						DrawRect(renderer, rowRc, COL_PANEL);
+					}
+
+					std::string name = ue.callsign;
+					std::string role = ue.role;
+					DrawText(renderer, fontTiny, name, rowRc.x + 6, rowRc.y + 1, COL_TEXT);
+					if (!role.empty() && role != "user") {
+						std::string tag = "[" + role + "]";
+						int tw = 0, th = 0;
+						TTF_SizeUTF8(fontTiny, tag.c_str(), &tw, &th);
+						DrawText(renderer, fontTiny, tag, rowRc.x + rowRc.w - tw - 6, rowRc.y + 1, COL_TEXT_MUT);
+					}
+
+					yy += lhRow;
+					row++;
+				}
+				yy += 6;
+			}
+			SDL_RenderSetClipRect(renderer, nullptr);
+		}
+
+        if (g_activeTab == 5) {
             DrawRect(renderer, rcLogCard, COL_PANEL);
             DrawRectBorder(renderer, rcLogCard, COL_PANEL_BD, 1);
             DrawText(renderer, font, "Console log", rcLogCard.x + 8, rcLogCard.y + 6, COL_TEXT);

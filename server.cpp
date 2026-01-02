@@ -1326,6 +1326,91 @@ static void clearBridgeIdForLocalTx(const std::string& tg)
 static void handlePeerLine(PeerConn* pc, const std::string& line);
 static void broadcastToLinkedTalkgroups(const std::string& tg,const std::string& message,SOCKET exceptSock);
 static void broadcastAudioToLinkedTalkgroups(const std::string& tg,const std::string& fromUser,const std::vector<char>& buf,SOCKET exceptSock);
+void broadcastToTalkgroup(const std::string& tg,
+                          const std::string& message,
+                          SOCKET exceptSock);
+
+static Role roleForCallsign_NoLock(const std::string& callsign)
+{
+    auto uit = g_users.find(callsign);
+    if (uit == g_users.end()) return Role::USER;
+    return uit->second.role;
+}
+
+static bool userHasPermission_NoLock(const std::string& callsign, const std::string& perm)
+{
+    auto uit = g_users.find(callsign);
+    if (uit == g_users.end()) return false;
+    return (uit->second.permissions.find(perm) != uit->second.permissions.end());
+}
+
+static bool userVisibleToViewer_NoLock(const std::string& targetCallsign, Role viewerRole)
+{
+    if (viewerRole == Role::ADMIN || viewerRole == Role::OPERATOR) return true;
+
+    Role tr = roleForCallsign_NoLock(targetCallsign);
+    if (tr == Role::ADMIN) return false;
+    if (userHasPermission_NoLock(targetCallsign, "hidden")) return false;
+    return true;
+}
+
+static bool talkgroupVisibleToViewer_NoLock(const std::string& tg, Role viewerRole)
+{
+    if (tg.empty()) return false;
+
+    if (viewerRole == Role::ADMIN || viewerRole == Role::OPERATOR) return true;
+
+    auto it = g_knownTalkgroups.find(tg);
+    if (it == g_knownTalkgroups.end()) {
+        return true;
+    }
+
+    const TalkgroupInfo& info = it->second;
+    if (info.mode == TalkgroupMode::PUBLIC) return true;
+    return false;
+}
+
+static std::string buildTgUsersLine_NoLock(const std::string& tg, Role viewerRole)
+{
+    std::vector<std::string> entries;
+    entries.reserve(g_clients.size());
+
+    for (const auto& kv : g_clients) {
+        const ClientInfo& ci = kv.second;
+        if (!ci.authenticated) continue;
+        if (ci.talkgroup != tg) continue;
+        if (ci.callsign.empty()) continue;
+
+        if (!userVisibleToViewer_NoLock(ci.callsign, viewerRole)) continue;
+
+        Role r = roleForCallsign_NoLock(ci.callsign);
+
+        std::string e = ci.callsign;
+        e += "|";
+        e += roleToStr(r);
+        entries.push_back(std::move(e));
+    }
+
+    std::ostringstream oss;
+    oss << "TG_USERS " << tg << " ";
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (i) oss << ",";
+        oss << entries[i];
+    }
+    oss << "\n";
+    return oss.str();
+}
+
+static void broadcastTgUsers(const std::string& tg)
+{
+    if (tg.empty()) return;
+    std::string line;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        line = buildTgUsersLine_NoLock(tg, Role::OPERATOR);
+    }
+    broadcastToTalkgroup(tg, line, INVALID_SOCKET);
+}
 
 static SOCKET connectTcp(const std::string& host, int port)
 {
@@ -4344,6 +4429,7 @@ void cleanupClient(SOCKET sock) {
         }
 
         triggerAnnouncementForTalkgroup(tg, "tg_leave");
+        broadcastTgUsers(tg);
     }
 }
 
@@ -4653,12 +4739,51 @@ void handleClient(SOCKET sock) {
 				sendTalkgroupListForUser(sock, callsign);
 
 				if (!prevTg.empty() && prevTg != effectiveTg) {
+					broadcastTgUsers(prevTg);
+				}
+				broadcastTgUsers(effectiveTg);
+
+				if (!prevTg.empty() && prevTg != effectiveTg) {
 					triggerAnnouncementForTalkgroup(prevTg, "tg_leave");
 				}
 				triggerAnnouncementForTalkgroup(effectiveTg, "tg_join");
 			} else {
 				std::string resp = "JOIN_FAIL " + err + "\n";
 				sendAll(sock, resp.c_str(), resp.size());
+			}
+		}
+		else if (cmd == "REQ_ALL_TG_USERS") {
+			Role viewerRole = Role::USER;
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+				auto itc = g_clients.find(sock);
+				if (itc != g_clients.end() && itc->second.authenticated) {
+					viewerRole = roleForCallsign_NoLock(itc->second.callsign);
+				}
+			}
+
+			std::vector<std::string> tgs;
+			std::vector<std::string> lines;
+			{
+				std::lock_guard<std::mutex> lock(g_mutex);
+
+				tgs.reserve(g_knownTalkgroups.size());
+				for (const auto& kv : g_knownTalkgroups) {
+					const std::string& name = kv.second.name;
+					if (name.empty()) continue;
+					if (!talkgroupVisibleToViewer_NoLock(name, viewerRole)) continue;
+					tgs.push_back(name);
+				}
+				std::sort(tgs.begin(), tgs.end());
+
+				lines.reserve(tgs.size());
+				for (const auto& tg : tgs) {
+					lines.push_back(buildTgUsersLine_NoLock(tg, viewerRole));
+				}
+			}
+
+			for (const auto& line : lines) {
+				sendAll(sock, line.c_str(), line.size());
 			}
 		}
 		else if (cmd == "REQ_SPEAK") {
