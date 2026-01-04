@@ -732,6 +732,35 @@ static void DrawRectBorder(SDL_Renderer* r, const SDL_Rect& rc, SDL_Color c, int
     }
 }
 
+
+static std::string Utf8FromCodepoint(uint32_t cp) {
+    std::string out;
+    if (cp <= 0x7F) {
+        out.push_back(char(cp));
+    } else if (cp <= 0x7FF) {
+        out.push_back(char(0xC0 | ((cp >> 6) & 0x1F)));
+        out.push_back(char(0x80 | (cp & 0x3F)));
+    } else if (cp <= 0xFFFF) {
+        out.push_back(char(0xE0 | ((cp >> 12) & 0x0F)));
+        out.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(char(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back(char(0xF0 | ((cp >> 18) & 0x07)));
+        out.push_back(char(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(char(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(char(0x80 | (cp & 0x3F)));
+    }
+    return out;
+}
+
+template <typename T>
+static inline float ToFloat(const T& v) { return (float)v; }
+
+static inline float ToFloat(const std::atomic<float>& v) { return v.load(); }
+static inline float ToFloat(const std::atomic<double>& v) { return (float)v.load(); }
+static inline float ToFloat(const std::atomic<int>& v) { return (float)v.load(); }
+static inline float ToFloat(const std::atomic<unsigned>& v) { return (float)v.load(); }
+
 static void DrawText(SDL_Renderer* r, TTF_Font* font, const std::string& text,
                      int x, int y, SDL_Color col) {
     if (text.empty()) return;
@@ -754,6 +783,71 @@ static void DrawTextCentered(SDL_Renderer* r, TTF_Font* font, const std::string&
     int x = rc.x + (rc.w - tw) / 2;
     int y = rc.y + (rc.h - th) / 2;
     DrawText(r, font, text, x, y, col);
+}
+
+static void DrawIconTextCentered(SDL_Renderer* r,
+                                 TTF_Font* iconFont,
+                                 TTF_Font* textFont,
+                                 uint32_t iconCp,
+                                 const std::string& text,
+                                 SDL_Rect rc,
+                                 SDL_Color col,
+                                 int gapPx = 6) {
+    if (!iconFont || iconCp == 0) {
+        DrawTextCentered(r, textFont, text, rc, col);
+        return;
+    }
+
+    std::string iconStr = Utf8FromCodepoint(iconCp);
+
+    int iW = 0, iH = 0;
+    int tW = 0, tH = 0;
+    TTF_SizeUTF8(iconFont, iconStr.c_str(), &iW, &iH);
+    TTF_SizeUTF8(textFont, text.c_str(), &tW, &tH);
+
+    int groupW = iW + (text.empty() ? 0 : gapPx) + tW;
+    int startX = rc.x + (rc.w - groupW) / 2;
+
+    int iY = rc.y + (rc.h - iH) / 2;
+    int tY = rc.y + (rc.h - tH) / 2;
+
+    DrawText(r, iconFont, iconStr, startX, iY, col);
+    if (!text.empty()) {
+        DrawText(r, textFont, text, startX + iW + gapPx, tY, col);
+    }
+}
+
+static void DrawIconLabelCentered(SDL_Renderer* r,
+                                 TTF_Font* iconFont,
+                                 TTF_Font* textFont,
+                                 uint32_t iconCp,
+                                 const char* label,
+                                 int cx,
+                                 int y,
+                                 SDL_Color iconCol,
+                                 SDL_Color textCol,
+                                 int gapPx = 6)
+{
+    if (!label) label = "";
+
+    std::string iconUtf8 = iconFont ? Utf8FromCodepoint(iconCp) : std::string();
+    int iw = 0, ih = 0;
+    int tw = 0, th = 0;
+    if (iconFont && iconCp) TTF_SizeUTF8(iconFont, iconUtf8.c_str(), &iw, &ih);
+    if (textFont) TTF_SizeUTF8(textFont, label, &tw, &th);
+
+    int groupW = 0;
+    if (iw > 0 && tw > 0) groupW = iw + gapPx + tw;
+    else groupW = std::max(iw, tw);
+
+    int x = cx - groupW / 2;
+    if (iw > 0) {
+        DrawText(r, iconFont, iconUtf8, x, y, iconCol);
+        x += iw + (tw > 0 ? gapPx : 0);
+    }
+    if (tw > 0) {
+        DrawText(r, textFont, label, x, y, textCol);
+    }
 }
 
 int GetTextWidth(TTF_Font* font, const char* text)
@@ -887,7 +981,8 @@ struct Widget {
 
     bool hovered;
     bool focused;
-    bool enabled;
+    bool        enabled;
+    uint32_t   iconCp;
 };
 
 static std::vector<Widget> g_widgets;
@@ -1237,6 +1332,8 @@ static int AddEdit(int tab, int x, int y, int w, std::string* bind) {
     wg.hovered = false;
     wg.focused = false;
 	wg.enabled = true;
+	wg.iconCp = 0;
+	wg.iconCp = 0;
 	wg.caretPos = -1;
     g_widgets.push_back(wg);
     return (int)g_widgets.size() - 1;
@@ -1255,6 +1352,7 @@ static int AddCheck(int tab, int x, int y, const std::string& text, bool* bind) 
     wg.hovered = false;
     wg.focused = false;
 	wg.enabled = true;
+	wg.iconCp = 0;
     g_widgets.push_back(wg);
     return (int)g_widgets.size() - 1;
 }
@@ -1272,9 +1370,30 @@ static int AddButton(int tab, int x, int y, int w, int h, const std::string& tex
     wg.hovered = false;
     wg.focused = false;
 	wg.enabled = true;
+	wg.iconCp = 0;
     g_widgets.push_back(wg);
     return (int)g_widgets.size() - 1;
 }
+
+
+static int AddButtonIcon(int tab, int x, int y, int w, int h, const std::string& text, uint32_t iconCp) {
+    Widget wg;
+    wg.type = W_BUTTON;
+    wg.rect = makeRect(x, y, w, h);
+    wg.tab  = tab;
+    wg.label = text;
+    wg.boundText = nullptr;
+    wg.boundBool = nullptr;
+    wg.boundIndex = nullptr;
+    wg.comboItems = nullptr;
+    wg.hovered = false;
+    wg.focused = false;
+    wg.enabled = true;
+    wg.iconCp = iconCp;
+    g_widgets.push_back(wg);
+    return (int)g_widgets.size() - 1;
+}
+
 
 static int AddCombo(int tab, int x, int y, int w, std::string* display,
                     int* index, std::vector<std::string>* items) {
@@ -1289,6 +1408,7 @@ static int AddCombo(int tab, int x, int y, int w, std::string* display,
     wg.hovered = false;
     wg.focused = false;
 	wg.enabled = true;
+	wg.iconCp = 0;
     g_widgets.push_back(wg);
     return (int)g_widgets.size() - 1;
 }
@@ -1312,6 +1432,7 @@ static int AddSlider(int tab, int x, int y, int w,int* value, int minVal, int ma
     wg.hovered = false;
     wg.focused = false;
     wg.enabled = true;
+	wg.iconCp = 0;
 
     g_widgets.push_back(wg);
     return (int)g_widgets.size() - 1;
@@ -1780,7 +1901,7 @@ static void UiToCfg() {
 	g_cfg.roger_sound = ui_roger_index;
 }
 
-static void RenderWidgets(SDL_Renderer* r, TTF_Font* font) {
+static void RenderWidgets(SDL_Renderer* r, TTF_Font* font, TTF_Font* faFont) {
     for (size_t i = 0; i < g_widgets.size(); ++i) {
         Widget& w = g_widgets[i];
 
@@ -1846,7 +1967,7 @@ static void RenderWidgets(SDL_Renderer* r, TTF_Font* font) {
 			DrawRectBorder(r, w.rect, COL_PANEL_BD, 1);
 
 			SDL_Color txt = w.enabled ? COL_TEXT : COL_TEXT_MUT;
-			DrawTextCentered(r, font, w.label, w.rect, txt);
+			DrawIconTextCentered(r, faFont, font, w.iconCp, w.label, w.rect, txt);
 			break;
 		}
         case W_CHECK: {
@@ -2032,12 +2153,33 @@ int main(int argc, char** argv) {
 	SDL_RenderSetIntegerScale(renderer, SDL_FALSE);
 #endif
 
-    const char* fontPath = "raleway-regular.ttf";
-	TTF_Font* fontTiny = TTF_OpenFont(fontPath, 12);
-	TTF_Font* font = TTF_OpenFont(fontPath, 16);
-	TTF_Font* fontBig = TTF_OpenFont(fontPath, 26);
-    if (!font) {
-        std::cerr << "TTF_OpenFont failed (" << fontPath << "): " << TTF_GetError() << "\n";
+    const char* fontPathA = "raleway-regular.ttf";
+    const char* fontPathB = "raleway.ttf";
+	TTF_Font* fontTiny = TTF_OpenFont(fontPathA, 12);
+	if (!fontTiny) fontTiny = TTF_OpenFont(fontPathB, 12);
+	TTF_Font* font = TTF_OpenFont(fontPathA, 16);
+	if (!font) font = TTF_OpenFont(fontPathB, 16);
+	TTF_Font* fontBig = TTF_OpenFont(fontPathA, 26);
+	if (!fontBig) fontBig = TTF_OpenFont(fontPathB, 26);
+	if (!font) {
+        std::cerr << "TTF_OpenFont failed (" << fontPathA << ") or (" << fontPathB << "): " << TTF_GetError() << "\n";
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        TTF_Quit();
+        SDL_Quit();
+        return 1;
+    }
+
+	const char* faPathA = "fontawesome-webfont.ttf";
+	const char* faPathB = "fontawesome.ttf";
+	TTF_Font* faFontSmall = TTF_OpenFont(faPathA, 14);
+	if (!faFontSmall) faFontSmall = TTF_OpenFont(faPathB, 14);
+	TTF_Font* faFont = TTF_OpenFont(faPathA, 16);
+	if (!faFont) faFont = TTF_OpenFont(faPathB, 16);
+	TTF_Font* fafontBig = TTF_OpenFont(faPathA, 26);
+	if (!fafontBig) fafontBig = TTF_OpenFont(faPathB, 26);
+	if (!faFont) {
+        std::cerr << "TTF_OpenFont failed (" << faPathA << ") or (" << faPathB << "): " << TTF_GetError() << "\n";
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(window);
         TTF_Quit();
@@ -2046,6 +2188,9 @@ int main(int argc, char** argv) {
     }
 
     if (!ShowSplashScreen(window, renderer, font, "splash.bmp", 1000)) {
+		if (faFont)      TTF_CloseFont(faFont);
+		if (faFontSmall) TTF_CloseFont(faFontSmall);
+		if (fafontBig) TTF_CloseFont(fafontBig);
         if (fontBig)  TTF_CloseFont(fontBig);
         if (font)     TTF_CloseFont(font);
         if (fontTiny) TTF_CloseFont(fontTiny);
@@ -2198,8 +2343,8 @@ int main(int argc, char** argv) {
 		AddLabel(1, xLabel, y, "Output Gain");
 		AddSlider(1, xCtrl, y, fullW, &ui_out_gain, 0, 200, ""); y += 40;
 
-		id_btnLoad1 = AddButton(1, w - 190, y + 8, 80, 30, "Load");
-		id_btnSave1 = AddButton(1, w - 100, y + 8, 80, 30, "Save");
+		id_btnLoad1 = AddButtonIcon(1, w - 190, y + 8, 80, 30, "Load", 0xf07c /* folder-open */);
+		id_btnSave1 = AddButtonIcon(1, w - 100, y + 8, 80, 30, "Save", 0xf0c7 /* floppy-o */);
 	}
 
 	{
@@ -2232,8 +2377,8 @@ int main(int argc, char** argv) {
 		AddLabel(2, xLabel, y, "PTT cmd OFF");
 		AddEdit(2, xCtrl, y - 2, w - xCtrl - 20, &ui_ptt_cmd_off); y += 34;
 
-		id_btnLoad2 = AddButton(2, w - 190, y + 8, 80, 30, "Load");
-		id_btnSave2 = AddButton(2, w - 100, y + 8, 80, 30, "Save");
+		id_btnLoad2 = AddButtonIcon(2, w - 190, y + 8, 80, 30, "Load", 0xf07c /* folder-open */);
+		id_btnSave2 = AddButtonIcon(2, w - 100, y + 8, 80, 30, "Save", 0xf0c7 /* floppy-o */);
 	}
 
 	{
@@ -2271,8 +2416,8 @@ int main(int argc, char** argv) {
 		AddLabel(3, xCtrl + 150, y + 6, "(click to change)");
 		y += 44;
 
-		id_btnLoad3 = AddButton(3, w - 190, y + 8, 80, 30, "Load");
-		id_btnSave3 = AddButton(3, w - 100, y + 8, 80, 30, "Save");
+		id_btnLoad3 = AddButtonIcon(3, w - 190, y + 8, 80, 30, "Load", 0xf07c /* folder-open */);
+		id_btnSave3 = AddButtonIcon(3, w - 100, y + 8, 80, 30, "Save", 0xf0c7 /* floppy-o */);
 	}
 
 	const int gap           = 16;
@@ -2290,17 +2435,17 @@ int main(int argc, char** argv) {
 	bottomAreaHeight = h - bottomTop;
 
 	SDL_Rect rcTxBtnRect = { 16, txBtnY, w - 32, txHeight };
-	id_txButton = AddButton(-1, rcTxBtnRect.x, rcTxBtnRect.y + 4,
-								rcTxBtnRect.w, rcTxBtnRect.h, "TALK");
+	id_txButton = AddButtonIcon(-1, rcTxBtnRect.x, rcTxBtnRect.y + 4,
+								rcTxBtnRect.w, rcTxBtnRect.h, "TALK", 0xf130 /* microphone */);
 
-	id_btnConnect = AddButton(-1, 16, row2Y, w - 32, 30, "Connect");
+	id_btnConnect = AddButtonIcon(-1, 16, row2Y, w - 32, 30, "Connect", 0xf1e6 /* plug */);
 
 	int cmdX         = 16;
 	int sendWidth    = 72;
 	int cmdW = w - cmdX - sendWidth - 24;
 
 	id_cmdEdit = AddEdit(-1, cmdX, cmdY, cmdW, &ui_cmd);
-	id_sendBtn = AddButton(-1, w - sendWidth - 16, cmdY, sendWidth, cmdHeight, "Send");
+	id_sendBtn = AddButtonIcon(-1, w - sendWidth - 16, cmdY, sendWidth, cmdHeight, "Send", 0xf1d8 /* paper-plane */);
 
 	int logTop    = contentTop + 6;
 	int logBottom = bottomTop - 10;
@@ -2310,15 +2455,15 @@ int main(int argc, char** argv) {
 		rcUsersCard = makeRect(10, logTop, w - 20, logHeight);
 		rcUsersInner = makeRect(rcUsersCard.x + 8, rcUsersCard.y + 24, rcUsersCard.w - 16, rcUsersCard.h - 72);
 
-		id_btnRefreshUsers = AddButton(4, w - 100, rcUsersCard.h + 16, 80, 30, "Refresh");
+		id_btnRefreshUsers = AddButtonIcon(4, w - 100, rcUsersCard.h + 16, 80, 30, "Refresh", 0xf021 /* refresh */);
 	}
 
 	{
 		rcLogCard = makeRect(10, logTop, w - 20, logHeight);
 		rcLogInner = makeRect(rcLogCard.x + 8, rcLogCard.y + 24, rcLogCard.w - 16, rcLogCard.h - 72);
 
-		id_btnClearLog = AddButton(5, 20, rcLogCard.h + 16, 80, 30, "Clear Log");
-		id_btnSaveLog = AddButton(5, w - 100, rcLogCard.h + 16, 80, 30, "Save Log");
+		id_btnClearLog = AddButtonIcon(5, 20, rcLogCard.h + 16, 80, 30, "Clear", 0xf1f8 /* trash */);
+		id_btnSaveLog = AddButtonIcon(5, w - 100, rcLogCard.h + 16, 80, 30, "Save", 0xf0c7 /* floppy-o */);
 	}
 
 #if defined(__ANDROID__)
@@ -2921,7 +3066,15 @@ int main(int argc, char** argv) {
 			int yy = rcUsersInner.y + 6 - g_usersScrollY;
 			for (const auto& tg : snapshot) {
 				std::string hdr = tg.first + " (" + std::to_string((int)tg.second.size()) + ")";
-				DrawText(renderer, font, hdr, rcUsersInner.x + 6, yy, COL_TEXT);
+				int hx = rcUsersInner.x + 6;
+				if (faFont) {
+					std::string ico = Utf8FromCodepoint(0xf0e8 /* sitemap / group */);
+					int iw = 0, ih = 0;
+					TTF_SizeUTF8(faFont, ico.c_str(), &iw, &ih);
+					DrawText(renderer, faFont, ico, hx, yy, COL_TEXT_MUT);
+					hx += iw + 6;
+				}
+				DrawText(renderer, font, hdr, hx, yy, COL_TEXT);
 				yy += lhHeader;
 
 				std::vector<TgUserEntry> users = tg.second;
@@ -2938,7 +3091,15 @@ int main(int argc, char** argv) {
 
 					std::string name = ue.callsign;
 					std::string role = ue.role;
-					DrawText(renderer, fontTiny, name, rowRc.x + 6, rowRc.y + 1, COL_TEXT);
+					int nx = rowRc.x + 6;
+					if (faFontSmall) {
+						std::string uico = Utf8FromCodepoint(0xf007 /* user */);
+						int uiw = 0, uih = 0;
+						TTF_SizeUTF8(faFontSmall, uico.c_str(), &uiw, &uih);
+						DrawText(renderer, faFontSmall, uico, nx, rowRc.y + 1, COL_TEXT_MUT);
+						nx += uiw + 6;
+					}
+					DrawText(renderer, fontTiny, name, nx, rowRc.y + 1, COL_TEXT);
 					if (!role.empty() && role != "user") {
 						std::string tag = "[" + role + "]";
 						int tw = 0, th = 0;
@@ -2987,14 +3148,34 @@ int main(int argc, char** argv) {
             SDL_RenderSetClipRect(renderer, nullptr);
         }
 
-        RenderWidgets(renderer, font);
+        RenderWidgets(renderer, font, faFont);
 
 		if (g_activeTab == 0) {
 			int statusY = contentTop + 10 + 34 * 6 + 6;
 
-			std::string status = g_connected ? "Connected" : "Disconnected";
-			status += " / Mode: " + g_cfg.mode;
-			DrawText(renderer, font, status, 130, statusY, COL_TEXT_MUT);
+			int sx = 130;
+			int sy = statusY;
+
+			const int statusLineH = TTF_FontHeight(font) + 6;
+			auto drawIconText = [&](uint32_t iconCp, const std::string& text, SDL_Color colIcon, SDL_Color colText) {
+				if (faFont) {
+					std::string icon = Utf8FromCodepoint(iconCp);
+					int iw = 0, ih = 0;
+					TTF_SizeUTF8(faFont, icon.c_str(), &iw, &ih);
+					DrawText(renderer, faFont, icon, sx, sy, colIcon);
+					sx += iw + 6;
+				}
+				DrawText(renderer, font, text, sx, sy, colText);
+				int tw = 0, th = 0;
+				TTF_SizeUTF8(font, text.c_str(), &tw, &th);
+				sx += tw + 14;
+			};
+
+			if (g_connected) {
+				drawIconText(0xf1e6 /* plug */, "Connected / "+ g_cfg.mode, COL_BTN_CONNECT, COL_TEXT_MUT);
+			} else {
+				drawIconText(0xf05e /* ban */, "Disconnected / "+ g_cfg.mode, COL_BTN_DISCONNECT, COL_TEXT_MUT);
+			}
 
 			const int talkerGapAboveConnect = 12;
 			const int talkerHeight = 140;
@@ -3047,11 +3228,19 @@ int main(int argc, char** argv) {
 			if (!talker.empty()) {
 				int tw = 0, th = 0;
 				TTF_SizeUTF8(fontBig, talker.c_str(), &tw, &th);
+				
+				std::string userIcon = Utf8FromCodepoint(0xf007);
+				int iw = 0, ih = 0;
+				TTF_SizeUTF8(fafontBig, userIcon.c_str(), &iw, &ih);
 
-				int centerX = rcTalkerInner.x + (rcTalkerInner.w - tw) / 2;
+				int spacing = 6;
+				int totalW = iw + spacing + tw;
+
+				int centerX = rcTalkerInner.x + (rcTalkerInner.w - totalW) / 2;
 				int centerY = rcTalkerInner.y + 10;
 
-				DrawText(renderer, fontBig, talker, centerX, centerY, COL_TAB_ACTIVE);
+				DrawText(renderer, fafontBig, userIcon, centerX, centerY, COL_TAB_ACTIVE);
+				DrawText(renderer, fontBig, talker.c_str(), centerX + iw + spacing, centerY, COL_TAB_ACTIVE);
 
 				if (g_talkerActive.load()) {
 					auto now  = std::chrono::steady_clock::now();
@@ -3099,21 +3288,34 @@ int main(int argc, char** argv) {
 					if (singleWidth < 40) singleWidth = 40;
 
 					{
-						const char* label = "Transmit";
-						int lw = 0, lh = 0;
-						TTF_SizeUTF8(font, label, &lw, &lh);
-						int lx = barX + (singleWidth - lw) / 2;
-						int ly = barY - lh - 2;
-						DrawText(renderer, font, label, lx, ly, COL_TEXT_MUT);
-					}
+						bool txActive = (bool)g_isTalking.load();
+						bool rxActive = levelRx > 0.02f;
 
-					{
-						const char* label = "Receive";
-						int lw = 0, lh = 0;
-						TTF_SizeUTF8(font, label, &lw, &lh);
-						int lx = barX + singleWidth + gap + (singleWidth - lw) / 2;
-						int ly = barY - lh - 2;
-						DrawText(renderer, font, label, lx, ly, COL_TEXT_MUT);
+						const int labelY = barY - TTF_FontHeight(font) - 2;
+
+						const int txCenterX = barX + singleWidth / 2;
+						DrawIconLabelCentered(
+							renderer,
+							faFontSmall,
+							font,
+							txActive ? 0xf130 /* microphone */ : 0xf131 /* microphone-slash */,
+							"Transmit",
+							txCenterX,
+							labelY,
+							txActive ? COL_TX_BTN : COL_TEXT_MUT,
+							COL_TEXT_MUT);
+
+						const int rxCenterX = barX + singleWidth + gap + singleWidth / 2;
+						DrawIconLabelCentered(
+							renderer,
+							faFontSmall,
+							font,
+							rxActive ? 0xf028 /* volume-up */ : 0xf026 /* volume-off */,
+							"Receive",
+							rxCenterX,
+							labelY,
+							rxActive ? COL_BTN_CONNECT : COL_TEXT_MUT,
+							COL_TEXT_MUT);
 					}
 
 					SDL_Rect micBg = { barX, barY, singleWidth, barHeight };
@@ -3198,7 +3400,12 @@ int main(int argc, char** argv) {
     GuiStopCore();
 
     SDL_StopTextInput();
-    TTF_CloseFont(font);
+	if (fontBig)  TTF_CloseFont(fontBig);
+	if (font)     TTF_CloseFont(font);
+	if (fontTiny) TTF_CloseFont(fontTiny);
+	if (faFont)      TTF_CloseFont(faFont);
+	if (faFontSmall) TTF_CloseFont(faFontSmall);
+	if (fafontBig) TTF_CloseFont(fafontBig);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     TTF_Quit();
