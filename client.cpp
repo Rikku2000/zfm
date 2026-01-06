@@ -2759,19 +2759,27 @@ void receiverLoop(SOCKET sock) {
             std::cout << "[SERVER] Speak revoked: " << reason << "\n";
         }
 		else if (cmd == "MIC_FREE") {
-			playMicFreeSound();
+			bool hadSpeaker = false;
+			std::string finishedSpeaker;
+
 			{
 				std::lock_guard<std::mutex> lock(g_speakerMutex);
-				if (!g_currentSpeaker.empty()) {
-					LOG_INFO("[INFO] %s finished talking.\n", g_currentSpeaker.c_str());
+				hadSpeaker = !g_currentSpeaker.empty();
+				if (hadSpeaker) {
+					finishedSpeaker = g_currentSpeaker;
 					g_currentSpeaker.clear();
 #ifdef GUI
 					g_talkerActive = false;
 					g_rxAudioLevel = 0.0f;
 #endif
-				} else {
-					LOG_INFO("[INFO] Mic is now free.\n");
 				}
+			}
+
+			if (hadSpeaker) {
+				playMicFreeSound();
+				LOG_INFO("[INFO] %s finished talking.\n", finishedSpeaker.c_str());
+			} else {
+				LOG_INFO("[INFO] Mic is now free.\n");
 			}
 		}
 		else if (cmd == "SPEAKER") {

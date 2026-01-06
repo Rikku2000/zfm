@@ -2289,9 +2289,6 @@ void mixTimeAnnouncementIntoBuffer(const std::string& tg, std::vector<char>& buf
     }
 
     if (finished) {
-        std::string msg1 = "MIC_FREE\n";
-		broadcastToLinkedTalkgroups(tg, msg1, INVALID_SOCKET);
-
         std::string msg2 = "SPEAKER_NONE\n";
 		broadcastToLinkedTalkgroups(tg, msg2, INVALID_SOCKET);
     }
